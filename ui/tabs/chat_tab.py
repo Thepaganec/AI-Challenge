@@ -1,11 +1,24 @@
 import os, json
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QSplitter, QLabel, QMessageBox
+    QWidget, QVBoxLayout, QSplitter, QLabel, QMessageBox, QTextEdit, QSizePolicy
 )
 from PySide6.QtCore import (Qt, Signal, QByteArray, QTimer)
 
 from ui.tabs.base_tab import BaseTab
+
+def set_textbox_height(textbox: QTextEdit, lines: int=5):
+    fm = textbox.fontMetrics()
+    line_height = fm.lineSpacing()
+
+    extra = (
+        int(textbox.document().documentMargin() * 2)
+        + int(textbox.frameWidth() * 2)
+        + 12
+    )
+
+    height = line_height * lines + extra
+    textbox.setFixedHeight(height)
 
 class ChatTab(BaseTab):
     path = os.path.dirname(__file__)
@@ -24,16 +37,38 @@ class ChatTab(BaseTab):
 
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
-        
+        # --- Поле для ввода
+        self.input_editbox = QTextEdit()
+        self.input_editbox.setPlaceholderText(
+            f"Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит..."
+        )
+        self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        set_textbox_height(self.input_editbox, 5)
 
+        # --- Полей для вывода 
+        self.output_editbox = QTextEdit()
+        self.output_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.output_editbox.setReadOnly(True)
+        set_textbox_height(self.output_editbox, 20)
+        
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
         tab_layout = QVBoxLayout(self.top_widget)
         tab_layout.setContentsMargins(0, 0, 0, 0)
 
+        input_container = QWidget()
+        input_container.setFixedWidth(700)
+
+        input_layout = QVBoxLayout(input_container)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(0)
+        input_layout.addWidget(self.input_editbox)
+        input_layout.addWidget(self.output_editbox)
+
+        tab_layout.addWidget(input_container, alignment=Qt.AlignHCenter)
+
         self.splitter_move_timer = QTimer(self)
         self.splitter_move_timer.setSingleShot(True)
         
-
     def on_splitter_moved(self):
         self.splitter_move_timer.start(300)
 
