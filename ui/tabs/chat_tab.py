@@ -1,10 +1,11 @@
 import os, json, asyncio
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QTextEdit, QSizePolicy
+    QWidget, QVBoxLayout, QTextEdit, QSizePolicy, QProgressBar
 )
+
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QFont
 
 from ui.tabs.base_tab import BaseTab
 from core.api.gptmodel import GPTModel
@@ -47,16 +48,27 @@ class ChatTab(BaseTab):
 
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
+        # --- Шрифт
+        font = QFont()
+        font.setPointSize(13)
+
         # --- Поле для ввода
         self.input_editbox = QTextEdit()
+        self.input_editbox.setFont(font)
         self.input_editbox.setPlaceholderText(
             "Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит..."
         )
         self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         set_editbox_height(self.input_editbox, 5)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(8)
+
         # --- Поле для вывода
         self.output_editbox = QTextEdit()
+        self.output_editbox.setFont(font)
         self.output_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.output_editbox.setReadOnly(True)
         set_editbox_height(self.output_editbox, 20)
@@ -70,13 +82,16 @@ class ChatTab(BaseTab):
         input_layout = QVBoxLayout(input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(6)
+
         input_layout.addWidget(self.input_editbox)
+        input_layout.addWidget(self.progress_bar)
         input_layout.addWidget(self.output_editbox)
 
         tab_layout.addWidget(input_container, alignment=Qt.AlignHCenter)
 
         self.splitter_move_timer = QTimer(self)
         self.splitter_move_timer.setSingleShot(True)
+
 
     # ========= Enter отправляет, Shift+Enter перенос строки =========
 
@@ -96,6 +111,14 @@ class ChatTab(BaseTab):
 
         return super().eventFilter(obj, event)
 
+    def set_loading(self, is_loading: bool):
+        if is_loading:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+
+
     def on_send_message(self):
         if self.is_generating:
             self.logger.warning("Модель ещё отвечает — подожди.")
@@ -109,12 +132,16 @@ class ChatTab(BaseTab):
         self.input_editbox.clear()
 
         # Пишем в output “пользователь: …”
-        self.output_editbox.append(f"Ты: {text}")
+        self.output_editbox.append(f"Ты: {text} \n")
         self.output_editbox.append("GPT: ")
+
+        # включаем индикатор сразу при старте
+        self.set_loading(True)
 
         asyncio.create_task(self.ask_and_stream_answer(text))
 
     async def ask_and_stream_answer(self, user_text: str):
+        self.logger.info("Отправка запроса в API")
         self.is_generating = True
 
         try:
@@ -129,7 +156,6 @@ class ChatTab(BaseTab):
                 max_tokens=800,
             ):
                 self.output_editbox.insertPlainText(chunk)
-
                 self.output_editbox.moveCursor(QTextCursor.End)
                 self.output_editbox.ensureCursorVisible()
 
@@ -141,6 +167,8 @@ class ChatTab(BaseTab):
 
         finally:
             self.is_generating = False
+            self.set_loading(False)
+            self.logger.success("Ответ получен")
 
     def on_splitter_moved(self):
         self.splitter_move_timer.start(300)
