@@ -27,13 +27,8 @@ class GPTModel:
         user_text: str,
         system_text: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
-        temperature: float = 0.7,
         max_tokens: int = 800,
     ) -> AsyncIterator[str]:
-        """
-        Стриминговый ответ: отдаёт куски текста по мере генерации.
-        Совместимо с /chat/completions stream=true (SSE).
-        """
 
         messages: List[Dict[str, str]] = []
         if system_text:
@@ -43,6 +38,7 @@ class GPTModel:
         messages.append({"role": "user", "content": user_text})
 
         url = f"{self.base_url}/chat/completions"
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -51,8 +47,7 @@ class GPTModel:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "stream": True,
         }
 
@@ -60,18 +55,17 @@ class GPTModel:
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=payload) as resp:
+
                 if resp.status < 200 or resp.status >= 300:
                     body_text = await resp.text()
                     raise RuntimeError(
-                        f"ProxyAPI error: HTTP {resp.status}\n{body_text[:2000]}"
+                        f"ProxyAPI error: HTTP {resp.status}\n{body_text}"
                     )
 
                 async for raw_line in resp.content:
                     line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line:
-                        continue
 
-                    if not line.startswith("data:"):
+                    if not line or not line.startswith("data:"):
                         continue
 
                     data = line[len("data:"):].strip()
@@ -90,3 +84,5 @@ class GPTModel:
                             yield chunk
                     except Exception:
                         continue
+
+

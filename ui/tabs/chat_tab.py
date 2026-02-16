@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTextEdit, QSizePolicy
 )
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
+from PySide6.QtGui import QTextCursor
 
 from ui.tabs.base_tab import BaseTab
 from core.api.gptmodel import GPTModel
@@ -118,25 +119,21 @@ class ChatTab(BaseTab):
 
         try:
             cursor = self.output_editbox.textCursor()
-            cursor.movePosition(cursor.End)
+            cursor.movePosition(QTextCursor.End)
             self.output_editbox.setTextCursor(cursor)
-
-            full_answer = []
 
             async for chunk in self.gpt.stream_chat(
                 user_text=user_text,
                 system_text=None,
-                history=None,        # если надо диалог — будем передавать self.history
-                temperature=0.7,
+                history=None,
                 max_tokens=800,
             ):
-                full_answer.append(chunk)
                 self.output_editbox.insertPlainText(chunk)
 
-                self.output_editbox.moveCursor(self.output_editbox.textCursor().End)
-                QTimer.singleShot(0, self.output_editbox.ensureCursorVisible)
+                self.output_editbox.moveCursor(QTextCursor.End)
+                self.output_editbox.ensureCursorVisible()
 
-            self.output_editbox.append("")
+            self.output_editbox.append("")  # перенос строки после ответа
 
         except Exception as e:
             self.logger.error_handler(e, context="ChatTab -> ask_and_stream_answer")
