@@ -74,7 +74,7 @@ class ChatTab(BaseTab):
         set_editbox_height(self.output_editbox_with_condition, 15)
 
         # --- Тогл для включения условий
-        self.condition_toggle = ToggleSwitch("Условный запуск")
+        self.condition_toggle = ToggleSwitch()
         self.condition_toggle_label = QLabel("Режим запуска с условиями:")
 
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
