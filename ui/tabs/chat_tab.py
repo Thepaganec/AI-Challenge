@@ -1,7 +1,8 @@
 import os, json, asyncio
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel
+    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
+    QLineEdit, QPushButton
 )
 
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
@@ -22,7 +23,11 @@ class ChatTab(BaseTab):
 
         self.gpt = GPTModel()
         self.history = []
+
+        # --- Служебные
         self.is_generating = False
+        self.stop_requested = False
+        self.current_task = None
 
         self.init_content()
         self.load_window_state()
@@ -44,7 +49,7 @@ class ChatTab(BaseTab):
         # --- Шрифт
         font = QFont()
         font.setPointSize(13)
-
+        
         # --- Поле для ввода
         self.input_editbox = QTextEdit()
         self.input_editbox.setFont(font)
@@ -75,7 +80,46 @@ class ChatTab(BaseTab):
 
         # --- Тогл для включения условий
         self.condition_toggle = ToggleSwitch()
-        self.condition_toggle_label = QLabel("Режим запуска с условиями:")
+        self.condition_label = QLabel("Режим запуска с условиями:")
+        self.condition_label.setFixedWidth(230)
+
+        # --- Кнопки STOP под каждое окно
+        self.stop_button_plain = QPushButton("STOP")
+        self.stop_button_plain.setFixedWidth(445)
+        self.stop_button_plain.setEnabled(False)
+        self.stop_button_plain.clicked.connect(self.stop_generation_plain)
+
+        self.stop_button_condition = QPushButton("STOP")
+        self.stop_button_condition.setFixedWidth(445)
+        self.stop_button_condition.setEnabled(False)
+        self.stop_button_condition.clicked.connect(self.stop_generation_condition)
+
+        # --- Поля условий (правая панель)
+        self.format_label = QLabel("Формат ответа:")
+        self.format_label.setFixedWidth(230)
+        self.format_input = QLineEdit()
+        self.format_input.setFixedWidth(350)
+        self.format_input.setPlaceholderText("Например: Ровно 3 пункта, без вступления.")
+
+        self.length_label = QLabel("Ограничение длины (слова/символы):")
+        self.length_label.setFixedWidth(230)
+        self.length_input = QLineEdit()
+        self.length_input.setFixedWidth(350)
+        self.length_input.setPlaceholderText("Например: Не более 60 слов.")
+
+        self.stop_seq_label = QLabel("Stop sequence (строка завершения):")
+        self.stop_seq_label.setFixedWidth(230)
+        self.stop_seq_input = QLineEdit()
+        self.stop_seq_input.setFixedWidth(350)
+        self.stop_seq_input.setPlaceholderText("Например: ###END###")
+        self.stop_seq_input.setText("###END###")
+
+        self.max_tokens_label = QLabel("max_tokens (через API):")
+        self.max_tokens_label.setFixedWidth(230)
+        self.max_tokens_input = QLineEdit()
+        self.max_tokens_input.setFixedWidth(350)
+        self.max_tokens_input.setPlaceholderText("Например: 200")
+        self.max_tokens_input.setText("200")
 
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
         tab_layout = QVBoxLayout(self.top_widget)
@@ -94,8 +138,23 @@ class ChatTab(BaseTab):
         output_layout = QHBoxLayout(output_container)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(5)
-        output_layout.addWidget(self.output_editbox)
-        output_layout.addWidget(self.output_editbox_with_condition)
+
+        plain_output_container = QWidget()
+        plain_output_layout = QVBoxLayout(plain_output_container)
+        plain_output_layout.setContentsMargins(0, 0, 0, 0)
+        plain_output_layout.setSpacing(5)
+        plain_output_layout.addWidget(self.output_editbox)
+        plain_output_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignHCenter)
+
+        condition_output_container = QWidget()
+        condition_output_layout = QVBoxLayout(condition_output_container)
+        condition_output_layout.setContentsMargins(0, 0, 0, 0)
+        condition_output_layout.setSpacing(5)
+        condition_output_layout.addWidget(self.output_editbox_with_condition)
+        condition_output_layout.addWidget(self.stop_button_condition, alignment=Qt.AlignHCenter)
+
+        output_layout.addWidget(plain_output_container)
+        output_layout.addWidget(condition_output_container)
 
         union_container = QWidget()
         union_layout = QVBoxLayout(union_container)
@@ -109,13 +168,36 @@ class ChatTab(BaseTab):
         left_panel_layout.addWidget(union_container, alignment=Qt.AlignLeft)
 
         condition_toggle_layout = QHBoxLayout()
-        condition_toggle_layout.addWidget(self.condition_toggle_label, alignment=Qt.AlignLeft)
+        condition_toggle_layout.addWidget(self.condition_label, alignment=Qt.AlignLeft)
         condition_toggle_layout.addWidget(self.condition_toggle, alignment=Qt.AlignLeft)
+        condition_toggle_layout.addStretch()
+
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(self.format_label, alignment=Qt.AlignLeft)
+        format_layout.addWidget(self.format_input, alignment=Qt.AlignLeft)
+
+        length_layout = QHBoxLayout()
+        length_layout.addWidget(self.length_label, alignment=Qt.AlignLeft)
+        length_layout.addWidget(self.length_input, alignment=Qt.AlignLeft)
+
+        stop_seq_layout = QHBoxLayout()
+        stop_seq_layout.addWidget(self.stop_seq_label, alignment=Qt.AlignLeft)
+        stop_seq_layout.addWidget(self.stop_seq_input, alignment=Qt.AlignLeft)
+        
+        max_tokens_layout = QHBoxLayout()
+        max_tokens_layout.addWidget(self.max_tokens_label, alignment=Qt.AlignLeft)
+        max_tokens_layout.addWidget(self.max_tokens_input, alignment=Qt.AlignLeft)
 
         right_panel_container = QWidget()
         right_panel_layout = QVBoxLayout(right_panel_container)
         right_panel_layout.setContentsMargins(0, 0, 0, 0)
         right_panel_layout.addLayout(condition_toggle_layout)
+        right_panel_layout.addLayout(format_layout)
+        right_panel_layout.addLayout(length_layout)
+        right_panel_layout.addLayout(stop_seq_layout)
+        right_panel_layout.addLayout(max_tokens_layout)
+
+        right_panel_layout.addStretch()
 
         self.vertical_splitter = QSplitter(Qt.Horizontal)
         self.vertical_splitter.addWidget(left_panel_container)
@@ -162,44 +244,126 @@ class ChatTab(BaseTab):
 
         self.input_editbox.clear()
 
-        # Пишем в output “пользователь: …”
-        self.output_editbox.append(f"Ты: {text} \n")
-        self.output_editbox.append("GPT: ")
+        use_conditions = self.condition_toggle.isChecked()
+        target_output = self.output_editbox_with_condition if use_conditions else self.output_editbox
 
-        # включаем индикатор сразу при старте
+        self.stop_button_plain.setEnabled(False)
+        self.stop_button_condition.setEnabled(False)
+
+        if use_conditions:
+            self.stop_button_condition.setEnabled(True)
+        else:
+            self.stop_button_plain.setEnabled(True)
+
+        target_output.append(f"Ты: {text} \n")
+        target_output.append("GPT: ")
+
         self.set_loading(True)
 
-        asyncio.create_task(self.ask_and_stream_answer(text))
+        if use_conditions:
+            fmt = self.format_input.text().strip()
+            length_rule = self.length_input.text().strip()
+            stop_seq = self.stop_seq_input.text().strip()
 
-    async def ask_and_stream_answer(self, user_text: str):
-        self.logger.info("Отправка запроса в API")
+            instructions = []
+            if fmt:
+                instructions.append(f"Формат ответа: {fmt}")
+            if length_rule:
+                instructions.append(f"Ограничение длины: {length_rule}")
+            if stop_seq:
+                instructions.append(f"Условие завершения: в конце добавь строку {stop_seq} и после неё ничего не пиши.")
+
+            controlled_text = text
+            if instructions:
+                controlled_text = text + "\n\n" + "\n".join(instructions)
+
+            try:
+                max_tokens = int(self.max_tokens_input.text().strip())
+            except Exception:
+                max_tokens = 200
+                self.logger.warning("max_tokens задан неверно, использую 200.")
+        else:
+            controlled_text = text
+            max_tokens = 800
+
+        self.stop_requested = False
         self.is_generating = True
+        self.current_task = asyncio.create_task(
+            self.ask_and_stream_answer(controlled_text, target_output, use_conditions, max_tokens)
+        )
+
+
+    async def ask_and_stream_answer(self, user_text: str, target_output: QTextEdit, use_conditions: bool, max_tokens: int):
+        self.logger.info("Отправка запроса в API")
+
+        stop_seq = self.stop_seq_input.text().strip() if use_conditions else ""
+        buffer_text = ""
 
         try:
-            cursor = self.output_editbox.textCursor()
+            cursor = target_output.textCursor()
             cursor.movePosition(QTextCursor.End)
-            self.output_editbox.setTextCursor(cursor)
+            target_output.setTextCursor(cursor)
 
             async for chunk in self.gpt.stream_chat(
                 user_text=user_text,
                 system_text=None,
                 history=None,
-                max_tokens=800,
+                max_tokens=max_tokens,
             ):
-                self.output_editbox.insertPlainText(chunk)
-                self.output_editbox.moveCursor(QTextCursor.End)
-                self.output_editbox.ensureCursorVisible()
+                if self.stop_requested:
+                    break
 
-            self.output_editbox.append("")  # перенос строки после ответа
+                target_output.insertPlainText(chunk)
+                target_output.moveCursor(QTextCursor.End)
+                target_output.ensureCursorVisible()
+
+                # stop-sequence (явное завершение) — режем по ней
+                if use_conditions and stop_seq:
+                    buffer_text += chunk
+                    if stop_seq in buffer_text:
+                        # если стоп-строка прилетела — прекращаем
+                        break
+
+            target_output.append("")  # перенос строки после ответа
+
+        except asyncio.CancelledError:
+            target_output.append("\n[Остановлено пользователем]\n")
+            raise
 
         except Exception as e:
             self.logger.error_handler(e, context="ChatTab -> ask_and_stream_answer")
-            self.output_editbox.append(f"\n[Ошибка] {e}\n")
+            target_output.append(f"\n[Ошибка] {e}\n")
 
         finally:
             self.is_generating = False
+            self.current_task = None
             self.set_loading(False)
+            self.stop_button_plain.setEnabled(False)
+            self.stop_button_condition.setEnabled(False)
+
             self.logger.success("Ответ получен")
+
+
+    def stop_generation_plain(self):
+        self.stop_generation()
+
+    def stop_generation_condition(self):
+        self.stop_generation()
+
+    def stop_generation(self):
+        if not self.is_generating:
+            return
+
+        self.stop_requested = True
+
+        if self.current_task is not None and not self.current_task.done():
+            self.current_task.cancel()
+
+        self.stop_button_plain.setEnabled(False)
+        self.stop_button_condition.setEnabled(False)
+        self.set_loading(False)
+
+        self.logger.warning("Стрим остановлен пользователем.")
 
     def on_splitter_moved(self):
         self.splitter_move_timer.start(300)
