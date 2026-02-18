@@ -85,14 +85,26 @@ class ChatTab(BaseTab):
 
         # --- Кнопки STOP под каждое окно
         self.stop_button_plain = QPushButton("STOP")
-        self.stop_button_plain.setFixedWidth(445)
+        self.stop_button_plain.setFixedWidth(150)
         self.stop_button_plain.setEnabled(False)
         self.stop_button_plain.clicked.connect(self.stop_generation_plain)
 
+        self.clear_button_plain = QPushButton("CLEAR")
+        self.clear_button_plain.setFixedWidth(150)
+        self.clear_button_plain.setEnabled(False)
+        self.clear_button_plain.clicked.connect(self.clear_output_editbox)
+        self.output_editbox.textChanged.connect(self.set_enable_clear_button_plain)
+
         self.stop_button_condition = QPushButton("STOP")
-        self.stop_button_condition.setFixedWidth(445)
+        self.stop_button_condition.setFixedWidth(150)
         self.stop_button_condition.setEnabled(False)
         self.stop_button_condition.clicked.connect(self.stop_generation_condition)
+
+        self.clear_button_condition = QPushButton("CLEAR")
+        self.clear_button_condition.setFixedWidth(150)
+        self.clear_button_condition.setEnabled(False)
+        self.clear_button_condition.clicked.connect(self.clear_output_editbox_with_condition)
+        self.output_editbox_with_condition.textChanged.connect(self.set_enable_clear_button_condition)
 
         # --- Поля условий (правая панель)
         self.format_label = QLabel("Формат ответа:")
@@ -139,19 +151,29 @@ class ChatTab(BaseTab):
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(5)
 
+        outbox_plain_buttons_container = QWidget()
+        outbox_plain_layout = QHBoxLayout(outbox_plain_buttons_container)
+        outbox_plain_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignLeft)
+        outbox_plain_layout.addWidget(self.clear_button_plain, alignment=Qt.AlignRight)
+        
         plain_output_container = QWidget()
         plain_output_layout = QVBoxLayout(plain_output_container)
         plain_output_layout.setContentsMargins(0, 0, 0, 0)
         plain_output_layout.setSpacing(5)
         plain_output_layout.addWidget(self.output_editbox)
-        plain_output_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignHCenter)
+        plain_output_layout.addWidget(outbox_plain_buttons_container)
+
+        outbox_condition_buttons_container = QWidget()
+        outbox_condition_layout = QHBoxLayout(outbox_condition_buttons_container)
+        outbox_condition_layout.addWidget(self.stop_button_condition, alignment=Qt.AlignLeft)
+        outbox_condition_layout.addWidget(self.clear_button_condition, alignment=Qt.AlignRight)
 
         condition_output_container = QWidget()
         condition_output_layout = QVBoxLayout(condition_output_container)
         condition_output_layout.setContentsMargins(0, 0, 0, 0)
         condition_output_layout.setSpacing(5)
         condition_output_layout.addWidget(self.output_editbox_with_condition)
-        condition_output_layout.addWidget(self.stop_button_condition, alignment=Qt.AlignHCenter)
+        condition_output_layout.addWidget(outbox_condition_buttons_container)
 
         output_layout.addWidget(plain_output_container)
         output_layout.addWidget(condition_output_container)
@@ -205,8 +227,27 @@ class ChatTab(BaseTab):
 
         tab_layout.addWidget(self.vertical_splitter)
 
+    def set_enable_clear_button_plain(self):
+        state = True if self.output_editbox.toPlainText().strip() != "" else False
+        self.clear_button_plain.setEnabled(state) 
+
+    def set_enable_clear_button_condition(self):
+        state = True if self.output_editbox_with_condition.toPlainText().strip() != "" else False
+        self.clear_button_condition.setEnabled(state) 
+
+    def clear_output_editbox(self):
+        self.output_editbox.clear()
+        self.set_enable_clear_button_plain()
+
+    def clear_output_editbox_with_condition(self):
+        self.output_editbox_with_condition.clear()
+        self.set_enable_clear_button_condition()
+
     def condition_toggle_changed(self, state: bool):
         self.logger.info(f"Значение condition_toggle изменилось на {state}")
+        self.history = []
+        self.output_editbox_with_condition.clear() if state else self.output_editbox.clear()
+
 
     # ========= Enter отправляет, Shift+Enter перенос строки =========
     def eventFilter(self, obj, event):
@@ -292,24 +333,27 @@ class ChatTab(BaseTab):
             self.ask_and_stream_answer(controlled_text, target_output, use_conditions, max_tokens)
         )
 
-
     async def ask_and_stream_answer(self, user_text: str, target_output: QTextEdit, use_conditions: bool, max_tokens: int):
         self.logger.info("Отправка запроса в API")
 
         stop_seq = self.stop_seq_input.text().strip() if use_conditions else ""
         buffer_text = ""
 
+        gen = None
+
         try:
             cursor = target_output.textCursor()
             cursor.movePosition(QTextCursor.End)
             target_output.setTextCursor(cursor)
 
-            async for chunk in self.gpt.stream_chat(
+            gen = self.gpt.stream_chat(
                 user_text=user_text,
                 system_text=None,
                 history=None,
                 max_tokens=max_tokens,
-            ):
+            )
+
+            async for chunk in gen:
                 if self.stop_requested:
                     break
 
@@ -317,17 +361,18 @@ class ChatTab(BaseTab):
                 target_output.moveCursor(QTextCursor.End)
                 target_output.ensureCursorVisible()
 
-                # stop-sequence (явное завершение) — режем по ней
                 if use_conditions and stop_seq:
                     buffer_text += chunk
                     if stop_seq in buffer_text:
-                        # если стоп-строка прилетела — прекращаем
                         break
 
             target_output.append("")  # перенос строки после ответа
 
         except asyncio.CancelledError:
-            target_output.append("\n[Остановлено пользователем]\n")
+            try:
+                target_output.append("\n[Остановлено пользователем]\n")
+            except Exception:
+                pass
             raise
 
         except Exception as e:
@@ -335,14 +380,21 @@ class ChatTab(BaseTab):
             target_output.append(f"\n[Ошибка] {e}\n")
 
         finally:
+            # ВАЖНО: закрыть async generator всегда (и при stop-seq, и при STOP кнопке)
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except Exception:
+                    pass
+
             self.is_generating = False
             self.current_task = None
             self.set_loading(False)
+
             self.stop_button_plain.setEnabled(False)
             self.stop_button_condition.setEnabled(False)
 
             self.logger.success("Ответ получен")
-
 
     def stop_generation_plain(self):
         self.stop_generation()
