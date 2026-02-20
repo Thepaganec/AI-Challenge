@@ -2,7 +2,7 @@ import os, json, asyncio
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
-    QLineEdit, QPushButton
+    QLineEdit, QPushButton, QComboBox, QDoubleSpinBox
 )
 
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
@@ -44,12 +44,43 @@ class ChatTab(BaseTab):
         # Обработка отправки через Enter
         self.input_editbox.installEventFilter(self)
 
+        # --- Модель влияет на доступность temperature
+        self.model_selector.currentTextChanged.connect(self.on_model_changed)
+        self.on_model_changed(self.model_selector.currentText())
+
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
         # --- Шрифт
         font = QFont()
         font.setPointSize(13)
-        
+
+        # --- Верхняя панель настроек (модель / эндпоинт / температура)
+        self.model_label = QLabel("Модель:")
+        self.model_label.setFixedWidth(70)
+        self.model_selector = QComboBox()
+        self.model_selector.setFixedWidth(260)
+
+        # СНАЧАЛА модель с рабочей temperature (для Day 4)
+        self.model_selector.addItem("gpt-4o")
+        # Потом "старая" (у неё temperature в ProxyAPI заблокирована)
+        self.model_selector.addItem("openai/gpt-5.2-chat-latest")
+
+        self.endpoint_label = QLabel("Эндпоинт:")
+        self.endpoint_label.setFixedWidth(90)
+        self.endpoint_selector = QComboBox()
+        self.endpoint_selector.setFixedWidth(190)
+        self.endpoint_selector.addItem("Chat Completions", "chat")
+        self.endpoint_selector.addItem("Responses", "responses")
+
+        self.temperature_label = QLabel("temperature:")
+        self.temperature_label.setFixedWidth(95)
+        self.temperature_input = QDoubleSpinBox()
+        self.temperature_input.setFixedWidth(120)
+        self.temperature_input.setDecimals(1)
+        self.temperature_input.setSingleStep(0.1)
+        self.temperature_input.setRange(0.0, 2.0)
+        self.temperature_input.setValue(1.0)
+
         # --- Поле для ввода
         self.input_editbox = QTextEdit()
         self.input_editbox.setFont(font)
@@ -137,6 +168,28 @@ class ChatTab(BaseTab):
         tab_layout = QVBoxLayout(self.top_widget)
         tab_layout.setContentsMargins(0, 0, 0, 0)
 
+        # --- Верхняя панель по центру НАД всеми экранами
+        header_container = QWidget()
+        header_layout = QVBoxLayout(header_container)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+
+        header_layout.addWidget(self.model_label, alignment=Qt.AlignVCenter)
+        header_layout.addWidget(self.model_selector, alignment=Qt.AlignVCenter)
+        header_layout.addWidget(self.endpoint_label, alignment=Qt.AlignVCenter)
+        header_layout.addWidget(self.endpoint_selector, alignment=Qt.AlignVCenter)
+        header_layout.addWidget(self.temperature_label, alignment=Qt.AlignVCenter)
+        header_layout.addWidget(self.temperature_input, alignment=Qt.AlignVCenter)
+
+        header_wrap = QWidget()
+        header_wrap_layout = QHBoxLayout(header_wrap)
+        header_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        header_wrap_layout.addStretch()
+        header_wrap_layout.addWidget(header_container)
+        header_wrap_layout.addStretch()
+
+        tab_layout.addWidget(header_wrap)
+
         input_container = QWidget()
         input_container.setFixedWidth(450)
         input_layout = QVBoxLayout(input_container)
@@ -155,7 +208,7 @@ class ChatTab(BaseTab):
         outbox_plain_layout = QHBoxLayout(outbox_plain_buttons_container)
         outbox_plain_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignLeft)
         outbox_plain_layout.addWidget(self.clear_button_plain, alignment=Qt.AlignRight)
-        
+
         plain_output_container = QWidget()
         plain_output_layout = QVBoxLayout(plain_output_container)
         plain_output_layout.setContentsMargins(0, 0, 0, 0)
@@ -205,7 +258,7 @@ class ChatTab(BaseTab):
         stop_seq_layout = QHBoxLayout()
         stop_seq_layout.addWidget(self.stop_seq_label, alignment=Qt.AlignLeft)
         stop_seq_layout.addWidget(self.stop_seq_input, alignment=Qt.AlignLeft)
-        
+
         max_tokens_layout = QHBoxLayout()
         max_tokens_layout.addWidget(self.max_tokens_label, alignment=Qt.AlignLeft)
         max_tokens_layout.addWidget(self.max_tokens_input, alignment=Qt.AlignLeft)
@@ -218,7 +271,6 @@ class ChatTab(BaseTab):
         right_panel_layout.addLayout(length_layout)
         right_panel_layout.addLayout(stop_seq_layout)
         right_panel_layout.addLayout(max_tokens_layout)
-
         right_panel_layout.addStretch()
 
         self.vertical_splitter = QSplitter(Qt.Horizontal)
@@ -226,6 +278,21 @@ class ChatTab(BaseTab):
         self.vertical_splitter.addWidget(right_panel_container)
 
         tab_layout.addWidget(self.vertical_splitter)
+
+    def on_model_changed(self, model_text: str):
+        model_text = (model_text or "").strip()
+
+        # Для openai/gpt-5.2-chat-latest ProxyAPI запрещает temperature != 1
+        is_gpt52_locked = (model_text == "openai/gpt-5.2-chat-latest")
+
+        self.temperature_input.setEnabled(not is_gpt52_locked)
+
+        if is_gpt52_locked:
+            # Сбрасываем в 1.0, чтобы было очевидно, что иначе нельзя
+            self.temperature_input.setValue(1.0)
+            self.logger.warning("Для openai/gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
+        else:
+            self.logger.info(f"Выбрана модель {model_text}. temperature доступна.")
 
     def set_enable_clear_button_plain(self):
         state = True if self.output_editbox.toPlainText().strip() != "" else False
@@ -341,6 +408,14 @@ class ChatTab(BaseTab):
 
         gen = None
 
+        selected_model = self.model_selector.currentText().strip()
+        selected_endpoint = self.endpoint_selector.currentData()
+
+        # Если temperature поле заблокировано — не отправляем temperature вообще
+        selected_temperature = None
+        if self.temperature_input.isEnabled():
+            selected_temperature = float(self.temperature_input.value())
+
         try:
             cursor = target_output.textCursor()
             cursor.movePosition(QTextCursor.End)
@@ -351,6 +426,9 @@ class ChatTab(BaseTab):
                 system_text=None,
                 history=None,
                 max_tokens=max_tokens,
+                model=selected_model,
+                endpoint=selected_endpoint,
+                temperature=selected_temperature,
             )
 
             async for chunk in gen:
@@ -366,7 +444,7 @@ class ChatTab(BaseTab):
                     if stop_seq in buffer_text:
                         break
 
-            target_output.append("")  # перенос строки после ответа
+            target_output.append("")
 
         except asyncio.CancelledError:
             try:
@@ -380,7 +458,6 @@ class ChatTab(BaseTab):
             target_output.append(f"\n[Ошибка] {e}\n")
 
         finally:
-            # ВАЖНО: закрыть async generator всегда (и при stop-seq, и при STOP кнопке)
             if gen is not None:
                 try:
                     await gen.aclose()
