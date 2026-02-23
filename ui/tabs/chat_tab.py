@@ -1,4 +1,4 @@
-import os, json, asyncio
+import os, json, asyncio, time
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
@@ -48,6 +48,17 @@ class ChatTab(BaseTab):
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
         self.on_model_changed(self.model_selector.currentText())
 
+        # --- Day 5: прайс грузим ОДИН раз при инициализации
+        asyncio.get_event_loop().create_task(self.preload_pricing())
+
+    async def preload_pricing(self):
+        try:
+            self.logger.info("Загрузка тарифов ProxyAPI (pricing/list)...")
+            table = await self.gpt.get_pricing_rub_per_1m()
+            self.logger.success(f"Тарифы загружены: {len(table)} моделей")
+        except Exception as e:
+            self.logger.warning(f"Не удалось загрузить тарифы ProxyAPI: {e}")
+    
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
         # --- Шрифт
@@ -60,9 +71,10 @@ class ChatTab(BaseTab):
         self.model_selector = QComboBox()
         self.model_selector.setFixedWidth(260)
 
-        # СНАЧАЛА модель с рабочей temperature (для Day 4)
+        # Модели для Day 5: версии 3 / 4 / 5
+        self.model_selector.addItem("gpt-3.5-turbo")
+        self.model_selector.addItem("gpt-4o-mini")
         self.model_selector.addItem("gpt-4o")
-        # Потом "старая" (у неё temperature в ProxyAPI заблокирована)
         self.model_selector.addItem("openai/gpt-5.2-chat-latest")
 
         self.endpoint_label = QLabel("Эндпоинт:")
@@ -163,6 +175,16 @@ class ChatTab(BaseTab):
         self.max_tokens_input.setFixedWidth(350)
         self.max_tokens_input.setPlaceholderText("Например: 200")
         self.max_tokens_input.setText("200")
+
+        # --- Окно результатов замеров (правая панель)
+        self.metrics_label = QLabel("Результаты замеров (Day 5):")
+        self.metrics_box = QTextEdit()
+        self.metrics_box.setReadOnly(True)
+        self.metrics_box.setPlaceholderText(
+            "Здесь будет появляться результат каждой попытки:\n"
+            "TTFT / Total time / Tokens / Cost / Model / Endpoint / Temperature..."
+        )
+        self.metrics_box.setMinimumHeight(220)
 
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
         tab_layout = QVBoxLayout(self.top_widget)
@@ -271,6 +293,11 @@ class ChatTab(BaseTab):
         right_panel_layout.addLayout(length_layout)
         right_panel_layout.addLayout(stop_seq_layout)
         right_panel_layout.addLayout(max_tokens_layout)
+
+        right_panel_layout.addSpacing(10)
+        right_panel_layout.addWidget(self.metrics_label)
+        right_panel_layout.addWidget(self.metrics_box)
+
         right_panel_layout.addStretch()
 
         self.vertical_splitter = QSplitter(Qt.Horizontal)
@@ -416,6 +443,11 @@ class ChatTab(BaseTab):
         if self.temperature_input.isEnabled():
             selected_temperature = float(self.temperature_input.value())
 
+        # ===== Day 5: метрики времени
+        t0 = time.perf_counter()
+        ttft_sec = None
+        got_first_chunk = False
+
         try:
             cursor = target_output.textCursor()
             cursor.movePosition(QTextCursor.End)
@@ -429,11 +461,16 @@ class ChatTab(BaseTab):
                 model=selected_model,
                 endpoint=selected_endpoint,
                 temperature=selected_temperature,
+                include_usage=True,
             )
 
             async for chunk in gen:
                 if self.stop_requested:
                     break
+
+                if (not got_first_chunk) and chunk:
+                    got_first_chunk = True
+                    ttft_sec = time.perf_counter() - t0
 
                 target_output.insertPlainText(chunk)
                 target_output.moveCursor(QTextCursor.End)
@@ -464,6 +501,67 @@ class ChatTab(BaseTab):
                 except Exception:
                     pass
 
+            # ===== Время выполнения
+            total_sec = time.perf_counter() - t0
+
+            # ===== Usage (токены)
+            usage = getattr(self.gpt, "last_usage", None) or {}
+
+            prompt_tokens = (
+                usage.get("prompt_tokens")
+                or usage.get("input_tokens")
+                or 0
+            )
+
+            completion_tokens = (
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or 0
+            )
+
+            total_tokens = (
+                usage.get("total_tokens")
+                or (int(prompt_tokens) + int(completion_tokens))
+            )
+
+            # ===== Стоимость (через ProxyAPI pricing/list)
+            cost_rub = None
+            try:
+                price = await self.gpt.get_model_price_rub_per_1m(selected_model)
+
+                if isinstance(price, dict) and ("in" in price) and ("out" in price):
+                    cost_rub = (
+                        (float(prompt_tokens) / 1_000_000.0) * float(price["in"])
+                        + (float(completion_tokens) / 1_000_000.0) * float(price["out"])
+                    )
+            except Exception as e:
+                # Не ломаем выполнение, если прайс не подтянулся
+                self.logger.warning(
+                    f"Не удалось получить тарифы ProxyAPI для расчёта стоимости: {e}"
+                )
+
+            # ===== Формирование строки результата
+            ttft_str = f"{ttft_sec:.3f}s" if isinstance(ttft_sec, (int, float)) else "N/A"
+            temp_str = f"{selected_temperature}" if selected_temperature is not None else "locked(1.0)"
+            cost_str = f"{cost_rub:.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
+
+            result_line = (
+                f"Model={selected_model} | "
+                f"Endpoint={selected_endpoint} | "
+                f"Temp={temp_str} | "
+                f"TTFT={ttft_str} | "
+                f"Total={total_sec:.3f}s | "
+                f"Tokens={total_tokens} "
+                f"(p={prompt_tokens}, c={completion_tokens}) | "
+                f"Cost={cost_str}"
+            )
+
+            try:
+                self.metrics_box.append(result_line)
+            except Exception:
+                pass
+
+            # ===== Сброс состояния
             self.is_generating = False
             self.current_task = None
             self.set_loading(False)
