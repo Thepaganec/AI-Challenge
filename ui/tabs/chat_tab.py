@@ -75,7 +75,7 @@ class ChatTab(BaseTab):
         self.model_selector.addItem("gpt-3.5-turbo")
         self.model_selector.addItem("gpt-4o-mini")
         self.model_selector.addItem("gpt-4o")
-        self.model_selector.addItem("openai/gpt-5.2-chat-latest")
+        self.model_selector.addItem("gpt-5.2-chat-latest")
 
         self.endpoint_label = QLabel("Эндпоинт:")
         self.endpoint_label.setFixedWidth(90)
@@ -310,14 +310,14 @@ class ChatTab(BaseTab):
         model_text = (model_text or "").strip()
 
         # Для openai/gpt-5.2-chat-latest ProxyAPI запрещает temperature != 1
-        is_gpt52_locked = (model_text == "openai/gpt-5.2-chat-latest")
+        is_gpt52_locked = (model_text == "gpt-5.2-chat-latest")
 
         self.temperature_input.setEnabled(not is_gpt52_locked)
 
         if is_gpt52_locked:
             # Сбрасываем в 1.0, чтобы было очевидно, что иначе нельзя
             self.temperature_input.setValue(1.0)
-            self.logger.warning("Для openai/gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
+            self.logger.warning("Для gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
         else:
             self.logger.info(f"Выбрана модель {model_text}. temperature доступна.")
 

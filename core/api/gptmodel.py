@@ -11,7 +11,7 @@ class GPTModel:
         self,
         api_key_env: str = "PROXYAPI_KEY",
         base_url: str = "https://openai.api.proxyapi.ru/v1",
-        model: str = "openai/gpt-5.2-chat-latest",
+        model: str = "gpt-5.2-chat-latest",
         timeout_sec: int = 60,
     ):
         self.api_key = os.getenv(api_key_env)
