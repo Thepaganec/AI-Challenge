@@ -73,12 +73,14 @@ class LLMAgentServer:
         messages = session.get("messages") or []
         if not isinstance(messages, list):
             return []
+
         out = []
         for m in messages:
             role = (m.get("role") or "").strip()
             content = m.get("content")
             if role and isinstance(content, str):
                 out.append({"role": role, "content": content})
+
         return out
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -177,6 +179,11 @@ class LLMAgentServer:
             if not isinstance(messages, list):
                 messages = []
 
+            # 1) История для LLM формируется ДО добавления текущего user_text
+            session["messages"] = messages
+            history_for_llm = self._history_for_llm(session)
+
+            # 2) Сохраняем текущее user-сообщение в файл
             messages.append(
                 {
                     "role": "user",
@@ -198,15 +205,13 @@ class LLMAgentServer:
             assistant_answer = ""
 
             try:
-                history_for_llm = self._history_for_llm(session)
-
                 gen = self.gpt.stream_chat(
                     user_text=user_text,
                     system_text=None,
                     history=history_for_llm,
                     max_tokens=max_tokens,
                     model=model,
-                    endpoint=endpoint,  # Literal["chat","responses"] у твоего GPTModel
+                    endpoint=endpoint,
                     temperature=temperature,
                     include_usage=True,
                 )

@@ -112,7 +112,7 @@ class ChatTab(BaseTab):
             "Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит..."
         )
         self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        set_editbox_height(self.input_editbox, 8)
+        set_editbox_height(self.input_editbox, 7)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -124,14 +124,14 @@ class ChatTab(BaseTab):
         self.output_editbox.setFont(font)
         self.output_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.output_editbox.setReadOnly(True)
-        set_editbox_height(self.output_editbox, 15)
+        set_editbox_height(self.output_editbox, 10)
 
         # --- Поле для вывода ответа с условиями
         self.output_editbox_with_condition = QTextEdit()
         self.output_editbox_with_condition.setFont(font)
         self.output_editbox_with_condition.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.output_editbox_with_condition.setReadOnly(True)
-        set_editbox_height(self.output_editbox_with_condition, 15)
+        set_editbox_height(self.output_editbox_with_condition, 10)
 
         # --- Тогл для включения условий
         self.condition_toggle = ToggleSwitch()
@@ -223,12 +223,19 @@ class ChatTab(BaseTab):
         sessions_buttons_layout.addWidget(self.new_session_button)
         sessions_buttons_layout.addWidget(self.clear_session_button)
         
+        session_container = QWidget()
+        session_container.setFixedHeight(200)
+        session_layout = QVBoxLayout(session_container)
+        session_layout.setContentsMargins(0, 0, 0, 0)
+        session_layout.addWidget(self.sessions_list)
+        session_layout.addWidget(sessions_buttons)
+
         header_container = QWidget()
+        header_container.setFixedHeight(200)
         header_layout = QVBoxLayout(header_container)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(10)
 
-        header_layout.addWidget(sessions_buttons, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.model_label, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.model_selector, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.endpoint_label, alignment=Qt.AlignVCenter)
@@ -239,8 +246,8 @@ class ChatTab(BaseTab):
         header_wrap = QWidget()
         header_wrap_layout = QHBoxLayout(header_wrap)
         header_wrap_layout.setContentsMargins(0, 0, 0, 0)
-        header_wrap_layout.addWidget(self.sessions_list)
-        header_wrap_layout.addWidget(header_container)
+        header_wrap_layout.addWidget(session_container, alignment=Qt.AlignTop)
+        header_wrap_layout.addWidget(header_container, alignment=Qt.AlignTop)
         header_wrap_layout.addStretch()
 
         tab_layout.addWidget(header_wrap)

@@ -153,51 +153,52 @@ class GPTModel:
         user_text: str,
         system_text: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
-        max_tokens: int = 800,
-        *,
+        max_tokens: int = 512,
         model: Optional[str] = None,
-        endpoint: Literal["chat", "responses"] = "chat",
+        endpoint: str = "chat",
         temperature: Optional[float] = None,
-        include_usage: bool = True,
-    ) -> AsyncIterator[str]:
-
+        include_usage: bool = False,
+    ):
         selected_model = model or self.model
-        self.last_usage = None  # сбрасываем перед каждым запросом
-
-        messages: List[Dict[str, str]] = []
-        if system_text:
-            messages.append({"role": "system", "content": system_text})
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
+        messages: List[Dict[str, str]] = []
+
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+        if history:
+            for msg in history:
+                role = msg.get("role")
+                content = msg.get("content")
+                if role and content is not None:
+                    messages.append({"role": role, "content": str(content)})
+
+        # user_text добавляем отдельно — это важно, чтобы история не дублировалась
+        messages.append({"role": "user", "content": user_text})
+
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        self.last_usage = {}
 
         if endpoint == "chat":
             url = f"{self.base_url}/chat/completions"
 
-            payload: Dict[str, object] = {
+            payload_c: Dict[str, object] = {
                 "model": selected_model,
                 "messages": messages,
-                "max_completion_tokens": max_tokens,
                 "stream": True,
+                "max_tokens": max_tokens,
             }
 
-            # Просим usage в конце стрима, чтобы замерять токены
-            if include_usage:
-                payload["stream_options"] = {"include_usage": True}
-
-            # temperature отправляем только если явно задана и != 1
             if temperature is not None and float(temperature) != 1.0:
-                payload["temperature"] = float(temperature)
+                payload_c["temperature"] = float(temperature)
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
+                async with session.post(url, headers=headers, json=payload_c) as resp:
 
                     if resp.status < 200 or resp.status >= 300:
                         body_text = await resp.text()
@@ -207,7 +208,6 @@ class GPTModel:
 
                     async for raw_line in resp.content:
                         line = raw_line.decode("utf-8", errors="ignore").strip()
-
                         if not line or not line.startswith("data:"):
                             continue
 
@@ -220,28 +220,30 @@ class GPTModel:
                         except Exception:
                             continue
 
-                        # usage обычно приходит в одном из финальных чанков, если include_usage=True
                         try:
-                            usage = obj.get("usage")
-                            if isinstance(usage, dict):
-                                self.last_usage = usage
+                            if include_usage and isinstance(obj.get("usage"), dict):
+                                self.last_usage = obj.get("usage")
                         except Exception:
                             pass
 
                         try:
-                            delta = obj["choices"][0]["delta"]
-                            chunk = delta.get("content")
-                            if chunk:
-                                yield chunk
+                            choices = obj.get("choices")
+                            if isinstance(choices, list) and choices:
+                                delta = choices[0].get("delta")
+                                if isinstance(delta, dict):
+                                    content = delta.get("content")
+                                    if content:
+                                        yield content
                         except Exception:
                             continue
 
         else:
+            # ===== FIX: Responses должен получать историю, иначе "память" не работает
             url = f"{self.base_url}/responses"
 
             payload_r: Dict[str, object] = {
                 "model": selected_model,
-                "input": [{"role": "user", "content": user_text}],
+                "input": messages,          # <-- ВАЖНО: передаём всю историю + текущий user_text
                 "stream": True,
                 "max_output_tokens": max_tokens,
             }
@@ -272,14 +274,13 @@ class GPTModel:
                         except Exception:
                             continue
 
-                        # В Responses usage часто прилетает в событии завершения.
-                        # Мы не завязываемся на точный формат: ловим любой dict usage, где бы он ни был.
+                        # usage у responses часто в response.completed или внутри response.usage
                         try:
-                            if isinstance(obj.get("usage"), dict):
+                            if include_usage and isinstance(obj.get("usage"), dict):
                                 self.last_usage = obj.get("usage")
 
                             resp_obj = obj.get("response")
-                            if isinstance(resp_obj, dict) and isinstance(resp_obj.get("usage"), dict):
+                            if include_usage and isinstance(resp_obj, dict) and isinstance(resp_obj.get("usage"), dict):
                                 self.last_usage = resp_obj.get("usage")
                         except Exception:
                             pass
