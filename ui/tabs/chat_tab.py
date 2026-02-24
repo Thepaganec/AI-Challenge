@@ -1,8 +1,9 @@
 import os, json, asyncio, time
+import uuid
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
-    QLineEdit, QPushButton, QComboBox, QDoubleSpinBox
+    QLineEdit, QPushButton, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem
 )
 
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
@@ -10,7 +11,7 @@ from PySide6.QtGui import QTextCursor, QFont
 
 from ui.custom_objects.toggle_switch import ToggleSwitch
 from ui.tabs.base_tab import BaseTab
-from core.api.gptmodel import GPTModel
+from core.agent.agent_client import AgentClient
 from extra.Global import (set_editbox_height)
 
 class ChatTab(BaseTab):
@@ -21,8 +22,15 @@ class ChatTab(BaseTab):
     def __init__(self, logger):
         super().__init__(logger)
 
-        self.gpt = GPTModel()
-        self.history = []
+        self.agent = AgentClient()
+
+        # --- sessions
+        self.current_session_id = str(uuid.uuid4())
+        self.sessions_index = {}
+
+        # --- agent connection
+        self.is_agent_connected = False
+        self.agent_watchdog_task = None
 
         # --- Служебные
         self.is_generating = False
@@ -48,8 +56,12 @@ class ChatTab(BaseTab):
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
         self.on_model_changed(self.model_selector.currentText())
 
-        # --- Day 5: прайс грузим ОДИН раз при инициализации
-        asyncio.get_event_loop().create_task(self.preload_pricing())
+        # --- агент: первичная проверка + вечный watchdog переподключения
+        asyncio.get_event_loop().create_task(self.preload_agent_status())
+        self.agent_watchdog_task = asyncio.get_event_loop().create_task(self.agent_connection_watchdog())
+
+        # --- наполним список сессий хотя бы текущей, даже если агент оффлайн
+        self.render_sessions_list_offline()
 
     async def preload_pricing(self):
         try:
@@ -191,11 +203,32 @@ class ChatTab(BaseTab):
         tab_layout.setContentsMargins(0, 0, 0, 0)
 
         # --- Верхняя панель по центру НАД всеми экранами
+        # --- Список сессий (верхняя левая часть)
+        self.sessions_list = QListWidget(self)
+        self.sessions_list.setMinimumHeight(140)
+        self.sessions_list.itemClicked.connect(self.on_session_clicked)
+
+        self.new_session_button = QPushButton("Новая сессия")
+        self.new_session_button.setFixedHeight(34)
+        self.new_session_button.clicked.connect(self.on_new_session_clicked)
+
+        self.clear_session_button = QPushButton("Очистить сессию")
+        self.clear_session_button.setFixedHeight(34)
+        self.clear_session_button.clicked.connect(self.on_clear_session_clicked)
+
+        sessions_buttons = QWidget()
+        sessions_buttons_layout = QHBoxLayout(sessions_buttons)
+        sessions_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        sessions_buttons_layout.setSpacing(6)
+        sessions_buttons_layout.addWidget(self.new_session_button)
+        sessions_buttons_layout.addWidget(self.clear_session_button)
+        
         header_container = QWidget()
         header_layout = QVBoxLayout(header_container)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(10)
 
+        header_layout.addWidget(sessions_buttons, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.model_label, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.model_selector, alignment=Qt.AlignVCenter)
         header_layout.addWidget(self.endpoint_label, alignment=Qt.AlignVCenter)
@@ -206,7 +239,7 @@ class ChatTab(BaseTab):
         header_wrap = QWidget()
         header_wrap_layout = QHBoxLayout(header_wrap)
         header_wrap_layout.setContentsMargins(0, 0, 0, 0)
-        header_wrap_layout.addStretch()
+        header_wrap_layout.addWidget(self.sessions_list)
         header_wrap_layout.addWidget(header_container)
         header_wrap_layout.addStretch()
 
@@ -305,6 +338,190 @@ class ChatTab(BaseTab):
         self.vertical_splitter.addWidget(right_panel_container)
 
         tab_layout.addWidget(self.vertical_splitter)
+
+    
+    def render_sessions_list_offline(self):
+        try:
+            self.sessions_list.blockSignals(True)
+            self.sessions_list.clear()
+
+            label = f"{self.current_session_id} — (текущая, новая)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, self.current_session_id)
+            self.sessions_list.addItem(item)
+        finally:
+            try:
+                self.sessions_list.blockSignals(False)
+            except Exception:
+                pass
+
+    async def preload_agent_status(self):
+        try:
+            self.logger.info("Подключение к агенту (локальный сервер)...")
+            ok = await self.agent.ping()
+            self.is_agent_connected = bool(ok)
+
+            if self.is_agent_connected:
+                self.logger.success("Агент найден: подключение успешно")
+                await self.refresh_sessions_list()
+            else:
+                self.logger.warning("Агент не отвечает. Запусти agent_server.py перед запуском UI.")
+        except Exception as e:
+            self.is_agent_connected = False
+            self.logger.warning(f"Не удалось подключиться к агенту: {e}")
+
+    async def agent_connection_watchdog(self):
+        while True:
+            try:
+                if not self.is_agent_connected:
+                    self.logger.warning("Агент OFFLINE: попытка подключиться к серверу...")
+                    ok = await self.agent.ping()
+
+                    if ok:
+                        self.is_agent_connected = True
+                        self.logger.success("Агент ONLINE: соединение восстановлено")
+                        await self.refresh_sessions_list()
+            except Exception as e:
+                self.is_agent_connected = False
+                self.logger.warning(f"Ошибка проверки агента: {e}")
+
+            await asyncio.sleep(5)
+
+    async def refresh_sessions_list(self):
+        if not self.is_agent_connected:
+            self.render_sessions_list_offline()
+            return
+
+        try:
+            sessions = await self.agent.list_sessions()
+        except Exception as e:
+            self.logger.warning(f"Не удалось получить список сессий: {e}")
+            self.render_sessions_list_offline()
+            return
+
+        self.sessions_list.blockSignals(True)
+        self.sessions_list.clear()
+        self.sessions_index = {}
+
+        found_current = False
+
+        for s in sessions:
+            sid = (s.get("session_id") or "").strip()
+            title = (s.get("title") or "").strip()
+            if not sid:
+                continue
+
+            if sid == self.current_session_id:
+                found_current = True
+
+            label = f"{sid} — {title or 'Без темы'}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, sid)
+            self.sessions_list.addItem(item)
+            self.sessions_index[sid] = title or "Без темы"
+
+        if not found_current:
+            label = f"{self.current_session_id} — (текущая, новая)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, self.current_session_id)
+            self.sessions_list.insertItem(0, item)
+            self.sessions_index[self.current_session_id] = "(текущая, новая)"
+
+        self.sessions_list.blockSignals(False)
+
+    def on_session_clicked(self, item: QListWidgetItem):
+        sid = item.data(Qt.UserRole)
+        if not sid:
+            return
+
+        self.current_session_id = str(sid)
+        asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
+
+    async def load_session_to_ui(self, session_id: str):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: не могу загрузить историю")
+            return
+
+        try:
+            session = await self.agent.get_session(session_id)
+        except Exception as e:
+            self.logger.warning(f"Не удалось загрузить сессию {session_id}: {e}")
+            return
+
+        if not session:
+            return
+
+        messages = session.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
+
+        try:
+            self.output_editbox.clear()
+            self.output_editbox_with_condition.clear()
+        except Exception:
+            pass
+
+        for m in messages:
+            role = (m.get("role") or "").strip()
+            content = m.get("content") or ""
+
+            if role == "user":
+                prefix = "Ты: "
+            elif role == "assistant":
+                prefix = "GPT: "
+            else:
+                prefix = f"{role}: " if role else ""
+
+            self.output_editbox.append(prefix + content)
+            self.output_editbox.append("")
+
+    def on_new_session_clicked(self):
+        if self.is_generating:
+            self.logger.warning("Нельзя сменить сессию во время генерации.")
+            return
+
+        self.current_session_id = str(uuid.uuid4())
+
+        try:
+            self.output_editbox.clear()
+            self.output_editbox_with_condition.clear()
+        except Exception:
+            pass
+
+        self.logger.success(f"Создана новая сессия: {self.current_session_id}")
+
+        if self.is_agent_connected:
+            asyncio.get_event_loop().create_task(self.refresh_sessions_list())
+        else:
+            self.render_sessions_list_offline()
+
+    def on_clear_session_clicked(self):
+        if self.is_generating:
+            self.logger.warning("Нельзя очистить сессию во время генерации.")
+            return
+
+        async def _do():
+            if not self.is_agent_connected:
+                self.logger.warning("Агент OFFLINE: очистка сессии невозможна.")
+                return
+
+            try:
+                ok = await self.agent.reset_session(self.current_session_id)
+                if ok:
+                    try:
+                        self.output_editbox.clear()
+                        self.output_editbox_with_condition.clear()
+                    except Exception:
+                        pass
+
+                    self.logger.success(f"Сессия очищена: {self.current_session_id}")
+                    await self.refresh_sessions_list()
+                else:
+                    self.logger.warning("Не удалось очистить сессию (agent вернул False).")
+            except Exception as e:
+                self.logger.warning(f"Ошибка очистки сессии: {e}")
+
+        asyncio.get_event_loop().create_task(_do())
 
     def on_model_changed(self, model_text: str):
         model_text = (model_text or "").strip()
@@ -428,7 +645,7 @@ class ChatTab(BaseTab):
         )
 
     async def ask_and_stream_answer(self, user_text: str, target_output: QTextEdit, use_conditions: bool, max_tokens: int):
-        self.logger.info("Отправка запроса в API")
+        self.logger.info("Отправка запроса в агент")
 
         stop_seq = self.stop_seq_input.text().strip() if use_conditions else ""
         buffer_text = ""
@@ -438,30 +655,39 @@ class ChatTab(BaseTab):
         selected_model = self.model_selector.currentText().strip()
         selected_endpoint = self.endpoint_selector.currentData()
 
-        # Если temperature поле заблокировано — не отправляем temperature вообще
         selected_temperature = None
         if self.temperature_input.isEnabled():
             selected_temperature = float(self.temperature_input.value())
 
-        # ===== Day 5: метрики времени
         t0 = time.perf_counter()
         ttft_sec = None
         got_first_chunk = False
 
         try:
+            if not self.is_agent_connected:
+                self.logger.warning("Агент OFFLINE: проверяю доступность перед отправкой...")
+                try:
+                    ok = await self.agent.ping()
+                except Exception:
+                    ok = False
+
+                self.is_agent_connected = bool(ok)
+
+                if not self.is_agent_connected:
+                    target_output.append("\n[Ошибка] Агент не запущен или недоступен (server OFFLINE).\n")
+                    return
+
             cursor = target_output.textCursor()
             cursor.movePosition(QTextCursor.End)
             target_output.setTextCursor(cursor)
 
-            gen = self.gpt.stream_chat(
+            gen = self.agent.stream_chat(
                 user_text=user_text,
-                system_text=None,
-                history=None,
-                max_tokens=max_tokens,
                 model=selected_model,
                 endpoint=selected_endpoint,
+                max_tokens=max_tokens,
                 temperature=selected_temperature,
-                include_usage=True,
+                session_id=self.current_session_id,
             )
 
             async for chunk in gen:
@@ -491,6 +717,10 @@ class ChatTab(BaseTab):
             raise
 
         except Exception as e:
+            if self.is_agent_connected:
+                self.is_agent_connected = False
+                self.logger.error("Соединение с агентом потеряно (server OFFLINE)")
+
             self.logger.error_handler(e, context="ChatTab -> ask_and_stream_answer")
             target_output.append(f"\n[Ошибка] {e}\n")
 
@@ -501,46 +731,15 @@ class ChatTab(BaseTab):
                 except Exception:
                     pass
 
-            # ===== Время выполнения
             total_sec = time.perf_counter() - t0
 
-            # ===== Usage (токены)
-            usage = getattr(self.gpt, "last_usage", None) or {}
+            usage = getattr(self.agent, "last_usage", None) or {}
+            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            total_tokens = usage.get("total_tokens") or (int(prompt_tokens) + int(completion_tokens))
 
-            prompt_tokens = (
-                usage.get("prompt_tokens")
-                or usage.get("input_tokens")
-                or 0
-            )
+            cost_rub = getattr(self.agent, "last_cost_rub", None)
 
-            completion_tokens = (
-                usage.get("completion_tokens")
-                or usage.get("output_tokens")
-                or 0
-            )
-
-            total_tokens = (
-                usage.get("total_tokens")
-                or (int(prompt_tokens) + int(completion_tokens))
-            )
-
-            # ===== Стоимость (через ProxyAPI pricing/list)
-            cost_rub = None
-            try:
-                price = await self.gpt.get_model_price_rub_per_1m(selected_model)
-
-                if isinstance(price, dict) and ("in" in price) and ("out" in price):
-                    cost_rub = (
-                        (float(prompt_tokens) / 1_000_000.0) * float(price["in"])
-                        + (float(completion_tokens) / 1_000_000.0) * float(price["out"])
-                    )
-            except Exception as e:
-                # Не ломаем выполнение, если прайс не подтянулся
-                self.logger.warning(
-                    f"Не удалось получить тарифы ProxyAPI для расчёта стоимости: {e}"
-                )
-
-            # ===== Формирование строки результата
             ttft_str = f"{ttft_sec:.3f}s" if isinstance(ttft_sec, (int, float)) else "N/A"
             temp_str = f"{selected_temperature}" if selected_temperature is not None else "locked(1.0)"
             cost_str = f"{cost_rub:.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
@@ -561,7 +760,6 @@ class ChatTab(BaseTab):
             except Exception:
                 pass
 
-            # ===== Сброс состояния
             self.is_generating = False
             self.current_task = None
             self.set_loading(False)
@@ -570,6 +768,9 @@ class ChatTab(BaseTab):
             self.stop_button_condition.setEnabled(False)
 
             self.logger.success("Ответ получен")
+
+            if self.is_agent_connected:
+                asyncio.get_event_loop().create_task(self.refresh_sessions_list())
 
     def stop_generation_plain(self):
         self.stop_generation()
