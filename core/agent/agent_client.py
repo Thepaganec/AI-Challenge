@@ -66,7 +66,9 @@ class AgentClient:
                 pass
 
     async def get_session(self, session_id: str) -> Optional[dict]:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
+        # ВАЖНО: увеличиваем лимит StreamReader, чтобы readline() не падал на больших JSON-строках
+        reader, writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
+
         writer.write(
             (json.dumps({"action": "get_session", "session_id": session_id}, ensure_ascii=False) + "\n").encode("utf-8")
         )
@@ -78,11 +80,50 @@ class AgentClient:
                 return None
 
             msg = json.loads(line.decode("utf-8", errors="replace"))
+
+            # обычный короткий ответ
             if msg.get("type") == "session":
                 return msg.get("session")
             if msg.get("type") == "error":
                 raise RuntimeError(msg.get("message") or "Agent error")
+
+            # chunked ответ (если сервер уже умеет)
+            if msg.get("type") == "chunked_start" and msg.get("orig_type") == "session":
+                chunks = int(msg.get("chunks") or 0)
+                parts = [""] * chunks
+
+                while True:
+                    line2 = await reader.readline()
+                    if not line2:
+                        break
+
+                    m2 = json.loads(line2.decode("utf-8", errors="replace"))
+                    t = m2.get("type")
+
+                    if t == "chunked_part" and m2.get("orig_type") == "session":
+                        i = int(m2.get("i") or 0)
+                        data = m2.get("data") or ""
+                        if 0 <= i < chunks:
+                            parts[i] = data
+                        continue
+
+                    if t == "chunked_end" and m2.get("orig_type") == "session":
+                        break
+
+                    if t == "error":
+                        raise RuntimeError(m2.get("message") or "Agent error")
+
+                full_text = "".join(parts)
+                payload = json.loads(full_text)
+
+                if payload.get("type") == "session":
+                    return payload.get("session")
+                if payload.get("type") == "error":
+                    raise RuntimeError(payload.get("message") or "Agent error")
+                return None
+
             return None
+
         finally:
             try:
                 writer.close()

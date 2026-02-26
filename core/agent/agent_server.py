@@ -69,6 +69,39 @@ class LLMAgentServer:
         writer.write(data)
         await writer.drain()
 
+    async def _send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
+        """
+        Если payload слишком большой для одной строки readline() у клиента — шлём в несколько строк.
+
+        Протокол:
+        1) {"type":"chunked_start","orig_type":"session","chunks":N}
+        2) N строк {"type":"chunked_part","orig_type":"session","i":0..N-1,"data":"..."}
+        3) {"type":"chunked_end","orig_type":"session"}
+        """
+        text = json.dumps(payload, ensure_ascii=False)
+        raw = (text + "\n").encode("utf-8")
+
+        if len(raw) <= max_line_bytes:
+            writer.write(raw)
+            await writer.drain()
+            return
+
+        part_size = max(1000, max_line_bytes - 2000)
+        parts = [text[i:i + part_size] for i in range(0, len(text), part_size)]
+
+        start = {"type": "chunked_start", "orig_type": payload.get("type"), "chunks": len(parts)}
+        writer.write((json.dumps(start, ensure_ascii=False) + "\n").encode("utf-8"))
+        await writer.drain()
+
+        for i, part in enumerate(parts):
+            msg = {"type": "chunked_part", "orig_type": payload.get("type"), "i": i, "data": part}
+            writer.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+            await writer.drain()
+
+        end = {"type": "chunked_end", "orig_type": payload.get("type")}
+        writer.write((json.dumps(end, ensure_ascii=False) + "\n").encode("utf-8"))
+        await writer.drain()
+
     def _history_for_llm(self, session: dict) -> list:
         history = session.get("history") or {}
         if not isinstance(history, dict):
@@ -139,7 +172,9 @@ class LLMAgentServer:
                     return
 
                 session = self.memory_store.load_session(session_id)
-                await self._send_json(writer, {"type": "session", "session": session})
+
+                # ВАЖНО: сессия может быть огромной -> шлём chunked, чтобы readline() у клиента не падал
+                await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
                 return
 
             if action == "reset_session":
@@ -148,7 +183,6 @@ class LLMAgentServer:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
-                # удаляем файл полностью
                 self.memory_store.delete_session_file(session_id)
                 await self._send_json(writer, {"type": "ok"})
                 return
@@ -224,12 +258,6 @@ class LLMAgentServer:
             session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.memory_store.save_session(session)
 
-            self.logger.write(
-                "INFO",
-                "Запрос к LLM",
-                extra=f"session_id={session_id} title={session.get('title','')} model={model} endpoint={endpoint}",
-            )
-
             gen = None
             assistant_answer = ""
 
@@ -256,7 +284,6 @@ class LLMAgentServer:
                 c = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
                 total_call = int(usage.get("total_tokens") or (r + c))
 
-                # то, что тебе нужно:
                 current_message_tokens = int(max(r - int(r_prev_prompt_total), 0) + c)
 
                 history[turn_id]["assistant_text"] = assistant_answer
