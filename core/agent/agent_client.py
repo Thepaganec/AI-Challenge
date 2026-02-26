@@ -17,6 +17,8 @@ class AgentClient:
         self.last_endpoint: Optional[str] = None
         self.last_title: Optional[str] = None
 
+        self.last_message_stats: Dict[str, Any] = {}
+
     async def ping(self) -> bool:
         try:
             reader, writer = await asyncio.wait_for(
@@ -123,6 +125,7 @@ class AgentClient:
         self.last_model = None
         self.last_endpoint = None
         self.last_title = None
+        self.last_message_stats = {}
 
         reader, writer = await asyncio.open_connection(self.host, self.port)
 
@@ -160,6 +163,7 @@ class AgentClient:
                     self.last_usage = msg.get("usage") or {}
                     self.last_cost_rub = msg.get("cost_rub", None)
                     self.last_title = msg.get("title") or None
+                    self.last_message_stats = msg.get("message_stats") or {}
                     break
 
                 if msg_type == "error":

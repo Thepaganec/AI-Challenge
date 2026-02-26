@@ -70,16 +70,25 @@ class LLMAgentServer:
         await writer.drain()
 
     def _history_for_llm(self, session: dict) -> list:
-        messages = session.get("messages") or []
-        if not isinstance(messages, list):
+        history = session.get("history") or {}
+        if not isinstance(history, dict):
             return []
 
         out = []
-        for m in messages:
-            role = (m.get("role") or "").strip()
-            content = m.get("content")
-            if role and isinstance(content, str):
-                out.append({"role": role, "content": content})
+        try:
+            keys = sorted(history.keys(), key=lambda x: int(x))
+        except Exception:
+            keys = list(history.keys())
+
+        for k in keys:
+            turn = history.get(k) or {}
+            user_text = turn.get("user_text")
+            assistant_text = turn.get("assistant_text")
+
+            if isinstance(user_text, str) and user_text:
+                out.append({"role": "user", "content": user_text})
+            if isinstance(assistant_text, str) and assistant_text:
+                out.append({"role": "assistant", "content": assistant_text})
 
         return out
 
@@ -139,11 +148,8 @@ class LLMAgentServer:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
-                session = self.memory_store.load_session(session_id)
-                session["messages"] = []
-                session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.memory_store.save_session(session)
-
+                # удаляем файл полностью
+                self.memory_store.delete_session_file(session_id)
                 await self._send_json(writer, {"type": "ok"})
                 return
 
@@ -175,23 +181,46 @@ class LLMAgentServer:
             session = self.memory_store.load_session(session_id)
             self.memory_store.set_title_if_empty(session, user_text)
 
-            messages = session.get("messages") or []
-            if not isinstance(messages, list):
-                messages = []
+            history = session.get("history") or {}
+            if not isinstance(history, dict):
+                history = {}
 
-            # 1) История для LLM формируется ДО добавления текущего user_text
-            session["messages"] = messages
+            # история для LLM до добавления текущего сообщения
+            session["history"] = history
             history_for_llm = self._history_for_llm(session)
 
-            # 2) Сохраняем текущее user-сообщение в файл
-            messages.append(
-                {
-                    "role": "user",
-                    "content": user_text,
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-            session["messages"] = messages
+            # turn_id
+            try:
+                last_idx = max([int(k) for k in history.keys()] or [0])
+            except Exception:
+                last_idx = 0
+            turn_id = str(last_idx + 1)
+
+            # r_prev_prompt_total (из предыдущего turn)
+            r_prev_prompt_total = 0
+            if last_idx > 0:
+                prev_turn = history.get(str(last_idx)) or {}
+                r_prev_prompt_total = int(prev_turn.get("r_prompt_total") or 0)
+
+            # сохраняем turn с user_text заранее
+            history[turn_id] = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "user_text": user_text,
+                "assistant_text": "",
+                "model": model,
+                "endpoint": endpoint,
+                "max_tokens": int(max_tokens),
+                "temperature": temperature,
+                "usage": {},
+                "cost_rub": None,
+                "r_prompt_total": 0,
+                "c_completion": 0,
+                "total_tokens_call": 0,
+                "r_prev_prompt_total": int(r_prev_prompt_total),
+                "current_message_tokens": 0,
+            }
+
+            session["history"] = history
             session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.memory_store.save_session(session)
 
@@ -220,19 +249,38 @@ class LLMAgentServer:
                     assistant_answer += chunk
                     await self._send_json(writer, {"type": "chunk", "chunk": chunk})
 
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_answer,
-                        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                )
-                session["messages"] = messages
+                usage = getattr(self.gpt, "last_usage", None) or {}
+                cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
+
+                r = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                c = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                total_call = int(usage.get("total_tokens") or (r + c))
+
+                # то, что тебе нужно:
+                current_message_tokens = int(max(r - int(r_prev_prompt_total), 0) + c)
+
+                history[turn_id]["assistant_text"] = assistant_answer
+                history[turn_id]["usage"] = usage
+                history[turn_id]["cost_rub"] = cost_rub
+                history[turn_id]["r_prompt_total"] = int(r)
+                history[turn_id]["c_completion"] = int(c)
+                history[turn_id]["total_tokens_call"] = int(total_call)
+                history[turn_id]["r_prev_prompt_total"] = int(r_prev_prompt_total)
+                history[turn_id]["current_message_tokens"] = int(current_message_tokens)
+
+                session["history"] = history
                 session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.memory_store.save_session(session)
 
-                usage = getattr(self.gpt, "last_usage", None) or {}
-                cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
+                message_stats = {
+                    "turn_id": turn_id,
+                    "r_prompt_total": int(r),
+                    "r_prev_prompt_total": int(r_prev_prompt_total),
+                    "c_completion": int(c),
+                    "current_message_tokens": int(current_message_tokens),
+                    "total_tokens_call": int(total_call),
+                    "cost_rub": cost_rub,
+                }
 
                 await self._send_json(
                     writer,
@@ -244,10 +292,9 @@ class LLMAgentServer:
                         "cost_rub": cost_rub,
                         "session_id": session_id,
                         "title": session.get("title") or "",
+                        "message_stats": message_stats,
                     },
                 )
-
-                self.logger.write("SUCCESS", "Ответ сформирован", extra=f"session_id={session_id} cost_rub={cost_rub}")
 
             finally:
                 if gen is not None:
@@ -258,12 +305,10 @@ class LLMAgentServer:
 
         except Exception as e:
             tb = traceback.format_exc()
-            self.logger.write("ERROR", "Ошибка обработки клиента", extra=str(e))
+            msg = str(e) or "Unknown error"
+            self.logger.write("ERROR", "Ошибка обработки клиента", extra=msg)
             self.logger.write("ERROR", "TRACEBACK", extra=tb)
-            try:
-                await self._send_json(writer, {"type": "error", "message": str(e)})
-            except Exception:
-                pass
+            await self._send_json(writer, {"type": "error", "message": msg})
 
         finally:
             try:

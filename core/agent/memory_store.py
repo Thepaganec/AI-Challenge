@@ -112,6 +112,64 @@ class AgentMemoryStore:
 
                 if isinstance(data, dict) and data.get("session_id") == session_id:
                     data["file_path"] = path
+
+                    # миграция старого формата -> новый history(dict)
+                    if "history" not in data:
+                        old_messages = data.get("messages")
+                        if isinstance(old_messages, list):
+                            history: Dict[str, Any] = {}
+                            idx = 0
+                            pending_user = None
+
+                            for m in old_messages:
+                                role = (m.get("role") or "").strip()
+                                content = m.get("content")
+
+                                if role == "user" and isinstance(content, str):
+                                    pending_user = {"text": content, "ts": m.get("ts")}
+                                elif role == "assistant" and isinstance(content, str):
+                                    if pending_user is None:
+                                        pending_user = {"text": "", "ts": m.get("ts")}
+                                    idx += 1
+                                    history[str(idx)] = {
+                                        "ts": pending_user.get("ts"),
+                                        "user_text": pending_user.get("text") or "",
+                                        "assistant_text": content,
+                                        "model": None,
+                                        "endpoint": None,
+                                        "usage": {},
+                                        "cost_rub": None,
+                                        "r_prompt_total": 0,
+                                        "c_completion": 0,
+                                        "total_tokens_call": 0,
+                                        "r_prev_prompt_total": 0,
+                                        "current_message_tokens": 0,
+                                    }
+                                    pending_user = None
+
+                            if pending_user is not None:
+                                idx += 1
+                                history[str(idx)] = {
+                                    "ts": pending_user.get("ts"),
+                                    "user_text": pending_user.get("text") or "",
+                                    "assistant_text": "",
+                                    "model": None,
+                                    "endpoint": None,
+                                    "usage": {},
+                                    "cost_rub": None,
+                                    "r_prompt_total": 0,
+                                    "c_completion": 0,
+                                    "total_tokens_call": 0,
+                                    "r_prev_prompt_total": 0,
+                                    "current_message_tokens": 0,
+                                }
+
+                            data["history"] = history
+                            data.pop("messages", None)
+
+                    if not isinstance(data.get("history"), dict):
+                        data["history"] = {}
+
                     return data
             except Exception:
                 pass
@@ -122,10 +180,21 @@ class AgentMemoryStore:
             "title": "",
             "created_at": created_at,
             "updated_at": created_at,
-            "messages": [],
+            "history": {},
             "file_path": self._session_file_path_today(session_id),
         }
         return data
+
+    def delete_session_file(self, session_id: str) -> bool:
+        path = self._find_latest_file_for_session(session_id)
+        if not path:
+            return False
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return True
+        except Exception:
+            return False
 
     def save_session(self, session: Dict[str, Any]) -> str:
         session_id = (session.get("session_id") or "").strip()

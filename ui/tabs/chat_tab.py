@@ -253,7 +253,7 @@ class ChatTab(BaseTab):
         tab_layout.addWidget(header_wrap)
 
         input_container = QWidget()
-        input_container.setFixedWidth(450)
+        input_container.setFixedWidth(400)
         input_layout = QVBoxLayout(input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(5)
@@ -261,7 +261,7 @@ class ChatTab(BaseTab):
         input_layout.addWidget(self.progress_bar, alignment=Qt.AlignTop)
 
         output_container = QWidget()
-        output_container.setFixedWidth(900)
+        output_container.setFixedWidth(820)
         output_layout = QHBoxLayout(output_container)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(5)
@@ -458,29 +458,69 @@ class ChatTab(BaseTab):
         if not session:
             return
 
-        messages = session.get("messages") or []
-        if not isinstance(messages, list):
-            messages = []
+        history = session.get("history") or {}
+        if not isinstance(history, dict):
+            history = {}
 
         try:
             self.output_editbox.clear()
             self.output_editbox_with_condition.clear()
+            self.metrics_box.clear()
         except Exception:
             pass
 
-        for m in messages:
-            role = (m.get("role") or "").strip()
-            content = m.get("content") or ""
+        try:
+            keys = sorted(history.keys(), key=lambda x: int(x))
+        except Exception:
+            keys = list(history.keys())
 
-            if role == "user":
-                prefix = "Ты: "
-            elif role == "assistant":
-                prefix = "GPT: "
-            else:
-                prefix = f"{role}: " if role else ""
+        last_turn = None
 
-            self.output_editbox.append(prefix + content)
-            self.output_editbox.append("")
+        for k in keys:
+            turn = history.get(k) or {}
+            user_text = turn.get("user_text") or ""
+            assistant_text = turn.get("assistant_text") or ""
+
+            if user_text:
+                self.output_editbox.append("Ты: " + user_text)
+                self.output_editbox.append("")
+            if assistant_text:
+                self.output_editbox.append("GPT: " + assistant_text)
+                self.output_editbox.append("")
+
+            model = turn.get("model") or "N/A"
+            endpoint = turn.get("endpoint") or "N/A"
+
+            r = int(turn.get("r_prompt_total") or 0)
+            r_prev = int(turn.get("r_prev_prompt_total") or 0)
+            c = int(turn.get("c_completion") or 0)
+            cur = int(turn.get("current_message_tokens") or 0)
+            total_call = int(turn.get("total_tokens_call") or 0)
+            cost_rub = turn.get("cost_rub", None)
+            cost_str = f"{float(cost_rub):.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
+
+            self.metrics_box.append(
+                f"#{k} | Model={model} | Endpoint={endpoint} | "
+                f"r={r} (prev_r={r_prev}) | c={c} | current_message_tokens={cur} | "
+                f"total_tokens={total_call} | cost={cost_str}"
+            )
+
+            last_turn = turn
+
+        # модель/эндпоинт как в последнем сообщении
+        if isinstance(last_turn, dict):
+            last_model = (last_turn.get("model") or "").strip()
+            last_endpoint = (last_turn.get("endpoint") or "").strip()
+
+            if last_model:
+                idx = self.model_selector.findText(last_model)
+                if idx >= 0:
+                    self.model_selector.setCurrentIndex(idx)
+
+            if last_endpoint:
+                idx2 = self.endpoint_selector.findData(last_endpoint)
+                if idx2 >= 0:
+                    self.endpoint_selector.setCurrentIndex(idx2)
 
     def on_new_session_clicked(self):
         if self.is_generating:
@@ -518,15 +558,17 @@ class ChatTab(BaseTab):
                     try:
                         self.output_editbox.clear()
                         self.output_editbox_with_condition.clear()
+                        self.metrics_box.clear()
+                        self.input_editbox.clear()
                     except Exception:
                         pass
 
-                    self.logger.success(f"Сессия очищена: {self.current_session_id}")
                     await self.refresh_sessions_list()
+                    self.logger.success(f"История удалена: {self.current_session_id}")
                 else:
-                    self.logger.warning("Не удалось очистить сессию (agent вернул False).")
+                    self.logger.warning("Не удалось удалить историю (agent вернул False).")
             except Exception as e:
-                self.logger.warning(f"Ошибка очистки сессии: {e}")
+                self.logger.warning(f"Ошибка удаления истории: {e}")
 
         asyncio.get_event_loop().create_task(_do())
 
@@ -741,11 +783,15 @@ class ChatTab(BaseTab):
             total_sec = time.perf_counter() - t0
 
             usage = getattr(self.agent, "last_usage", None) or {}
-            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-            total_tokens = usage.get("total_tokens") or (int(prompt_tokens) + int(completion_tokens))
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            total_tokens_call = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
             cost_rub = getattr(self.agent, "last_cost_rub", None)
+
+            ms = getattr(self.agent, "last_message_stats", None) or {}
+            r_prev_prompt_total = int(ms.get("r_prev_prompt_total") or 0)
+            current_message_tokens = int(ms.get("current_message_tokens") or 0)
 
             ttft_str = f"{ttft_sec:.3f}s" if isinstance(ttft_sec, (int, float)) else "N/A"
             temp_str = f"{selected_temperature}" if selected_temperature is not None else "locked(1.0)"
@@ -757,8 +803,10 @@ class ChatTab(BaseTab):
                 f"Temp={temp_str} | "
                 f"TTFT={ttft_str} | "
                 f"Total={total_sec:.3f}s | "
-                f"Tokens={total_tokens} "
-                f"(p={prompt_tokens}, c={completion_tokens}) | "
+                f"prompt(r)={prompt_tokens} (prev_r={r_prev_prompt_total}) | "
+                f"completion(c)={completion_tokens} | "
+                f"current_message_tokens={current_message_tokens} | "
+                f"total_tokens={total_tokens_call} | "
                 f"Cost={cost_str}"
             )
 
