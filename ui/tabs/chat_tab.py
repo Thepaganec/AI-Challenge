@@ -767,6 +767,9 @@ class ChatTab(BaseTab):
         ttft_sec = None
         got_first_chunk = False
 
+        # Для метрик/логов в finally
+        error_text = None
+
         try:
             if not self.is_agent_connected:
                 self.logger.warning("Агент OFFLINE: проверяю доступность перед отправкой...")
@@ -821,9 +824,36 @@ class ChatTab(BaseTab):
             raise
 
         except Exception as e:
-            if self.is_agent_connected:
-                self.is_agent_connected = False
-                self.logger.error("Соединение с агентом потеряно (server OFFLINE)")
+            error_text = str(e)
+
+            # ✅ ВАЖНО:
+            # 400/ProxyAPI ошибки НЕ должны ронять флаг подключения к агенту.
+            # OFFLINE ставим только при реальных сетевых/транспортных проблемах.
+            is_proxyapi_error = ("ProxyAPI error:" in error_text) or ("HTTP 400" in error_text) or ("ContextWindowExceededError" in error_text)
+
+            is_connection_error = isinstance(
+                e,
+                (
+                    ConnectionError,
+                    ConnectionRefusedError,
+                    ConnectionResetError,
+                    BrokenPipeError,
+                    asyncio.IncompleteReadError,
+                    asyncio.TimeoutError,
+                    OSError,
+                ),
+            )
+
+            # Доп. страховка по текстам типичных сетевых ошибок
+            if not is_proxyapi_error:
+                low = error_text.lower()
+                if ("connection reset" in low) or ("broken pipe" in low) or ("connection refused" in low) or ("cannot connect" in low):
+                    is_connection_error = True
+
+            if is_connection_error and (not is_proxyapi_error):
+                if self.is_agent_connected:
+                    self.is_agent_connected = False
+                    self.logger.error("Соединение с агентом потеряно (server OFFLINE)")
 
             self.logger.error_handler(e, context="ChatTab -> ask_and_stream_answer")
             target_output.append(f"\n[Ошибка] {e}\n")
@@ -865,6 +895,14 @@ class ChatTab(BaseTab):
                 f"Cost={cost_str}"
             )
 
+            # Если была ошибка API — добавим короткую пометку в метрики (без “оффлайна”)
+            if error_text:
+                # не раздуваем строку логов
+                short_err = error_text.replace("\n", " ")
+                if len(short_err) > 180:
+                    short_err = short_err[:180] + "..."
+                result_line += f" | ERROR={short_err}"
+
             try:
                 self.metrics_box.append(result_line)
             except Exception:
@@ -879,6 +917,7 @@ class ChatTab(BaseTab):
 
             self.logger.success("Ответ получен")
 
+            # список сессий можно обновлять даже после API-ошибки (если агент жив)
             if self.is_agent_connected:
                 asyncio.get_event_loop().create_task(self.refresh_sessions_list())
 
