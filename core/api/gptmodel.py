@@ -157,7 +157,7 @@ class GPTModel:
         model: Optional[str] = None,
         endpoint: str = "chat",
         temperature: Optional[float] = None,
-        include_usage: bool = False,
+        include_usage: bool = True,
     ):
         selected_model = model or self.model
 
@@ -178,33 +178,20 @@ class GPTModel:
                 if role and content is not None:
                     messages.append({"role": role, "content": str(content)})
 
-        # user_text добавляем отдельно — это важно, чтобы история не дублировалась
         messages.append({"role": "user", "content": user_text})
 
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
         self.last_usage = {}
 
-        if endpoint == "chat":
+        async def _post_chat(payload: Dict[str, object]) -> AsyncIterator[str]:
             url = f"{self.base_url}/chat/completions"
 
-            payload_c: Dict[str, object] = {
-                "model": selected_model,
-                "messages": messages,
-                "stream": True,
-                "max_tokens": max_tokens,
-            }
-
-            if temperature is not None and float(temperature) != 1.0:
-                payload_c["temperature"] = float(temperature)
-
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload_c) as resp:
+                async with session.post(url, headers=headers, json=payload) as resp:
 
                     if resp.status < 200 or resp.status >= 300:
                         body_text = await resp.text()
-                        raise RuntimeError(
-                            f"ProxyAPI error: HTTP {resp.status}\n{body_text}"
-                        )
+                        raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
 
                     async for raw_line in resp.content:
                         line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -237,15 +224,57 @@ class GPTModel:
                         except Exception:
                             continue
 
+        if endpoint == "chat":
+            # --- 1) Сначала пробуем max_completion_tokens (нужно для gpt-5.2-chat-latest)
+            payload_c: Dict[str, object] = {
+                "model": selected_model,
+                "messages": messages,
+                "stream": True,
+                "max_completion_tokens": int(max_tokens),
+            }
+
+            # usage в chat-стриме придёт только если это попросить явно
+            if include_usage:
+                payload_c["stream_options"] = {"include_usage": True}
+
+            if temperature is not None and float(temperature) != 1.0:
+                payload_c["temperature"] = float(temperature)
+
+            try:
+                async for chunk in _post_chat(payload_c):
+                    yield chunk
+                return
+
+            except RuntimeError as e:
+                # --- 2) Fallback: если модель/прокси не поддерживает max_completion_tokens, повторяем с max_tokens
+                msg = str(e)
+                if "max_completion_tokens" not in msg:
+                    raise
+
+                payload_c2: Dict[str, object] = {
+                    "model": selected_model,
+                    "messages": messages,
+                    "stream": True,
+                    "max_tokens": int(max_tokens),
+                }
+
+                if include_usage:
+                    payload_c2["stream_options"] = {"include_usage": True}
+
+                if temperature is not None and float(temperature) != 1.0:
+                    payload_c2["temperature"] = float(temperature)
+
+                async for chunk in _post_chat(payload_c2):
+                    yield chunk
+
         else:
-            # ===== FIX: Responses должен получать историю, иначе "память" не работает
             url = f"{self.base_url}/responses"
 
             payload_r: Dict[str, object] = {
                 "model": selected_model,
-                "input": messages,          # <-- ВАЖНО: передаём всю историю + текущий user_text
+                "input": messages,
                 "stream": True,
-                "max_output_tokens": max_tokens,
+                "max_output_tokens": int(max_tokens),
             }
 
             if temperature is not None and float(temperature) != 1.0:
@@ -274,7 +303,6 @@ class GPTModel:
                         except Exception:
                             continue
 
-                        # usage у responses часто в response.completed или внутри response.usage
                         try:
                             if include_usage and isinstance(obj.get("usage"), dict):
                                 self.last_usage = obj.get("usage")
