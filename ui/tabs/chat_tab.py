@@ -458,9 +458,15 @@ class ChatTab(BaseTab):
         if not session:
             return
 
-        history = session.get("history") or {}
+        # Новый формат: history(dict) (если вдруг старый — попробуем fallback на messages)
+        history = session.get("history")
+        messages = session.get("messages")
+
         if not isinstance(history, dict):
             history = {}
+
+        if not isinstance(messages, list):
+            messages = []
 
         try:
             self.output_editbox.clear()
@@ -469,58 +475,107 @@ class ChatTab(BaseTab):
         except Exception:
             pass
 
-        try:
-            keys = sorted(history.keys(), key=lambda x: int(x))
-        except Exception:
-            keys = list(history.keys())
-
         last_turn = None
 
-        for k in keys:
-            turn = history.get(k) or {}
-            user_text = turn.get("user_text") or ""
-            assistant_text = turn.get("assistant_text") or ""
+        # 1) Если есть новый формат history — используем его
+        if history:
+            try:
+                keys = sorted(history.keys(), key=lambda x: int(x))
+            except Exception:
+                keys = list(history.keys())
 
-            if user_text:
-                self.output_editbox.append("Ты: " + user_text)
+            for k in keys:
+                turn = history.get(k) or {}
+                user_text = turn.get("user_text") or ""
+                assistant_text = turn.get("assistant_text") or ""
+
+                if user_text:
+                    self.output_editbox.append("Ты: " + user_text)
+                    self.output_editbox.append("")
+                if assistant_text:
+                    self.output_editbox.append("GPT: " + assistant_text)
+                    self.output_editbox.append("")
+
+                model = (turn.get("model") or "N/A").strip()
+                endpoint = (turn.get("endpoint") or "N/A").strip()
+
+                r = int(turn.get("r_prompt_total") or 0)
+                r_prev = int(turn.get("r_prev_prompt_total") or 0)
+                c = int(turn.get("c_completion") or 0)
+
+                current_message_tokens = int(turn.get("current_message_tokens") or 0)
+                total_tokens_call = int(turn.get("total_tokens_call") or 0)
+
+                cost_rub = turn.get("cost_rub", None)
+                cost_str = f"{float(cost_rub):.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
+
+                # Температура (если есть в turn)
+                temp_val = turn.get("temperature", None)
+                if isinstance(temp_val, (int, float)):
+                    temp_str = f"{float(temp_val)}"
+                else:
+                    temp_str = "locked(1.0)"
+
+                # TTFT / Total в истории не сохранялись -> показываем N/A, но формат тот же
+                result_line = (
+                    f"Model={model} | "
+                    f"Endpoint={endpoint} | "
+                    f"Temp={temp_str} | "
+                    f"TTFT=N/A | "
+                    f"Total=N/A | "
+                    f"prompt(r)={r} (prev_r={r_prev}) | "
+                    f"completion(c)={c} | "
+                    f"current_message_tokens={current_message_tokens} | "
+                    f"total_tokens={total_tokens_call} | "
+                    f"Cost={cost_str}"
+                )
+
+                try:
+                    self.metrics_box.append(result_line)
+                except Exception:
+                    pass
+
+                last_turn = turn
+
+        # 2) Fallback: если это старая сессия без history — покажем messages как раньше (без метрик)
+        else:
+            for m in messages:
+                role = (m.get("role") or "").strip()
+                content = m.get("content") or ""
+
+                if role == "user":
+                    prefix = "Ты: "
+                elif role == "assistant":
+                    prefix = "GPT: "
+                else:
+                    prefix = f"{role}: " if role else ""
+
+                self.output_editbox.append(prefix + content)
                 self.output_editbox.append("")
-            if assistant_text:
-                self.output_editbox.append("GPT: " + assistant_text)
-                self.output_editbox.append("")
 
-            model = turn.get("model") or "N/A"
-            endpoint = turn.get("endpoint") or "N/A"
-
-            r = int(turn.get("r_prompt_total") or 0)
-            r_prev = int(turn.get("r_prev_prompt_total") or 0)
-            c = int(turn.get("c_completion") or 0)
-            cur = int(turn.get("current_message_tokens") or 0)
-            total_call = int(turn.get("total_tokens_call") or 0)
-            cost_rub = turn.get("cost_rub", None)
-            cost_str = f"{float(cost_rub):.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
-
-            self.metrics_box.append(
-                f"#{k} | Model={model} | Endpoint={endpoint} | "
-                f"r={r} (prev_r={r_prev}) | c={c} | current_message_tokens={cur} | "
-                f"total_tokens={total_call} | cost={cost_str}"
-            )
-
-            last_turn = turn
-
-        # модель/эндпоинт как в последнем сообщении
+        # 3) Восстановим модель/эндпоинт/температуру по последнему turn
         if isinstance(last_turn, dict):
             last_model = (last_turn.get("model") or "").strip()
             last_endpoint = (last_turn.get("endpoint") or "").strip()
+            last_temp = last_turn.get("temperature", None)
 
             if last_model:
                 idx = self.model_selector.findText(last_model)
                 if idx >= 0:
                     self.model_selector.setCurrentIndex(idx)
 
+            # endpoint_selector у тебя хранит endpoint в userData
             if last_endpoint:
                 idx2 = self.endpoint_selector.findData(last_endpoint)
                 if idx2 >= 0:
                     self.endpoint_selector.setCurrentIndex(idx2)
+
+            # температура — только если поле активно (у некоторых моделей она “locked”)
+            if self.temperature_input.isEnabled() and isinstance(last_temp, (int, float)):
+                try:
+                    self.temperature_input.setValue(float(last_temp))
+                except Exception:
+                    pass
 
     def on_new_session_clicked(self):
         if self.is_generating:
