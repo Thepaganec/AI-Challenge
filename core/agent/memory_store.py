@@ -31,12 +31,13 @@ class AgentMemoryStore:
     def _session_file_path_today(self, session_id: str) -> str:
         day = datetime.now().strftime("%Y%m%d")
         safe_id = self._safe_id(session_id)
-        # ВАЖНО: memmory — как ты написал
+        # ВАЖНО: memmory — как у тебя было
         return os.path.join(self.base_dir, f"{safe_id}_memmory{day}.json")
 
     def _find_latest_file_for_session(self, session_id: str) -> Optional[str]:
         safe_id = self._safe_id(session_id)
         candidates: List[str] = []
+
         try:
             for name in os.listdir(self.base_dir):
                 if name.startswith(f"{safe_id}_memmory") and name.endswith(".json"):
@@ -51,6 +52,7 @@ class AgentMemoryStore:
             candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         except Exception:
             pass
+
         return candidates[0]
 
     def list_sessions(self) -> List[SessionInfo]:
@@ -101,10 +103,12 @@ class AgentMemoryStore:
             result.sort(key=lambda s: s.updated_at or "", reverse=True)
         except Exception:
             pass
+
         return result
 
     def load_session(self, session_id: str) -> Dict[str, Any]:
         path = self._find_latest_file_for_session(session_id)
+
         if path and os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -113,7 +117,7 @@ class AgentMemoryStore:
                 if isinstance(data, dict) and data.get("session_id") == session_id:
                     data["file_path"] = path
 
-                    # миграция старого формата -> новый history(dict)
+                    # --- миграция старого формата messages -> history
                     if "history" not in data:
                         old_messages = data.get("messages")
                         if isinstance(old_messages, list):
@@ -170,10 +174,17 @@ class AgentMemoryStore:
                     if not isinstance(data.get("history"), dict):
                         data["history"] = {}
 
+                    # --- NEW: гарантируем наличие history_summary
+                    if "history_summary" not in data:
+                        data["history_summary"] = ""
+                    if not isinstance(data.get("history_summary"), str):
+                        data["history_summary"] = ""
+
                     return data
             except Exception:
                 pass
 
+        # --- если сессии нет, создаём новую
         created_at = _now_iso()
         data = {
             "session_id": session_id,
@@ -181,6 +192,7 @@ class AgentMemoryStore:
             "created_at": created_at,
             "updated_at": created_at,
             "history": {},
+            "history_summary": "",  # NEW
             "file_path": self._session_file_path_today(session_id),
         }
         return data
@@ -203,6 +215,13 @@ class AgentMemoryStore:
 
         path = session.get("file_path") or self._session_file_path_today(session_id)
         session["file_path"] = path
+
+        # --- гарантируем структуру
+        if "history" not in session or not isinstance(session.get("history"), dict):
+            session["history"] = {}
+
+        if "history_summary" not in session or not isinstance(session.get("history_summary"), str):
+            session["history_summary"] = ""
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=2)

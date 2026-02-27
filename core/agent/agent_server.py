@@ -102,6 +102,49 @@ class LLMAgentServer:
         writer.write((json.dumps(end, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
 
+    async def _summarize_history_text(
+        self,
+        *,
+        history_text: str,
+        model: str,
+        endpoint: str,
+    ) -> str:
+        """
+        Делает суммаризацию истории через GPTModel.stream_chat (стрим), собирает в строку.
+        """
+        prompt = (
+            "Сожми историю диалога в компактную выжимку, сохранив смысл, факты, договорённости и контекст.\n"
+            "Требования:\n"
+            "- Пиши по-русски.\n"
+            "- Без воды.\n"
+            "- Сохраняй имена переменных/методов/классов как есть.\n"
+            "- Если есть требования/правила — вынеси их отдельным списком.\n\n"
+            "ИСТОРИЯ:\n"
+            f"{history_text}"
+        )
+
+        out = ""
+        gen = self.gpt.stream_chat(
+            user_text=prompt,
+            system_text=None,
+            history=None,
+            max_tokens=700,
+            model=model,
+            endpoint=endpoint,
+            temperature=None,
+            include_usage=False,
+        )
+        try:
+            async for ch in gen:
+                out += ch
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+
+        return out.strip()
+
     def _history_for_llm(self, session: dict) -> list:
         history = session.get("history") or {}
         if not isinstance(history, dict):
@@ -212,6 +255,20 @@ class LLMAgentServer:
                 except Exception:
                     temperature = None
 
+            # NEW: параметры контроля длины и суммаризации
+            try:
+                char_limit = int(request.get("char_limit") or 12000)
+            except Exception:
+                char_limit = 12000
+
+            try:
+                keep_last_n = int(request.get("keep_last_n") or 8)
+            except Exception:
+                keep_last_n = 8
+
+            summary_model = (request.get("summary_model") or "").strip() or model
+            summary_endpoint = (request.get("summary_endpoint") or "").strip() or "chat"
+
             session = self.memory_store.load_session(session_id)
             self.memory_store.set_title_if_empty(session, user_text)
 
@@ -219,9 +276,14 @@ class LLMAgentServer:
             if not isinstance(history, dict):
                 history = {}
 
-            # история для LLM до добавления текущего сообщения
+            # подтянем прошлую суммаризацию
+            history_summary = session.get("history_summary") or ""
+            if not isinstance(history_summary, str):
+                history_summary = ""
+
+            # история для LLM (полная) до добавления текущего сообщения
             session["history"] = history
-            history_for_llm = self._history_for_llm(session)
+            history_for_llm_full = self._history_for_llm(session)
 
             # turn_id
             try:
@@ -256,15 +318,98 @@ class LLMAgentServer:
 
             session["history"] = history
             session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            session["history_summary"] = history_summary
             self.memory_store.save_session(session)
 
             gen = None
             assistant_answer = ""
 
+            # ====== NEW_MESSAGE сборка на сервере ======
+            # New_message (для измерения длины):
+            # HISTORY_SUMMARY + последние N сообщений + NEW_MESSAGE(user_text)
+            msgs_flat = list(history_for_llm_full)
+
+            if keep_last_n > 0:
+                tail_msgs = msgs_flat[-keep_last_n:]
+                old_msgs = msgs_flat[:-keep_last_n]
+            else:
+                tail_msgs = []
+                old_msgs = msgs_flat
+
+            def _to_text(msgs):
+                out = []
+                for m in msgs:
+                    role = m.get("role")
+                    content = m.get("content")
+                    if not content:
+                        continue
+                    if role == "user":
+                        out.append("USER: " + str(content))
+                    elif role == "assistant":
+                        out.append("ASSISTANT: " + str(content))
+                    else:
+                        out.append(str(content))
+                return "\n".join(out).strip()
+
+            old_text = _to_text(old_msgs)
+            tail_text = _to_text(tail_msgs)
+
+            def _build_new_message_preview(summary_text: str) -> str:
+                s = ""
+                if isinstance(summary_text, str) and summary_text.strip():
+                    s += "HISTORY_SUMMARY:\n" + summary_text.strip() + "\n\n"
+                if tail_text:
+                    s += "LAST_MESSAGES:\n" + tail_text + "\n\n"
+                s += "NEW_MESSAGE:\n" + user_text
+                return s
+
+            new_message_preview = _build_new_message_preview(history_summary)
+            new_message_len = len(new_message_preview)
+
+            history_summarized = False
+
+            # Если превышаем порог — суммаризируем old_text и сохраняем history_summary
+            if char_limit > 0 and new_message_len > char_limit:
+                if old_text.strip():
+                    try:
+                        self.logger.write(
+                            "INFO",
+                            "История превышает порог, делаю суммаризацию",
+                            extra=f"len={new_message_len}/{char_limit}",
+                        )
+
+                        # ВАЖНО: метод _summarize_history_text должен быть добавлен в класс LLMAgentServer
+                        new_summary = await self._summarize_history_text(
+                            history_text=old_text,
+                            model=summary_model,
+                            endpoint=summary_endpoint,
+                        )
+
+                        if isinstance(new_summary, str) and new_summary.strip():
+                            history_summary = new_summary.strip()
+                            session["history_summary"] = history_summary
+                            session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            self.memory_store.save_session(session)
+                            history_summarized = True
+
+                            # пересчёт длины после обновления summary
+                            new_message_len = len(_build_new_message_preview(history_summary))
+
+                    except Exception as e:
+                        self.logger.write("WARN", "Суммаризация не удалась", extra=str(e))
+
+            # ====== Формируем запрос для GPT ======
+            system_text = None
+            if isinstance(history_summary, str) and history_summary.strip():
+                system_text = "History summary (compressed context):\n" + history_summary.strip()
+
+            # В историю для LLM кладём только хвост последних сообщений
+            history_for_llm = tail_msgs
+
             try:
                 gen = self.gpt.stream_chat(
                     user_text=user_text,
-                    system_text=None,
+                    system_text=system_text,
                     history=history_for_llm,
                     max_tokens=max_tokens,
                     model=model,
@@ -297,6 +442,7 @@ class LLMAgentServer:
 
                 session["history"] = history
                 session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session["history_summary"] = history_summary
                 self.memory_store.save_session(session)
 
                 message_stats = {
@@ -307,6 +453,12 @@ class LLMAgentServer:
                     "current_message_tokens": int(current_message_tokens),
                     "total_tokens_call": int(total_call),
                     "cost_rub": cost_rub,
+
+                    # NEW: для UI
+                    "new_message_len": int(new_message_len),
+                    "char_limit": int(char_limit),
+                    "history_summarized": bool(history_summarized),
+                    "history_summary": history_summary,
                 }
 
                 await self._send_json(

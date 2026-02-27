@@ -160,6 +160,10 @@ class AgentClient:
         max_tokens: int,
         temperature: Optional[float],
         session_id: str,
+        char_limit: int,
+        keep_last_n: int,
+        summary_model: str,
+        summary_endpoint: str,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -178,6 +182,12 @@ class AgentClient:
             "endpoint": endpoint,
             "max_tokens": int(max_tokens),
             "temperature": temperature,
+
+            # NEW: параметры контроля длины и суммаризации
+            "char_limit": int(char_limit),
+            "keep_last_n": int(keep_last_n),
+            "summary_model": str(summary_model or "").strip(),
+            "summary_endpoint": str(summary_endpoint or "chat"),
         }
 
         writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))

@@ -3,7 +3,8 @@ import uuid
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
-    QLineEdit, QPushButton, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem
+    QLineEdit, QPushButton, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
+    QSpinBox
 )
 
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
@@ -63,41 +64,57 @@ class ChatTab(BaseTab):
         # --- наполним список сессий хотя бы текущей, даже если агент оффлайн
         self.render_sessions_list_offline()
 
-    async def preload_pricing(self):
-        try:
-            self.logger.info("Загрузка тарифов ProxyAPI (pricing/list)...")
-            table = await self.gpt.get_pricing_rub_per_1m()
-            self.logger.success(f"Тарифы загружены: {len(table)} моделей")
-        except Exception as e:
-            self.logger.warning(f"Не удалось загрузить тарифы ProxyAPI: {e}")
-    
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
-        # --- Шрифт
         font = QFont()
         font.setPointSize(13)
 
+        # --- Список сессий (фикс ширина 400, высота меньше на треть)
+        self.sessions_list = QListWidget(self)
+        self.sessions_list.setFixedWidth(400)
+        self.sessions_list.setMinimumHeight(95)  # было ~140, минус треть
+        self.sessions_list.itemClicked.connect(self.on_session_clicked)
+
+        self.new_session_button = QPushButton("Новая сессия")
+        self.new_session_button.setFixedHeight(34)
+        self.new_session_button.clicked.connect(self.on_new_session_clicked)
+
+        self.clear_session_button = QPushButton("Очистить сессию")
+        self.clear_session_button.setFixedHeight(34)
+        self.clear_session_button.clicked.connect(self.on_clear_session_clicked)
+
+        sessions_buttons = QWidget()
+        sessions_buttons_layout = QHBoxLayout(sessions_buttons)
+        sessions_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        sessions_buttons_layout.setSpacing(6)
+        sessions_buttons_layout.addWidget(self.new_session_button)
+        sessions_buttons_layout.addWidget(self.clear_session_button)
+
+        session_container = QWidget()
+        session_container.setFixedWidth(400)
+        session_container.setFixedHeight(140)  # было 200, минус треть
+        session_layout = QVBoxLayout(session_container)
+        session_layout.setContentsMargins(0, 0, 0, 0)
+        session_layout.setSpacing(6)
+        session_layout.addWidget(self.sessions_list)
+        session_layout.addWidget(sessions_buttons)
+
         # --- Верхняя панель настроек (модель / эндпоинт / температура)
         self.model_label = QLabel("Модель:")
-        self.model_label.setFixedWidth(70)
         self.model_selector = QComboBox()
         self.model_selector.setFixedWidth(260)
-
-        # Модели для Day 5: версии 3 / 4 / 5
         self.model_selector.addItem("gpt-3.5-turbo")
         self.model_selector.addItem("gpt-4o-mini")
         self.model_selector.addItem("gpt-4o")
         self.model_selector.addItem("gpt-5.2-chat-latest")
 
         self.endpoint_label = QLabel("Эндпоинт:")
-        self.endpoint_label.setFixedWidth(90)
         self.endpoint_selector = QComboBox()
         self.endpoint_selector.setFixedWidth(190)
         self.endpoint_selector.addItem("Chat Completions", "chat")
         self.endpoint_selector.addItem("Responses", "responses")
 
         self.temperature_label = QLabel("temperature:")
-        self.temperature_label.setFixedWidth(95)
         self.temperature_input = QDoubleSpinBox()
         self.temperature_input.setFixedWidth(120)
         self.temperature_input.setDecimals(1)
@@ -105,12 +122,27 @@ class ChatTab(BaseTab):
         self.temperature_input.setRange(0.0, 2.0)
         self.temperature_input.setValue(1.0)
 
+        # --- Новые параметры под temperature
+        self.char_limit_label = QLabel("Порог длины (символы):")
+        self.char_limit_input = QSpinBox()
+        self.char_limit_input.setRange(500, 200000)
+        self.char_limit_input.setSingleStep(500)
+        self.char_limit_input.setValue(12000)
+        self.char_limit_input.setFixedWidth(140)
+        self.char_limit_input.valueChanged.connect(self.on_threshold_changed)
+
+        self.keep_last_n_label = QLabel("N последних сообщений (оригинал):")
+        self.keep_last_n_input = QSpinBox()
+        self.keep_last_n_input.setRange(1, 200)
+        self.keep_last_n_input.setSingleStep(1)
+        self.keep_last_n_input.setValue(8)
+        self.keep_last_n_input.setFixedWidth(140)
+        self.keep_last_n_input.valueChanged.connect(self.on_threshold_changed)
+
         # --- Поле для ввода
         self.input_editbox = QTextEdit()
         self.input_editbox.setFont(font)
-        self.input_editbox.setPlaceholderText(
-            "Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит..."
-        )
+        self.input_editbox.setPlaceholderText("Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит...")
         self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         set_editbox_height(self.input_editbox, 7)
 
@@ -118,6 +150,10 @@ class ChatTab(BaseTab):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedHeight(8)
+
+        # --- Лейблы над окнами вывода (len(new_message) / limit)
+        self.plain_len_label = QLabel("0 / 0")
+        self.condition_len_label = QLabel("0 / 0")
 
         # --- Поле для вывода ответа без условий
         self.output_editbox = QTextEdit()
@@ -138,7 +174,7 @@ class ChatTab(BaseTab):
         self.condition_label = QLabel("Режим запуска с условиями:")
         self.condition_label.setFixedWidth(230)
 
-        # --- Кнопки STOP под каждое окно
+        # --- Кнопки STOP/CLEAR
         self.stop_button_plain = QPushButton("STOP")
         self.stop_button_plain.setFixedWidth(150)
         self.stop_button_plain.setEnabled(False)
@@ -188,7 +224,7 @@ class ChatTab(BaseTab):
         self.max_tokens_input.setPlaceholderText("Например: 200")
         self.max_tokens_input.setText("200")
 
-        # --- Окно результатов замеров (правая панель)
+        # --- Окно результатов замеров
         self.metrics_label = QLabel("Результаты замеров (Day 5):")
         self.metrics_box = QTextEdit()
         self.metrics_box.setReadOnly(True)
@@ -198,155 +234,207 @@ class ChatTab(BaseTab):
         )
         self.metrics_box.setMinimumHeight(220)
 
+        # --- НОВОЕ: настройки суммаризации + окно вывода суммаризации
+        self.summary_model_label = QLabel("Модель для суммаризации:")
+        self.summary_model_selector = QComboBox()
+        self.summary_model_selector.setFixedWidth(260)
+        self.summary_model_selector.addItem("gpt-3.5-turbo")
+        self.summary_model_selector.addItem("gpt-4o-mini")
+        self.summary_model_selector.addItem("gpt-4o")
+        self.summary_model_selector.addItem("gpt-5.2-chat-latest")
+
+        self.summary_endpoint_label = QLabel("Эндпоинт для суммаризации:")
+        self.summary_endpoint_selector = QComboBox()
+        self.summary_endpoint_selector.setFixedWidth(190)
+        self.summary_endpoint_selector.addItem("Chat Completions", "chat")
+        self.summary_endpoint_selector.addItem("Responses", "responses")
+
+        self.summary_output_label = QLabel("History_summary (из сессии):")
+        self.summary_output_box = QTextEdit()
+        self.summary_output_box.setReadOnly(True)
+        self.summary_output_box.setMinimumHeight(180)
+        self.summary_output_box.setPlaceholderText("Здесь будет появляться суммаризация истории...")
+
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
         tab_layout = QVBoxLayout(self.top_widget)
         tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(8)
 
-        # --- Верхняя панель по центру НАД всеми экранами
-        # --- Список сессий (верхняя левая часть)
-        self.sessions_list = QListWidget(self)
-        self.sessions_list.setMinimumHeight(140)
-        self.sessions_list.itemClicked.connect(self.on_session_clicked)
-
-        self.new_session_button = QPushButton("Новая сессия")
-        self.new_session_button.setFixedHeight(34)
-        self.new_session_button.clicked.connect(self.on_new_session_clicked)
-
-        self.clear_session_button = QPushButton("Очистить сессию")
-        self.clear_session_button.setFixedHeight(34)
-        self.clear_session_button.clicked.connect(self.on_clear_session_clicked)
-
-        sessions_buttons = QWidget()
-        sessions_buttons_layout = QHBoxLayout(sessions_buttons)
-        sessions_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        sessions_buttons_layout.setSpacing(6)
-        sessions_buttons_layout.addWidget(self.new_session_button)
-        sessions_buttons_layout.addWidget(self.clear_session_button)
-        
-        session_container = QWidget()
-        session_container.setFixedHeight(200)
-        session_layout = QVBoxLayout(session_container)
-        session_layout.setContentsMargins(0, 0, 0, 0)
-        session_layout.addWidget(self.sessions_list)
-        session_layout.addWidget(sessions_buttons)
-
-        header_container = QWidget()
-        header_container.setFixedHeight(200)
-        header_layout = QVBoxLayout(header_container)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(10)
-
-        header_layout.addWidget(self.model_label, alignment=Qt.AlignVCenter)
-        header_layout.addWidget(self.model_selector, alignment=Qt.AlignVCenter)
-        header_layout.addWidget(self.endpoint_label, alignment=Qt.AlignVCenter)
-        header_layout.addWidget(self.endpoint_selector, alignment=Qt.AlignVCenter)
-        header_layout.addWidget(self.temperature_label, alignment=Qt.AlignVCenter)
-        header_layout.addWidget(self.temperature_input, alignment=Qt.AlignVCenter)
-
+        # --- Header wrap: слева сессии, справа параметры (параметры прижаты вправо)
         header_wrap = QWidget()
         header_wrap_layout = QHBoxLayout(header_wrap)
-        header_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        header_wrap_layout.setContentsMargins(0, 0, 25, 0)
+        header_wrap_layout.setSpacing(12)
+
+        # контейнер параметров: лейбл слева, поле справа (2 колонки)
+        params_container = QWidget()
+        params_layout = QVBoxLayout(params_container)
+        params_layout.setContentsMargins(0, 0, 0, 0)
+        params_layout.setSpacing(6)
+
+        def _row(lbl: QLabel, widget: QWidget):
+            r = QWidget()
+            r_l = QHBoxLayout(r)
+            r_l.setContentsMargins(0, 0, 0, 0)
+            r_l.setSpacing(8)
+            r_l.addWidget(lbl, alignment=Qt.AlignLeft)
+            r_l.addStretch()
+            r_l.addWidget(widget, alignment=Qt.AlignRight)
+            return r
+
+        params_layout.addWidget(_row(self.model_label, self.model_selector))
+        params_layout.addWidget(_row(self.endpoint_label, self.endpoint_selector))
+        params_layout.addWidget(_row(self.temperature_label, self.temperature_input))
+        params_layout.addWidget(_row(self.char_limit_label, self.char_limit_input))
+        params_layout.addWidget(_row(self.keep_last_n_label, self.keep_last_n_input))
+        params_layout.addStretch()
+
         header_wrap_layout.addWidget(session_container, alignment=Qt.AlignTop)
-        header_wrap_layout.addWidget(header_container, alignment=Qt.AlignTop)
         header_wrap_layout.addStretch()
+        header_wrap_layout.addWidget(params_container, alignment=Qt.AlignTop | Qt.AlignRight)
 
-        tab_layout.addWidget(header_wrap)
-
+        # --- Ввод (выровнен по верху)
         input_container = QWidget()
         input_container.setFixedWidth(400)
         input_layout = QVBoxLayout(input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(5)
-        input_layout.addWidget(self.input_editbox)
+        input_layout.addWidget(self.input_editbox, alignment=Qt.AlignTop)
         input_layout.addWidget(self.progress_bar, alignment=Qt.AlignTop)
 
-        output_container = QWidget()
-        output_container.setFixedWidth(820)
-        output_layout = QHBoxLayout(output_container)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_layout.setSpacing(5)
-
+        # --- Выводы (2 окна)
         outbox_plain_buttons_container = QWidget()
         outbox_plain_layout = QHBoxLayout(outbox_plain_buttons_container)
+        outbox_plain_layout.setContentsMargins(0, 0, 0, 0)
         outbox_plain_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignLeft)
         outbox_plain_layout.addWidget(self.clear_button_plain, alignment=Qt.AlignRight)
 
         plain_output_container = QWidget()
         plain_output_layout = QVBoxLayout(plain_output_container)
         plain_output_layout.setContentsMargins(0, 0, 0, 0)
-        plain_output_layout.setSpacing(5)
+        plain_output_layout.setSpacing(4)
+        plain_output_layout.addWidget(self.plain_len_label, alignment=Qt.AlignLeft)
         plain_output_layout.addWidget(self.output_editbox)
         plain_output_layout.addWidget(outbox_plain_buttons_container)
 
         outbox_condition_buttons_container = QWidget()
         outbox_condition_layout = QHBoxLayout(outbox_condition_buttons_container)
+        outbox_condition_layout.setContentsMargins(0, 0, 0, 0)
         outbox_condition_layout.addWidget(self.stop_button_condition, alignment=Qt.AlignLeft)
         outbox_condition_layout.addWidget(self.clear_button_condition, alignment=Qt.AlignRight)
 
         condition_output_container = QWidget()
         condition_output_layout = QVBoxLayout(condition_output_container)
         condition_output_layout.setContentsMargins(0, 0, 0, 0)
-        condition_output_layout.setSpacing(5)
+        condition_output_layout.setSpacing(4)
+        condition_output_layout.addWidget(self.condition_len_label, alignment=Qt.AlignLeft)
         condition_output_layout.addWidget(self.output_editbox_with_condition)
         condition_output_layout.addWidget(outbox_condition_buttons_container)
 
+        output_container = QWidget()
+        output_container.setFixedWidth(820)
+        output_layout = QHBoxLayout(output_container)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.setSpacing(8)
         output_layout.addWidget(plain_output_container)
         output_layout.addWidget(condition_output_container)
 
         union_container = QWidget()
         union_layout = QVBoxLayout(union_container)
-        union_layout.addWidget(input_container, alignment=Qt.AlignHCenter)
-        union_layout.addWidget(output_container, alignment=Qt.AlignHCenter)
+        union_layout.setContentsMargins(0, 0, 0, 0)
+        union_layout.setSpacing(8)
+        union_layout.addWidget(input_container, alignment=Qt.AlignTop | Qt.AlignHCenter)
+        union_layout.addWidget(output_container, alignment=Qt.AlignTop | Qt.AlignHCenter)
         union_layout.addStretch()
 
         left_panel_container = QWidget()
-        left_panel_layout = QHBoxLayout(left_panel_container)
+        left_panel_layout = QVBoxLayout(left_panel_container)
         left_panel_layout.setContentsMargins(0, 0, 0, 0)
-        left_panel_layout.addWidget(union_container, alignment=Qt.AlignLeft)
+        left_panel_layout.addWidget(header_wrap)
+        left_panel_layout.addWidget(union_container, alignment=Qt.AlignTop | Qt.AlignLeft)
+        left_panel_layout.addStretch()
+
+        # --- Правая панель: начинается с самого верха
+        right_panel_container = QWidget()
+        right_panel_layout = QVBoxLayout(right_panel_container)
+        right_panel_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel_layout.setSpacing(8)
 
         condition_toggle_layout = QHBoxLayout()
+        condition_toggle_layout.setContentsMargins(0, 0, 0, 0)
         condition_toggle_layout.addWidget(self.condition_label, alignment=Qt.AlignLeft)
         condition_toggle_layout.addWidget(self.condition_toggle, alignment=Qt.AlignLeft)
         condition_toggle_layout.addStretch()
 
         format_layout = QHBoxLayout()
+        format_layout.setContentsMargins(0, 0, 0, 0)
         format_layout.addWidget(self.format_label, alignment=Qt.AlignLeft)
         format_layout.addWidget(self.format_input, alignment=Qt.AlignLeft)
 
         length_layout = QHBoxLayout()
+        length_layout.setContentsMargins(0, 0, 0, 0)
         length_layout.addWidget(self.length_label, alignment=Qt.AlignLeft)
         length_layout.addWidget(self.length_input, alignment=Qt.AlignLeft)
 
         stop_seq_layout = QHBoxLayout()
+        stop_seq_layout.setContentsMargins(0, 0, 0, 0)
         stop_seq_layout.addWidget(self.stop_seq_label, alignment=Qt.AlignLeft)
         stop_seq_layout.addWidget(self.stop_seq_input, alignment=Qt.AlignLeft)
 
         max_tokens_layout = QHBoxLayout()
+        max_tokens_layout.setContentsMargins(0, 0, 0, 0)
         max_tokens_layout.addWidget(self.max_tokens_label, alignment=Qt.AlignLeft)
         max_tokens_layout.addWidget(self.max_tokens_input, alignment=Qt.AlignLeft)
 
-        right_panel_container = QWidget()
-        right_panel_layout = QVBoxLayout(right_panel_container)
-        right_panel_layout.setContentsMargins(0, 0, 0, 0)
         right_panel_layout.addLayout(condition_toggle_layout)
         right_panel_layout.addLayout(format_layout)
         right_panel_layout.addLayout(length_layout)
         right_panel_layout.addLayout(stop_seq_layout)
         right_panel_layout.addLayout(max_tokens_layout)
 
-        right_panel_layout.addSpacing(10)
+        right_panel_layout.addSpacing(6)
         right_panel_layout.addWidget(self.metrics_label)
         right_panel_layout.addWidget(self.metrics_box)
 
+        # --- НОВОЕ: блок суммаризации под логами
+        right_panel_layout.addSpacing(8)
+        right_panel_layout.addWidget(self.summary_model_label)
+        right_panel_layout.addWidget(self.summary_model_selector)
+        right_panel_layout.addWidget(self.summary_endpoint_label)
+        right_panel_layout.addWidget(self.summary_endpoint_selector)
+        right_panel_layout.addWidget(self.summary_output_label)
+        right_panel_layout.addWidget(self.summary_output_box)
+
         right_panel_layout.addStretch()
 
+        # --- Сплиттер: слева чат, справа параметры/метрики/summary
         self.vertical_splitter = QSplitter(Qt.Horizontal)
         self.vertical_splitter.addWidget(left_panel_container)
         self.vertical_splitter.addWidget(right_panel_container)
 
         tab_layout.addWidget(self.vertical_splitter)
 
+        # сразу обновим лейблы лимитов (порог поменяется/перезапуск)
+        self.on_threshold_changed()
     
+    def on_threshold_changed(self):
+        try:
+            limit = int(self.char_limit_input.value())
+        except Exception:
+            limit = 0
+
+        # длина new_message обновляется только при отправке,
+        # но порог/подписи должны обновляться сразу при изменении порога.
+        # Поэтому тут меняем только знаменатель.
+        try:
+            left_plain = self.plain_len_label.text().split("/")[0].strip()
+            left_cond = self.condition_len_label.text().split("/")[0].strip()
+        except Exception:
+            left_plain, left_cond = "0", "0"
+
+        self.plain_len_label.setText(f"{left_plain} / {limit}")
+        self.condition_len_label.setText(f"{left_cond} / {limit}")
+
     def render_sessions_list_offline(self):
         try:
             self.sessions_list.blockSignals(True)
@@ -436,6 +524,14 @@ class ChatTab(BaseTab):
 
         self.sessions_list.blockSignals(False)
 
+    async def preload_pricing(self):
+        try:
+            self.logger.info("Загрузка тарифов ProxyAPI (pricing/list)...")
+            table = await self.gpt.get_pricing_rub_per_1m()
+            self.logger.success(f"Тарифы загружены: {len(table)} моделей")
+        except Exception as e:
+            self.logger.warning(f"Не удалось загрузить тарифы ProxyAPI: {e}")
+    
     def on_session_clicked(self, item: QListWidgetItem):
         sid = item.data(Qt.UserRole)
         if not sid:
@@ -458,7 +554,6 @@ class ChatTab(BaseTab):
         if not session:
             return
 
-        # Новый формат: history(dict) (если вдруг старый — попробуем fallback на messages)
         history = session.get("history")
         messages = session.get("messages")
 
@@ -467,6 +562,13 @@ class ChatTab(BaseTab):
 
         if not isinstance(messages, list):
             messages = []
+
+        # --- подтягиваем history_summary
+        history_summary = session.get("history_summary") or ""
+        try:
+            self.summary_output_box.setPlainText(str(history_summary))
+        except Exception:
+            pass
 
         try:
             self.output_editbox.clear()
@@ -477,7 +579,6 @@ class ChatTab(BaseTab):
 
         last_turn = None
 
-        # 1) Если есть новый формат history — используем его
         if history:
             try:
                 keys = sorted(history.keys(), key=lambda x: int(x))
@@ -509,14 +610,12 @@ class ChatTab(BaseTab):
                 cost_rub = turn.get("cost_rub", None)
                 cost_str = f"{float(cost_rub):.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
 
-                # Температура (если есть в turn)
                 temp_val = turn.get("temperature", None)
                 if isinstance(temp_val, (int, float)):
                     temp_str = f"{float(temp_val)}"
                 else:
                     temp_str = "locked(1.0)"
 
-                # TTFT / Total в истории не сохранялись -> показываем N/A, но формат тот же
                 result_line = (
                     f"Model={model} | "
                     f"Endpoint={endpoint} | "
@@ -536,8 +635,6 @@ class ChatTab(BaseTab):
                     pass
 
                 last_turn = turn
-
-        # 2) Fallback: если это старая сессия без history — покажем messages как раньше (без метрик)
         else:
             for m in messages:
                 role = (m.get("role") or "").strip()
@@ -553,7 +650,6 @@ class ChatTab(BaseTab):
                 self.output_editbox.append(prefix + content)
                 self.output_editbox.append("")
 
-        # 3) Восстановим модель/эндпоинт/температуру по последнему turn
         if isinstance(last_turn, dict):
             last_model = (last_turn.get("model") or "").strip()
             last_endpoint = (last_turn.get("endpoint") or "").strip()
@@ -564,18 +660,19 @@ class ChatTab(BaseTab):
                 if idx >= 0:
                     self.model_selector.setCurrentIndex(idx)
 
-            # endpoint_selector у тебя хранит endpoint в userData
             if last_endpoint:
                 idx2 = self.endpoint_selector.findData(last_endpoint)
                 if idx2 >= 0:
                     self.endpoint_selector.setCurrentIndex(idx2)
 
-            # температура — только если поле активно (у некоторых моделей она “locked”)
             if self.temperature_input.isEnabled() and isinstance(last_temp, (int, float)):
                 try:
                     self.temperature_input.setValue(float(last_temp))
                 except Exception:
                     pass
+
+        # обновим знаменатель в лейблах (порог)
+        self.on_threshold_changed()
 
     def on_new_session_clicked(self):
         if self.is_generating:
@@ -716,6 +813,7 @@ class ChatTab(BaseTab):
 
         self.set_loading(True)
 
+        # --- условия
         if use_conditions:
             fmt = self.format_input.text().strip()
             length_rule = self.length_input.text().strip()
@@ -742,13 +840,46 @@ class ChatTab(BaseTab):
             controlled_text = text
             max_tokens = 800
 
+        # --- параметры “сжатия”
+        try:
+            char_limit = int(self.char_limit_input.value())
+        except Exception:
+            char_limit = 12000
+
+        try:
+            keep_last_n = int(self.keep_last_n_input.value())
+        except Exception:
+            keep_last_n = 8
+
+        summary_model = self.summary_model_selector.currentText().strip()
+        summary_endpoint = self.summary_endpoint_selector.currentData()
+
         self.stop_requested = False
         self.is_generating = True
         self.current_task = asyncio.create_task(
-            self.ask_and_stream_answer(controlled_text, target_output, use_conditions, max_tokens)
+            self.ask_and_stream_answer(
+                controlled_text,
+                target_output,
+                use_conditions,
+                max_tokens,
+                char_limit,
+                keep_last_n,
+                summary_model,
+                summary_endpoint,
+            )
         )
 
-    async def ask_and_stream_answer(self, user_text: str, target_output: QTextEdit, use_conditions: bool, max_tokens: int):
+    async def ask_and_stream_answer(
+        self,
+        user_text: str,
+        target_output: QTextEdit,
+        use_conditions: bool,
+        max_tokens: int,
+        char_limit: int,
+        keep_last_n: int,
+        summary_model: str,
+        summary_endpoint: str,
+    ):
         self.logger.info("Отправка запроса в агент")
 
         stop_seq = self.stop_seq_input.text().strip() if use_conditions else ""
@@ -767,7 +898,6 @@ class ChatTab(BaseTab):
         ttft_sec = None
         got_first_chunk = False
 
-        # Для метрик/логов в finally
         error_text = None
 
         try:
@@ -795,6 +925,10 @@ class ChatTab(BaseTab):
                 max_tokens=max_tokens,
                 temperature=selected_temperature,
                 session_id=self.current_session_id,
+                char_limit=int(char_limit),
+                keep_last_n=int(keep_last_n),
+                summary_model=str(summary_model or "").strip(),
+                summary_endpoint=str(summary_endpoint or "chat"),
             )
 
             async for chunk in gen:
@@ -826,9 +960,6 @@ class ChatTab(BaseTab):
         except Exception as e:
             error_text = str(e)
 
-            # ✅ ВАЖНО:
-            # 400/ProxyAPI ошибки НЕ должны ронять флаг подключения к агенту.
-            # OFFLINE ставим только при реальных сетевых/транспортных проблемах.
             is_proxyapi_error = ("ProxyAPI error:" in error_text) or ("HTTP 400" in error_text) or ("ContextWindowExceededError" in error_text)
 
             is_connection_error = isinstance(
@@ -844,7 +975,6 @@ class ChatTab(BaseTab):
                 ),
             )
 
-            # Доп. страховка по текстам типичных сетевых ошибок
             if not is_proxyapi_error:
                 low = error_text.lower()
                 if ("connection reset" in low) or ("broken pipe" in low) or ("connection refused" in low) or ("cannot connect" in low):
@@ -878,6 +1008,28 @@ class ChatTab(BaseTab):
             r_prev_prompt_total = int(ms.get("r_prev_prompt_total") or 0)
             current_message_tokens = int(ms.get("current_message_tokens") or 0)
 
+            # --- NEW stats
+            new_message_len = int(ms.get("new_message_len") or 0)
+            char_limit_used = int(ms.get("char_limit") or char_limit)
+            history_summarized = bool(ms.get("history_summarized") or False)
+            history_summary_text = ms.get("history_summary") or ""
+
+            # --- обновим summary в UI если агент прислал
+            if isinstance(history_summary_text, str) and history_summary_text.strip():
+                try:
+                    self.summary_output_box.setPlainText(history_summary_text)
+                except Exception:
+                    pass
+
+            # --- обновим лейблы длины (ТОЛЬКО при отправке — как ты и хотел)
+            try:
+                if use_conditions:
+                    self.condition_len_label.setText(f"{new_message_len} / {char_limit_used}")
+                else:
+                    self.plain_len_label.setText(f"{new_message_len} / {char_limit_used}")
+            except Exception:
+                pass
+
             ttft_str = f"{ttft_sec:.3f}s" if isinstance(ttft_sec, (int, float)) else "N/A"
             temp_str = f"{selected_temperature}" if selected_temperature is not None else "locked(1.0)"
             cost_str = f"{cost_rub:.4f} ₽" if isinstance(cost_rub, (int, float)) else "N/A"
@@ -892,12 +1044,12 @@ class ChatTab(BaseTab):
                 f"completion(c)={completion_tokens} | "
                 f"current_message_tokens={current_message_tokens} | "
                 f"total_tokens={total_tokens_call} | "
-                f"Cost={cost_str}"
+                f"Cost={cost_str} | "
+                f"new_message_len={new_message_len}/{char_limit_used} | "
+                f"summarized={history_summarized}"
             )
 
-            # Если была ошибка API — добавим короткую пометку в метрики (без “оффлайна”)
             if error_text:
-                # не раздуваем строку логов
                 short_err = error_text.replace("\n", " ")
                 if len(short_err) > 180:
                     short_err = short_err[:180] + "..."
@@ -917,7 +1069,6 @@ class ChatTab(BaseTab):
 
             self.logger.success("Ответ получен")
 
-            # список сессий можно обновлять даже после API-ошибки (если агент жив)
             if self.is_agent_connected:
                 asyncio.get_event_loop().create_task(self.refresh_sessions_list())
 
