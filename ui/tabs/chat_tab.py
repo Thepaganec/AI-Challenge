@@ -149,89 +149,174 @@ class ChatTab(BaseTab):
         set_editbox_height(self.input_editbox, 6)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setVisible(False)
 
         self.output_editbox = QTextEdit()
         self.output_editbox.setFont(font)
         self.output_editbox.setReadOnly(True)
 
         self.stop_button = QPushButton("STOP")
-        self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_generation)
+        self.stop_button.setEnabled(False)
 
-        self.clear_button = QPushButton("CLEAR")
-        self.clear_button.clicked.connect(self.output_editbox.clear)
+        self.clear_output_button = QPushButton("CLEAR")
+        self.clear_output_button.clicked.connect(self.on_clear_output_clicked)
 
         btn_row = QWidget()
-        br = QHBoxLayout(btn_row)
-        br.setContentsMargins(0, 0, 0, 0)
-        br.addWidget(self.stop_button)
-        br.addStretch()
-        br.addWidget(self.clear_button)
+        btn_l = QHBoxLayout(btn_row)
+        btn_l.setContentsMargins(0, 0, 0, 0)
+        btn_l.setSpacing(8)
+        btn_l.addWidget(self.stop_button)
+        btn_l.addStretch(1)
+        btn_l.addWidget(self.clear_output_button)
 
-        # ===== metrics =====
-        self.metrics_box = QTextEdit()
-        self.metrics_box.setReadOnly(True)
-        self.metrics_box.setMinimumHeight(160)
-        self.metrics_box.setPlaceholderText("usage / cost / стратегия / ветка ...")
-
-        self.facts_box = QTextEdit()
-        self.facts_box.setReadOnly(True)
-        self.facts_box.setMinimumHeight(140)
-        self.facts_box.setPlaceholderText("FACTS для стратегии Sticky Facts (показывается, когда она активна).")
-
-        # ===== layout =====
-        top_controls = QGroupBox("Параметры запроса")
-        tc = QVBoxLayout(top_controls)
-        tc.setContentsMargins(8, 8, 8, 8)
-        tc.setSpacing(6)
-
-        def row(lbl, widget):
-            w = QWidget()
-            l = QHBoxLayout(w)
-            l.setContentsMargins(0, 0, 0, 0)
-            l.setSpacing(8)
-            l.addWidget(QLabel(lbl))
-            l.addStretch()
-            l.addWidget(widget)
-            return w
-
-        tc.addWidget(row("Модель:", self.model_selector))
-        tc.addWidget(row("Эндпоинт:", self.endpoint_selector))
-        tc.addWidget(row("temperature:", self.temperature_input))
-        tc.addWidget(row("N сообщений (user+assistant):", self.keep_last_n_input))
-        tc.addWidget(row("Стратегия контекста:", self.strategy_selector))
-
-        branching_box = QGroupBox("Branching (ветки диалога)")
-        bb = QVBoxLayout(branching_box)
-        bb.setContentsMargins(8, 8, 8, 8)
-        bb.setSpacing(6)
-
-        bb.addWidget(row("Текущая ветка:", self.branch_selector))
-        bb.addWidget(row("Checkpoint:", self.checkpoint_name))
-        bb.addWidget(self.create_checkpoint_btn)
-        bb.addSpacing(6)
-        bb.addWidget(row("Выбрать checkpoint:", self.checkpoint_selector))
-        bb.addWidget(row("Новая ветка:", self.new_branch_name))
-        bb.addWidget(self.create_branch_btn)
-
+        # ===== right panel (params + branching + metrics + facts) =====
         right_panel = QWidget()
         rp = QVBoxLayout(right_panel)
         rp.setContentsMargins(0, 0, 0, 0)
         rp.setSpacing(10)
-        rp.addWidget(top_controls)
-        rp.addWidget(branching_box)
-        rp.addWidget(QLabel("Metrics:"))
-        rp.addWidget(self.metrics_box)
-        rp.addWidget(QLabel("Facts:"))
-        rp.addWidget(self.facts_box)
-        rp.addStretch()
 
+        params_box = QGroupBox("Параметры запроса")
+        p_l = QVBoxLayout(params_box)
+        p_l.setContentsMargins(8, 8, 8, 8)
+        p_l.setSpacing(6)
+
+        row1 = QWidget()
+        r1 = QHBoxLayout(row1)
+        r1.setContentsMargins(0, 0, 0, 0)
+        r1.setSpacing(8)
+        r1.addWidget(QLabel("Модель:"))
+        r1.addStretch(1)
+        r1.addWidget(self.model_selector)
+
+        row2 = QWidget()
+        r2 = QHBoxLayout(row2)
+        r2.setContentsMargins(0, 0, 0, 0)
+        r2.setSpacing(8)
+        r2.addWidget(QLabel("Эндпоинт:"))
+        r2.addStretch(1)
+        r2.addWidget(self.endpoint_selector)
+
+        row3 = QWidget()
+        r3 = QHBoxLayout(row3)
+        r3.setContentsMargins(0, 0, 0, 0)
+        r3.setSpacing(8)
+        r3.addWidget(QLabel("temperature:"))
+        r3.addStretch(1)
+        r3.addWidget(self.temperature_input)
+
+        row4 = QWidget()
+        r4 = QHBoxLayout(row4)
+        r4.setContentsMargins(0, 0, 0, 0)
+        r4.setSpacing(8)
+        r4.addWidget(QLabel("N сообщений (user+assistant):"))
+        r4.addStretch(1)
+        r4.addWidget(self.keep_last_n_input)
+
+        row5 = QWidget()
+        r5 = QHBoxLayout(row5)
+        r5.setContentsMargins(0, 0, 0, 0)
+        r5.setSpacing(8)
+        r5.addWidget(QLabel("Стратегия контекста:"))
+        r5.addStretch(1)
+        r5.addWidget(self.strategy_selector)
+
+        p_l.addWidget(row1)
+        p_l.addWidget(row2)
+        p_l.addWidget(row3)
+        p_l.addWidget(row4)
+        p_l.addWidget(row5)
+
+        branch_box = QGroupBox("Branching (ветки диалога)")
+        b_l = QVBoxLayout(branch_box)
+        b_l.setContentsMargins(8, 8, 8, 8)
+        b_l.setSpacing(6)
+
+        b_row1 = QWidget()
+        b1 = QHBoxLayout(b_row1)
+        b1.setContentsMargins(0, 0, 0, 0)
+        b1.setSpacing(8)
+        b1.addWidget(QLabel("Текущая ветка:"))
+        b1.addStretch(1)
+        b1.addWidget(self.branch_selector)
+
+        b_row2 = QWidget()
+        b2 = QHBoxLayout(b_row2)
+        b2.setContentsMargins(0, 0, 0, 0)
+        b2.setSpacing(8)
+        b2.addWidget(QLabel("Checkpoint:"))
+        b2.addStretch(1)
+        b2.addWidget(self.checkpoint_name)
+
+        b_row3 = QWidget()
+        b3 = QHBoxLayout(b_row3)
+        b3.setContentsMargins(0, 0, 0, 0)
+        b3.setSpacing(8)
+        b3.addStretch(1)
+        b3.addWidget(self.create_checkpoint_btn)
+
+        b_row4 = QWidget()
+        b4 = QHBoxLayout(b_row4)
+        b4.setContentsMargins(0, 0, 0, 0)
+        b4.setSpacing(8)
+        b4.addWidget(QLabel("Выбрать checkpoint:"))
+        b4.addStretch(1)
+        b4.addWidget(self.checkpoint_selector)
+
+        b_row5 = QWidget()
+        b5 = QHBoxLayout(b_row5)
+        b5.setContentsMargins(0, 0, 0, 0)
+        b5.setSpacing(8)
+        b5.addWidget(QLabel("Новая ветка:"))
+        b5.addStretch(1)
+        b5.addWidget(self.new_branch_name)
+
+        b_row6 = QWidget()
+        b6 = QHBoxLayout(b_row6)
+        b6.setContentsMargins(0, 0, 0, 0)
+        b6.setSpacing(8)
+        b6.addStretch(1)
+        b6.addWidget(self.create_branch_btn)
+
+        b_l.addWidget(b_row1)
+        b_l.addWidget(b_row2)
+        b_l.addWidget(b_row3)
+        b_l.addWidget(b_row4)
+        b_l.addWidget(b_row5)
+        b_l.addWidget(b_row6)
+
+        self.metrics_box = QTextEdit()
+        self.metrics_box.setReadOnly(True)
+        self.metrics_box.setMinimumHeight(120)
+
+        metrics_group = QGroupBox("Metrics:")
+        mg = QVBoxLayout(metrics_group)
+        mg.setContentsMargins(8, 8, 8, 8)
+        mg.addWidget(self.metrics_box)
+
+        self.facts_box = QTextEdit()
+        self.facts_box.setReadOnly(True)
+        self.facts_box.setMinimumHeight(90)
+        self.facts_box.setPlaceholderText("FACTS для стратегии Sticky Facts (показывается, когда она активна).")
+
+        facts_group = QGroupBox("Facts:")
+        fg = QVBoxLayout(facts_group)
+        fg.setContentsMargins(8, 8, 8, 8)
+        fg.addWidget(self.facts_box)
+
+        rp.addWidget(params_box)
+        rp.addWidget(branch_box)
+        rp.addWidget(metrics_group)
+        rp.addWidget(facts_group)
+        rp.addStretch(1)
+
+        # ===== main splitter =====
         left_panel = QWidget()
         lp = QVBoxLayout(left_panel)
-        lp.setContentsMargins(0, 0, 0, 0)
+        # ВАЖНО: даём правый отступ, чтобы левый контент не прилипал к сплиттеру
+        lp.setContentsMargins(8, 8, 12, 8)
         lp.setSpacing(10)
         lp.addWidget(session_box)
         lp.addWidget(QLabel("Ввод:"))
@@ -253,6 +338,46 @@ class ChatTab(BaseTab):
 
         self.on_model_changed(self.model_selector.currentText())
         self.on_strategy_changed()
+        self.refresh_sessions_timer = QTimer(self)
+        self.refresh_sessions_timer.setInterval(1000)
+        self.refresh_sessions_timer.timeout.connect(self._tick_refresh_sessions_list)
+        self.refresh_sessions_timer.start()
+
+        self.input_editbox.installEventFilter(self)
+        self.output_editbox.setMinimumHeight(160)
+
+    def on_clear_output_clicked(self):
+        """
+        Очищает только окно вывода (без влияния на историю на сервере).
+        История в сессии не трогается.
+        """
+        self.output_editbox.clear()
+
+    def _tick_refresh_sessions_list(self):
+        """
+        Таймер раз в N мс обновляет список сессий.
+        Метод НЕ async, поэтому создаём задачу через event loop.
+        Защита от параллельных запусков, чтобы не спамить запросами к агенту.
+        """
+        if not self.is_agent_connected:
+            return
+
+        if getattr(self, "_sessions_refresh_inflight", False):
+            return
+
+        self._sessions_refresh_inflight = True
+
+        async def _run():
+            try:
+                await self.refresh_sessions_list()
+            finally:
+                self._sessions_refresh_inflight = False
+
+        try:
+            asyncio.get_event_loop().create_task(_run())
+        except Exception:
+            # если по какой-то причине нет event loop — просто снимаем флаг
+            self._sessions_refresh_inflight = False
 
     # ======= UI helpers =======
     def set_loading(self, is_loading: bool):
@@ -642,9 +767,10 @@ class ChatTab(BaseTab):
 
             strategy_used = ms.get("strategy") or strategy
             facts_count = ms.get("facts_count")
+            sent_messages = ms.get("sent_messages")
 
             line = (
-                f"Strategy={strategy_used} | Branch={active_branch} | keep_last_n={keep_last_n} | "
+                f"Strategy={strategy_used} | Branch={active_branch} | sent_msgs={sent_messages} | keep_last_n={keep_last_n} | "
                 f"TTFT={ttft_str} | Total={total_sec:.3f}s | "
                 f"prompt={prompt_tokens} | completion={completion_tokens} | total={total_tokens_call} | Cost={cost_str} | "
                 f"Temp={temp_str}"
@@ -665,7 +791,7 @@ class ChatTab(BaseTab):
             if strategy_used == "facts" and isinstance(last_facts, dict):
                 self.render_facts(last_facts)
 
-            # refresh session list (title updates) — БЕЗ перезагрузки UI (иначе чистит поля)
+            # refresh session list (title updates) — без перезагрузки UI (иначе может чистить поля)
             if self.is_agent_connected:
                 asyncio.get_event_loop().create_task(self.refresh_sessions_list())
 

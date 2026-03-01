@@ -163,21 +163,14 @@ class LLMAgentServer:
         self.memory_store.set_title_if_empty(session, user_text)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer = writer.get_extra_info("peername")
-        self.logger.write("INFO", "Клиент подключился", extra=str(peer))
-
+        peer = writer
         try:
             line = await reader.readline()
             if not line:
                 return
 
-            try:
-                request = json.loads(line.decode("utf-8", errors="replace"))
-            except Exception:
-                await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
-                return
-
-            action = request.get("action")
+            request = json.loads(line.decode("utf-8", errors="replace"))
+            action = (request.get("action") or "").strip()
 
             if action == "ping":
                 await self._send_json(writer, {"type": "pong"})
@@ -185,21 +178,7 @@ class LLMAgentServer:
 
             if action == "list_sessions":
                 sessions = self.memory_store.list_sessions()
-                await self._send_json(
-                    writer,
-                    {
-                        "type": "sessions",
-                        "sessions": [
-                            {
-                                "session_id": s.session_id,
-                                "title": s.title,
-                                "created_at": s.created_at,
-                                "updated_at": s.updated_at,
-                            }
-                            for s in sessions
-                        ],
-                    },
-                )
+                await self._send_json(writer, {"type": "sessions", "sessions": sessions})
                 return
 
             if action == "get_session":
@@ -207,25 +186,29 @@ class LLMAgentServer:
                 if not session_id:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
-
-                session = self.memory_store.load_session(session_id)
-                await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
+                s = self.memory_store.load_session(session_id)
+                await self._send_json(writer, {"type": "session", "session": s})
                 return
 
-            if action == "reset_session":
+            if action == "create_session":
+                title = (request.get("title") or "").strip() or "Новая сессия"
+                session_id = self.memory_store.create_session(title=title)
+                await self._send_json(writer, {"type": "session_created", "session_id": session_id})
+                return
+
+            if action == "clear_session":
                 session_id = (request.get("session_id") or "").strip()
                 if not session_id:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
-
-                self.memory_store.delete_session_file(session_id)
-                await self._send_json(writer, {"type": "ok"})
+                ok = self.memory_store.clear_session(session_id)
+                await self._send_json(writer, {"type": "cleared", "ok": bool(ok)})
                 return
 
             if action == "create_checkpoint":
                 session_id = (request.get("session_id") or "").strip()
                 branch_id = (request.get("branch_id") or "").strip() or None
-                name = (request.get("name") or "").strip()
+                name = (request.get("name") or "").strip() or None
 
                 if not session_id:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
@@ -233,83 +216,119 @@ class LLMAgentServer:
 
                 session = self.memory_store.load_session(session_id)
                 bid, branch = self._get_branch(session, branch_id)
+                cps = branch.get("checkpoints") if isinstance(branch.get("checkpoints"), list) else []
+                branch["checkpoints"] = cps
+
                 history = self._branch_history(branch)
+                cp = self._make_checkpoint(history, name=name)
+                cps.append(cp)
 
-                cp_id = (name or f"cp_{len(branch.get('checkpoints') or {}) + 1}").strip()
-                if not isinstance(branch.get("checkpoints"), dict):
-                    branch["checkpoints"] = {}
-
-                branch["checkpoints"][cp_id] = len(history)  # индекс = длина (точка "после последнего сообщения")
-                branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                session["updated_at"] = branch["updated_at"]
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                branch["updated_at"] = now
+                session["updated_at"] = now
                 session["active_branch"] = bid
-
                 self.memory_store.save_session(session)
 
-                await self._send_json(writer, {"type": "ok", "checkpoint_id": cp_id, "branch_id": bid})
+                await self._send_json(writer, {"type": "checkpoint_created", "checkpoint": cp, "active_branch": bid})
                 return
 
             if action == "create_branch":
                 session_id = (request.get("session_id") or "").strip()
-                from_branch_id = (request.get("from_branch_id") or "").strip() or None
+                branch_id = (request.get("branch_id") or "").strip() or None
                 checkpoint_id = (request.get("checkpoint_id") or "").strip()
-                new_branch_name = (request.get("new_branch_name") or "").strip()
+                name = (request.get("name") or "").strip() or None
 
-                if not session_id:
-                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
-                    return
-                if not checkpoint_id:
-                    await self._send_json(writer, {"type": "error", "message": "checkpoint_id is required"})
+                if not session_id or not checkpoint_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id and checkpoint_id are required"})
                     return
 
                 session = self.memory_store.load_session(session_id)
-                src_bid, src_branch = self._get_branch(session, from_branch_id)
-                cps = src_branch.get("checkpoints") or {}
-                if not isinstance(cps, dict) or checkpoint_id not in cps:
+                base_bid, base_branch = self._get_branch(session, branch_id)
+
+                cps = base_branch.get("checkpoints") if isinstance(base_branch.get("checkpoints"), list) else []
+                cp = None
+                for c in cps:
+                    if (c or {}).get("id") == checkpoint_id:
+                        cp = c
+                        break
+
+                if not cp:
                     await self._send_json(writer, {"type": "error", "message": "checkpoint not found"})
                     return
 
-                cut = int(cps.get(checkpoint_id) or 0)
-                src_history = self._branch_history(src_branch)
-                new_history = list(src_history[:cut])
+                new_bid = self._create_branch_from_checkpoint(session, base_branch, cp, name=name)
 
-                new_bid = str(uuid.uuid4())[:8]
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                session["branches"][new_bid] = {
-                    "branch_id": new_bid,
-                    "name": new_branch_name or f"{src_bid}:{checkpoint_id}",
-                    "created_at": now,
-                    "updated_at": now,
-                    "facts": dict(src_branch.get("facts") or {}),
-                    "checkpoints": {},
-                    "history": new_history,
-                }
-
-                session["active_branch"] = new_bid
                 session["updated_at"] = now
+                session["active_branch"] = new_bid
                 self.memory_store.save_session(session)
 
-                await self._send_json(writer, {"type": "ok", "branch_id": new_bid})
+                await self._send_json(writer, {"type": "branch_created", "branch_id": new_bid})
                 return
 
-            if action == "switch_branch":
+            if action == "list_branches":
                 session_id = (request.get("session_id") or "").strip()
-                branch_id = (request.get("branch_id") or "").strip()
-
                 if not session_id:
                     await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
-                if not branch_id:
-                    await self._send_json(writer, {"type": "error", "message": "branch_id is required"})
-                    return
-
                 session = self.memory_store.load_session(session_id)
-                bid, _ = self._get_branch(session, branch_id)
-                session["active_branch"] = bid
-                session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.memory_store.save_session(session)
+                branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
+                out = []
+                for bid, b in branches.items():
+                    title = (b or {}).get("title") or bid
+                    out.append({"id": bid, "title": title})
+                await self._send_json(writer, {"type": "branches", "branches": out, "active_branch": session.get("active_branch")})
+                return
 
-                await self._send_json(writer, {"type": "ok", "active_branch": bid})
+            if action == "list_checkpoints":
+                session_id = (request.get("session_id") or "").strip()
+                branch_id = (request.get("branch_id") or "").strip() or None
+                if not session_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    return
+                session = self.memory_store.load_session(session_id)
+                bid, branch = self._get_branch(session, branch_id)
+                cps = branch.get("checkpoints") if isinstance(branch.get("checkpoints"), list) else []
+                await self._send_json(writer, {"type": "checkpoints", "checkpoints": cps, "active_branch": bid})
+                return
+
+            if action == "set_active_branch":
+                session_id = (request.get("session_id") or "").strip()
+                branch_id = (request.get("branch_id") or "").strip()
+                if not session_id or not branch_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id and branch_id are required"})
+                    return
+                session = self.memory_store.load_session(session_id)
+                branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
+                if branch_id not in branches:
+                    await self._send_json(writer, {"type": "error", "message": "branch not found"})
+                    return
+                session["active_branch"] = branch_id
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session["updated_at"] = now
+                self.memory_store.save_session(session)
+                await self._send_json(writer, {"type": "active_branch_set", "active_branch": branch_id})
+                return
+
+            if action == "delete_branch":
+                session_id = (request.get("session_id") or "").strip()
+                branch_id = (request.get("branch_id") or "").strip()
+                if not session_id or not branch_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id and branch_id are required"})
+                    return
+                session = self.memory_store.load_session(session_id)
+                branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
+                if branch_id == "main":
+                    await self._send_json(writer, {"type": "error", "message": "Cannot delete main branch"})
+                    return
+                if branch_id in branches:
+                    del branches[branch_id]
+                if session.get("active_branch") == branch_id:
+                    session["active_branch"] = "main"
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session["updated_at"] = now
+                self.memory_store.save_session(session)
+                await self._send_json(writer, {"type": "branch_deleted", "branch_id": branch_id})
                 return
 
             if action != "stream_chat":
@@ -352,7 +371,7 @@ class LLMAgentServer:
             bid, branch = self._get_branch(session, branch_id)
             history = self._branch_history(branch)
 
-            # 1) update facts after each user message (только для facts стратегии, но хранить можно всегда)
+            # 1) update facts after each user message
             facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
             facts = parse_facts_from_user_text(user_text, facts)
             branch["facts"] = facts
@@ -367,10 +386,8 @@ class LLMAgentServer:
             if strategy == "facts":
                 system_text, history_for_llm = build_facts_strategy(history[:-1], facts, keep_last_n)  # без текущего user_text
             elif strategy == "branching":
-                # branching по сути = sliding, но по ветке
                 history_for_llm = build_sliding_window(history[:-1], keep_last_n)
             else:
-                # default sliding
                 history_for_llm = build_sliding_window(history[:-1], keep_last_n)
 
             # 4) call model (user_text отдельно)
@@ -408,10 +425,12 @@ class LLMAgentServer:
                 self.memory_store.save_session(session)
 
                 # prompt tokens estimation for "sent" messages: system + history_for_llm + user_text
+                sent_messages = int(len(history_for_llm) + 1 + (1 if system_text else 0))
                 message_stats = {
                     "strategy": strategy,
                     "branch_id": bid,
                     "keep_last_n": int(keep_last_n),
+                    "sent_messages": sent_messages,
                     "facts_count": int(len(facts) if isinstance(facts, dict) else 0),
                 }
 
@@ -423,11 +442,10 @@ class LLMAgentServer:
                         "endpoint": endpoint,
                         "usage": usage,
                         "cost_rub": cost_rub,
-                        "session_id": session_id,
-                        "title": session.get("title") or "",
+                        "title": session.get("title"),
                         "active_branch": bid,
                         "message_stats": message_stats,
-                        "facts": facts if strategy == "facts" else None,
+                        "facts": facts if isinstance(facts, dict) else {},
                     },
                 )
 
@@ -439,19 +457,16 @@ class LLMAgentServer:
                         pass
 
         except Exception as e:
-            tb = traceback.format_exc()
-            msg = str(e) or "Unknown error"
-            self.logger.write("ERROR", "Ошибка обработки клиента", extra=msg)
-            self.logger.write("ERROR", "TRACEBACK", extra=tb)
-            await self._send_json(writer, {"type": "error", "message": msg})
-
+            try:
+                await self._send_json(writer, {"type": "error", "message": str(e)})
+            except Exception:
+                pass
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
-            self.logger.write("INFO", "Клиент отключился", extra=str(peer))
 
     async def run(self) -> None:
         await self.preload_pricing()
