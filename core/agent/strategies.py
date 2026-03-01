@@ -57,17 +57,24 @@ def build_sliding_window(history: List[dict], keep_last_n: int) -> List[dict]:
     last_turns = turns[-max_turns:]
     flattened: List[dict] = [m for t in last_turns for m in t]
     return flattened
+
 def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """
-    Простая (правда простая) эвристика обновления facts из текста пользователя.
-    - Поддерживает явный формат:
+    Эвристика обновления facts из текста пользователя.
+
+    Обновляем facts после КАЖДОГО сообщения пользователя:
+    - Поддерживаем явный формат:
         fact: key = value
         факт: key = value
-        key: value  (если key выглядит как "цель/ограничения/предпочтения/решение/договоренность")
-    - А также ловит распространённые фразы:
+        key: value  (если key выглядит как "цель/ограничения/предпочтения/решение/договорённости")
+    - Ловим распространённые фразы:
         "моя цель ..." / "цель: ..."
         "ограничение ..." / "ограничения: ..."
         "предпочитаю ..." / "предпочтения: ..."
+    - ВАЖНО: даже если пользователь не дал явных facts,
+      сохраняем:
+        * "Последний запрос" — всегда
+        * "Цель" — если ещё не задана (берём из первого нормального запроса)
     """
     facts: Dict[str, str] = dict(prev_facts or {})
 
@@ -75,8 +82,13 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
     if not text:
         return facts
 
+    # всегда фиксируем последний запрос (чтобы было видно, что блок живой)
+    # ограничим длину, чтобы не раздувать
+    first_line = text.splitlines()[0].strip()
+    if first_line:
+        facts["Последний запрос"] = (first_line[:220] + "...") if len(first_line) > 220 else first_line
+
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    lowered = text.lower()
 
     # 1) явные fact/факт команды
     for ln in lines:
@@ -124,16 +136,16 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
     if m:
         facts["Ограничения"] = m.group(1).strip()
 
-    # немного чистим
+    # 4) если цель ещё не определена — ставим её из первого запроса
+    # (это ровно то, что ожидается на демо Day 10: facts появляются и обновляются)
+    if "Цель" not in facts and first_line:
+        facts["Цель"] = (first_line[:220] + "...") if len(first_line) > 220 else first_line
+
+    # чистим пустые
     for k in list(facts.keys()):
-        if facts[k] is None:
+        v = facts.get(k)
+        if not k or v is None or str(v).strip() == "":
             facts.pop(k, None)
-            continue
-        v = str(facts[k]).strip()
-        if not v:
-            facts.pop(k, None)
-            continue
-        facts[k] = v
 
     return facts
 
