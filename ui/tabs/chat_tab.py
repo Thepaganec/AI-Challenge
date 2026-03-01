@@ -2,6 +2,7 @@ import os, json, asyncio, time
 import uuid
 import extra.Global as Global
 
+from core.logger.advanced_logger import Logger
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
     QLineEdit, QPushButton, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
@@ -27,7 +28,7 @@ class ChatTab(BaseTab):
     file_name = f"{os.path.splitext(os.path.basename(__file__))[0]}.json"
     CONFIG_FILE = os.path.join(path, file_name)
 
-    def __init__(self, logger):
+    def __init__(self, logger: Logger):
         super().__init__(logger)
 
         self.agent = AgentClient(logger=logger)
@@ -52,21 +53,9 @@ class ChatTab(BaseTab):
         #self.condition_toggle.toggled.connect(self.condition_toggle_changed)
         self.condition_parameters.char_limit_changed.connect(self.on_char_limit_changed)
 
-        """
-        
-        # --- Модель влияет на доступность temperature
-        self.model_selector.currentTextChanged.connect(self.on_model_changed)
-        self.on_model_changed(self.model_selector.currentText())
-
-        
-
-        # --- наполним список сессий хотя бы текущей, даже если агент оффлайн
-        self.render_sessions_list_offline()
-        """
-
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
-        self.inbox = InputController()
+        self.inbox = InputController(agent=self.agent, logger=self.logger)
         self.inbox.setContentsMargins(150, 0, 150, 0)
 
         self.outbox = OutputController()
@@ -81,7 +70,7 @@ class ChatTab(BaseTab):
         self.metrics = MetricsController()
         self.metrics.setContentsMargins(0, 0, 0, 0) 
 
-        self.summary = SummarizationController()
+        self.summary = SummarizationController(logger=self.logger)
         self.summary.setContentsMargins(0, 0, 0, 0) 
 
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
@@ -108,6 +97,25 @@ class ChatTab(BaseTab):
     
     def on_char_limit_changed(self, value):
         self.outbox.set_length_threshold(value)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def render_sessions_list_offline(self):
         try:
@@ -324,20 +332,6 @@ class ChatTab(BaseTab):
 
         asyncio.get_event_loop().create_task(_do())
 
-    def on_model_changed(self, model_text: str):
-        model_text = (model_text or "").strip()
-
-        # Для openai/gpt-5.2-chat-latest ProxyAPI запрещает temperature != 1
-        is_gpt52_locked = (model_text == "gpt-5.2-chat-latest")
-
-        self.temperature_input.setEnabled(not is_gpt52_locked)
-
-        if is_gpt52_locked:
-            # Сбрасываем в 1.0, чтобы было очевидно, что иначе нельзя
-            self.temperature_input.setValue(1.0)
-            self.logger.warning("Для gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
-        else:
-            self.logger.info(f"Выбрана модель {model_text}. temperature доступна.")
 
     async def ask_and_stream_answer(
         self,

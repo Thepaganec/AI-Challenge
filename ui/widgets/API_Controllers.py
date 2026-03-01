@@ -1,5 +1,5 @@
 import extra.Global as Global
-
+from core.logger.advanced_logger import Logger
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
     QLineEdit, QPushButton, QComboBox, QDoubleSpinBox, QListWidget, QListWidgetItem,
@@ -10,8 +10,9 @@ from PySide6.QtCore import (
 )
 
 class APIControllers(QWidget):
-    def __init__(self):
+    def __init__(self, logger: Logger):
         super().__init__()
+        self.logger = logger
 
         # --- ПЕРЕМЕННЫЕ ВИДЖЕТА
         self.model_list = [
@@ -24,8 +25,10 @@ class APIControllers(QWidget):
             ("Responses", "responses")]
 
         self.init_content()
+        self.on_model_changed(self.model_selector.currentText())
 
         # --- ПОДПИСКА НА СИГНАЛЫ (ЕСЛИ ЕСТЬ)
+        self.model_selector.currentTextChanged.connect(self.on_model_changed)
 
     def init_content(self):
         # --- UI объекты виджета
@@ -58,5 +61,21 @@ class APIControllers(QWidget):
         # === РАССТАНОВКА ОБЪЕКТОВ ВИДЖЕТА
         widget_layout = QVBoxLayout(self)
         widget_layout.addWidget(controllers_container)
+
+    def on_model_changed(self, model_text: str):
+        model_text = (model_text or "").strip()
+
+        # Для openai/gpt-5.2-chat-latest ProxyAPI запрещает temperature != 1
+        is_gpt52_locked = (model_text == "gpt-5.2-chat-latest")
+
+        self.temperature_input.setEnabled(not is_gpt52_locked)
+
+        if is_gpt52_locked:
+            self.temperature_input.setValue(1.0)
+            self.logger.warning("Для gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
+        else:
+            self.logger.info(f"Выбрана модель {model_text}. temperature доступна.")
+
+            
     
 

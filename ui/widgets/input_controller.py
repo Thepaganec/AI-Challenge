@@ -1,8 +1,10 @@
+import asyncio
 import extra.Global as Global
 
 
 from core.agent.agent_client import AgentClient
 from core.logger.advanced_logger import Logger
+
 from ui.widgets.API_Controllers import APIControllers
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
@@ -33,7 +35,7 @@ class InputController(QWidget):
     def init_content(self):
         # --- UI объекты виджета
         
-        self.API_controllers = APIControllers()
+        self.API_controllers = APIControllers(logger=self.logger)
         self.API_controllers.setContentsMargins(0, 0, 0, 0) 
 
         self.textbox = QTextEdit()

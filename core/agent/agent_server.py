@@ -39,12 +39,7 @@ class LLMAgentServer:
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
 
-    async def send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        writer.write(data)
-        await writer.drain()
-
-    async def preload_pricing(self) -> None:
+    async def load_pricing(self) -> None:
         try:
             self.logger.write("INFO", "Загрузка тарифов ProxyAPI (pricing/list)...")
             self.pricing_cache = await self.gpt.get_pricing_rub_per_1m()
@@ -52,6 +47,11 @@ class LLMAgentServer:
         except Exception as e:
             self.logger.write("WARN", "Не удалось загрузить тарифы ProxyAPI", extra=str(e))
             self.pricing_cache = {}
+
+    async def send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        writer.write(data)
+        await writer.drain()
 
     def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> Optional[float]:
         try:
@@ -498,11 +498,11 @@ class LLMAgentServer:
             self.logger.write("INFO", "Клиент отключился", extra=str(peer))
 
     async def run(self) -> None:
-        await self.preload_pricing()
+        await self.load_pricing()
 
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-        self.logger.write("INFO", "Агент запущен и слушает", extra=addrs)
+        self.logger.write("INFO", "Сервер запущен и слушает", extra=addrs)
 
         async with server:
             await server.serve_forever()
@@ -510,7 +510,6 @@ class LLMAgentServer:
 async def main() -> None:
     agent = LLMAgentServer()
     await agent.run()
-
 
 if __name__ == "__main__":
     try:

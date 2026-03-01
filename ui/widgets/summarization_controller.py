@@ -1,4 +1,5 @@
 import extra.Global as Global
+from core.logger.advanced_logger import Logger
 
 
 from ui.widgets.API_Controllers import APIControllers
@@ -12,8 +13,9 @@ from PySide6.QtCore import (
 )
 
 class SummarizationController(QWidget):
-    def __init__(self):
+    def __init__(self, logger: Logger):
         super().__init__()
+        self.logger = logger
 
         # --- ПЕРЕМЕННЫЕ ВИДЖЕТА
 
@@ -23,7 +25,7 @@ class SummarizationController(QWidget):
 
     def init_content(self):
         # --- UI объекты виджета
-        self.API_controllers = APIControllers()
+        self.API_controllers = APIControllers(logger=self.logger)
         self.API_controllers.setContentsMargins(0, 0, 0, 0) 
 
         self.label = QLabel("Суммаризация, если есть:")
