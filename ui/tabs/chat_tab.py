@@ -201,7 +201,7 @@ class ChatTab(BaseTab):
         tc.addWidget(row("Модель:", self.model_selector))
         tc.addWidget(row("Эндпоинт:", self.endpoint_selector))
         tc.addWidget(row("temperature:", self.temperature_input))
-        tc.addWidget(row("N последних сообщений:", self.keep_last_n_input))
+        tc.addWidget(row("N сообщений (user+assistant):", self.keep_last_n_input))
         tc.addWidget(row("Стратегия контекста:", self.strategy_selector))
 
         branching_box = QGroupBox("Branching (ветки диалога)")
@@ -665,10 +665,9 @@ class ChatTab(BaseTab):
             if strategy_used == "facts" and isinstance(last_facts, dict):
                 self.render_facts(last_facts)
 
-            # refresh session list (title updates)
+            # refresh session list (title updates) — БЕЗ перезагрузки UI (иначе чистит поля)
             if self.is_agent_connected:
                 asyncio.get_event_loop().create_task(self.refresh_sessions_list())
-                asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
 
             self.is_generating = False
             self.current_task = None

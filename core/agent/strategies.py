@@ -3,11 +3,60 @@ from typing import Dict, List, Optional, Tuple
 
 
 def build_sliding_window(history: List[dict], keep_last_n: int) -> List[dict]:
+    """
+    Sliding Window по ТЗ Day 10 считаем в *сообщениях*, но сохраняем *полные диалоговые итерации*.
+
+    Правило: 1 отправка = 2 сообщения (user -> assistant).
+    Поэтому:
+      keep_last_n = 10  => 5 последних "поворотов" (5 user + 5 assistant)
+    """
     if keep_last_n <= 0:
         return []
-    return list(history[-keep_last_n:])
 
+    # Считаем "повороты диалога" (turns): обычно это [user, assistant].
+    turns: List[List[dict]] = []
+    current: List[dict] = []
 
+    for msg in history or []:
+        role = (msg or {}).get("role")
+
+        if role == "user":
+            # если до этого остался незавершённый turn — сохраняем как есть
+            if current:
+                turns.append(current)
+                current = []
+            current.append(msg)
+            continue
+
+        if role == "assistant":
+            if not current:
+                # на всякий случай: assistant без user
+                current = [msg]
+                turns.append(current)
+                current = []
+            else:
+                current.append(msg)
+                turns.append(current)
+                current = []
+            continue
+
+        # неизвестная роль — просто добавим в текущий turn
+        if not current:
+            current = [msg]
+        else:
+            current.append(msg)
+
+    if current:
+        turns.append(current)
+
+    # keep_last_n — это количество сообщений (user+assistant). Один turn ~ 2 сообщения.
+    max_turns = keep_last_n // 2
+    if max_turns <= 0:
+        return []
+
+    last_turns = turns[-max_turns:]
+    flattened: List[dict] = [m for t in last_turns for m in t]
+    return flattened
 def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """
     Простая (правда простая) эвристика обновления facts из текста пользователя.

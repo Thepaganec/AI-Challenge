@@ -143,13 +143,21 @@ class LLMAgentServer:
         if not isinstance(h, list):
             h = []
             branch["history"] = h
-        out = []
+
+        # Нормализуем и ВАЖНО: сохраняем обратно в branch["history"],
+        # чтобы дальнейшие append() реально попадали в сессию.
+        normalized: List[Dict[str, str]] = []
         for m in h:
+            if not isinstance(m, dict):
+                continue
             role = (m.get("role") or "").strip()
             content = m.get("content")
-            if role and content is not None:
-                out.append({"role": role, "content": str(content)})
-        return out
+            if not role or content is None:
+                continue
+            normalized.append({"role": role, "content": str(content)})
+
+        branch["history"] = normalized
+        return branch["history"]
 
     def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
         self.memory_store.set_title_if_empty(session, user_text)
