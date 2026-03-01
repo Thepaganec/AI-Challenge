@@ -1,4 +1,5 @@
 from PySide6.QtWidgets import (QTextEdit)
+from PySide6.QtGui import QFont
 
 def set_editbox_height(editbox: QTextEdit, lines: int):
     fm = editbox.fontMetrics()
@@ -11,3 +12,8 @@ def set_editbox_height(editbox: QTextEdit, lines: int):
     )
 
     editbox.setFixedHeight(line_height * lines + extra)
+
+def get_default_font():
+    font = QFont()
+    font.setPointSize(13)
+    return font

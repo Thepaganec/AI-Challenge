@@ -1,5 +1,6 @@
 import os, json, asyncio, time
 import uuid
+import extra.Global as Global
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QSizePolicy, QProgressBar, QSplitter, QLabel,
@@ -8,12 +9,18 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import (Qt, QByteArray, QTimer, QEvent)
-from PySide6.QtGui import QTextCursor, QFont
+from PySide6.QtGui import QTextCursor
 
-from ui.custom_objects.toggle_switch import ToggleSwitch
 from ui.tabs.base_tab import BaseTab
+from ui.widgets.input_controller import InputController
+from ui.widgets.output_controller import OutputController
+from ui.widgets.parameters_controller import ParametersController
+from ui.widgets.metrics_controller import MetricsController
+from ui.widgets.sessions_controller import SessionsController
+from ui.widgets.summarization_controller import SummarizationController
+from ui.widgets.API_Controllers import APIControllers
 from core.agent.agent_client import AgentClient
-from extra.Global import (set_editbox_height)
+
 
 class ChatTab(BaseTab):
     path = os.path.dirname(__file__)
@@ -23,15 +30,7 @@ class ChatTab(BaseTab):
     def __init__(self, logger):
         super().__init__(logger)
 
-        self.agent = AgentClient()
-
-        # --- sessions
-        self.current_session_id = str(uuid.uuid4())
-        self.sessions_index = {}
-
-        # --- agent connection
-        self.is_agent_connected = False
-        self.agent_watchdog_task = None
+        self.agent = AgentClient(logger=logger)
 
         # --- Служебные
         self.is_generating = False
@@ -41,399 +40,74 @@ class ChatTab(BaseTab):
         self.init_content()
         self.load_window_state()
 
+        self.outbox.set_length_threshold(self.condition_parameters.char_limit_input.value())
+
         self.splitter_move_timer = QTimer(self)
         self.splitter_move_timer.setSingleShot(True)
-
+        
         # ============ СЛУШАЕМ КРИКИ
         self.log_splitter.splitterMoved.connect(self.on_splitter_moved)
-        self.vertical_splitter.splitterMoved.connect(self.on_splitter_moved)
+        self.horizontal_splitter.splitterMoved.connect(self.on_splitter_moved)
         self.splitter_move_timer.timeout.connect(self.save_window_state)
-        self.condition_toggle.toggled.connect(self.condition_toggle_changed)
+        #self.condition_toggle.toggled.connect(self.condition_toggle_changed)
+        self.condition_parameters.char_limit_changed.connect(self.on_char_limit_changed)
 
-        # Обработка отправки через Enter
-        self.input_editbox.installEventFilter(self)
-
+        """
+        
         # --- Модель влияет на доступность temperature
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
         self.on_model_changed(self.model_selector.currentText())
 
-        # --- агент: первичная проверка + вечный watchdog переподключения
-        asyncio.get_event_loop().create_task(self.preload_agent_status())
-        self.agent_watchdog_task = asyncio.get_event_loop().create_task(self.agent_connection_watchdog())
+        
 
         # --- наполним список сессий хотя бы текущей, даже если агент оффлайн
         self.render_sessions_list_offline()
+        """
 
     def init_content(self):
         # ============ ОБЪЕКТЫ ВКЛАДКИ
-        font = QFont()
-        font.setPointSize(13)
+        self.inbox = InputController()
+        self.inbox.setContentsMargins(150, 0, 150, 0)
 
-        # --- Список сессий (фикс ширина 400, высота меньше на треть)
-        self.sessions_list = QListWidget(self)
-        self.sessions_list.setFixedWidth(400)
-        self.sessions_list.setMinimumHeight(95)  # было ~140, минус треть
-        self.sessions_list.itemClicked.connect(self.on_session_clicked)
+        self.outbox = OutputController()
+        self.outbox.setContentsMargins(0, 0, 0, 0) 
 
-        self.new_session_button = QPushButton("Новая сессия")
-        self.new_session_button.setFixedHeight(34)
-        self.new_session_button.clicked.connect(self.on_new_session_clicked)
+        self.session_list = SessionsController(agent=self.agent, logger=self.logger) 
+        self.session_list.setContentsMargins(0, 0, 0, 0) 
 
-        self.clear_session_button = QPushButton("Очистить сессию")
-        self.clear_session_button.setFixedHeight(34)
-        self.clear_session_button.clicked.connect(self.on_clear_session_clicked)
+        self.condition_parameters = ParametersController(logger=self.logger)
+        self.condition_parameters.setContentsMargins(0, 0, 0, 0) 
 
-        sessions_buttons = QWidget()
-        sessions_buttons_layout = QHBoxLayout(sessions_buttons)
-        sessions_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        sessions_buttons_layout.setSpacing(6)
-        sessions_buttons_layout.addWidget(self.new_session_button)
-        sessions_buttons_layout.addWidget(self.clear_session_button)
+        self.metrics = MetricsController()
+        self.metrics.setContentsMargins(0, 0, 0, 0) 
 
-        session_container = QWidget()
-        session_container.setFixedWidth(400)
-        session_container.setFixedHeight(140)  # было 200, минус треть
-        session_layout = QVBoxLayout(session_container)
-        session_layout.setContentsMargins(0, 0, 0, 0)
-        session_layout.setSpacing(6)
-        session_layout.addWidget(self.sessions_list)
-        session_layout.addWidget(sessions_buttons)
-
-        # --- Верхняя панель настроек (модель / эндпоинт / температура)
-        self.model_label = QLabel("Модель:")
-        self.model_selector = QComboBox()
-        self.model_selector.setFixedWidth(260)
-        self.model_selector.addItem("gpt-3.5-turbo")
-        self.model_selector.addItem("gpt-4o-mini")
-        self.model_selector.addItem("gpt-4o")
-        self.model_selector.addItem("gpt-5.2-chat-latest")
-
-        self.endpoint_label = QLabel("Эндпоинт:")
-        self.endpoint_selector = QComboBox()
-        self.endpoint_selector.setFixedWidth(190)
-        self.endpoint_selector.addItem("Chat Completions", "chat")
-        self.endpoint_selector.addItem("Responses", "responses")
-
-        self.temperature_label = QLabel("temperature:")
-        self.temperature_input = QDoubleSpinBox()
-        self.temperature_input.setFixedWidth(120)
-        self.temperature_input.setDecimals(1)
-        self.temperature_input.setSingleStep(0.1)
-        self.temperature_input.setRange(0.0, 2.0)
-        self.temperature_input.setValue(1.0)
-
-        # --- Новые параметры под temperature
-        self.char_limit_label = QLabel("Порог длины (символы):")
-        self.char_limit_input = QSpinBox()
-        self.char_limit_input.setRange(500, 200000)
-        self.char_limit_input.setSingleStep(500)
-        self.char_limit_input.setValue(12000)
-        self.char_limit_input.setFixedWidth(140)
-        self.char_limit_input.valueChanged.connect(self.on_threshold_changed)
-
-        self.keep_last_n_label = QLabel("N последних сообщений (оригинал):")
-        self.keep_last_n_input = QSpinBox()
-        self.keep_last_n_input.setRange(1, 200)
-        self.keep_last_n_input.setSingleStep(1)
-        self.keep_last_n_input.setValue(8)
-        self.keep_last_n_input.setFixedWidth(140)
-        self.keep_last_n_input.valueChanged.connect(self.on_threshold_changed)
-
-        # --- Поле для ввода
-        self.input_editbox = QTextEdit()
-        self.input_editbox.setFont(font)
-        self.input_editbox.setPlaceholderText("Ты можешь попробовать спросить, но не факт, что тебе кто-то ответит...")
-        self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        set_editbox_height(self.input_editbox, 7)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(8)
-
-        # --- Лейблы над окнами вывода (len(new_message) / limit)
-        self.plain_len_label = QLabel("0 / 0")
-        self.condition_len_label = QLabel("0 / 0")
-
-        # --- Поле для вывода ответа без условий
-        self.output_editbox = QTextEdit()
-        self.output_editbox.setFont(font)
-        self.output_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.output_editbox.setReadOnly(True)
-        set_editbox_height(self.output_editbox, 10)
-
-        # --- Поле для вывода ответа с условиями
-        self.output_editbox_with_condition = QTextEdit()
-        self.output_editbox_with_condition.setFont(font)
-        self.output_editbox_with_condition.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.output_editbox_with_condition.setReadOnly(True)
-        set_editbox_height(self.output_editbox_with_condition, 10)
-
-        # --- Тогл для включения условий
-        self.condition_toggle = ToggleSwitch()
-        self.condition_label = QLabel("Режим запуска с условиями:")
-        self.condition_label.setFixedWidth(230)
-
-        # --- Кнопки STOP/CLEAR
-        self.stop_button_plain = QPushButton("STOP")
-        self.stop_button_plain.setFixedWidth(150)
-        self.stop_button_plain.setEnabled(False)
-        self.stop_button_plain.clicked.connect(self.stop_generation_plain)
-
-        self.clear_button_plain = QPushButton("CLEAR")
-        self.clear_button_plain.setFixedWidth(150)
-        self.clear_button_plain.setEnabled(False)
-        self.clear_button_plain.clicked.connect(self.clear_output_editbox)
-        self.output_editbox.textChanged.connect(self.set_enable_clear_button_plain)
-
-        self.stop_button_condition = QPushButton("STOP")
-        self.stop_button_condition.setFixedWidth(150)
-        self.stop_button_condition.setEnabled(False)
-        self.stop_button_condition.clicked.connect(self.stop_generation_condition)
-
-        self.clear_button_condition = QPushButton("CLEAR")
-        self.clear_button_condition.setFixedWidth(150)
-        self.clear_button_condition.setEnabled(False)
-        self.clear_button_condition.clicked.connect(self.clear_output_editbox_with_condition)
-        self.output_editbox_with_condition.textChanged.connect(self.set_enable_clear_button_condition)
-
-        # --- Поля условий (правая панель)
-        self.format_label = QLabel("Формат ответа:")
-        self.format_label.setFixedWidth(230)
-        self.format_input = QLineEdit()
-        self.format_input.setFixedWidth(350)
-        self.format_input.setPlaceholderText("Например: Ровно 3 пункта, без вступления.")
-
-        self.length_label = QLabel("Ограничение длины (слова/символы):")
-        self.length_label.setFixedWidth(230)
-        self.length_input = QLineEdit()
-        self.length_input.setFixedWidth(350)
-        self.length_input.setPlaceholderText("Например: Не более 60 слов.")
-
-        self.stop_seq_label = QLabel("Stop sequence (строка завершения):")
-        self.stop_seq_label.setFixedWidth(230)
-        self.stop_seq_input = QLineEdit()
-        self.stop_seq_input.setFixedWidth(350)
-        self.stop_seq_input.setPlaceholderText("Например: ###END###")
-        self.stop_seq_input.setText("###END###")
-
-        self.max_tokens_label = QLabel("max_tokens (через API):")
-        self.max_tokens_label.setFixedWidth(230)
-        self.max_tokens_input = QLineEdit()
-        self.max_tokens_input.setFixedWidth(350)
-        self.max_tokens_input.setPlaceholderText("Например: 200")
-        self.max_tokens_input.setText("200")
-
-        # --- Окно результатов замеров
-        self.metrics_label = QLabel("Результаты замеров (Day 5):")
-        self.metrics_box = QTextEdit()
-        self.metrics_box.setReadOnly(True)
-        self.metrics_box.setPlaceholderText(
-            "Здесь будет появляться результат каждой попытки:\n"
-            "TTFT / Total time / Tokens / Cost / Model / Endpoint / Temperature..."
-        )
-        self.metrics_box.setMinimumHeight(220)
-
-        # --- НОВОЕ: настройки суммаризации + окно вывода суммаризации
-        self.summary_model_label = QLabel("Модель для суммаризации:")
-        self.summary_model_selector = QComboBox()
-        self.summary_model_selector.setFixedWidth(260)
-        self.summary_model_selector.addItem("gpt-3.5-turbo")
-        self.summary_model_selector.addItem("gpt-4o-mini")
-        self.summary_model_selector.addItem("gpt-4o")
-        self.summary_model_selector.addItem("gpt-5.2-chat-latest")
-
-        self.summary_endpoint_label = QLabel("Эндпоинт для суммаризации:")
-        self.summary_endpoint_selector = QComboBox()
-        self.summary_endpoint_selector.setFixedWidth(190)
-        self.summary_endpoint_selector.addItem("Chat Completions", "chat")
-        self.summary_endpoint_selector.addItem("Responses", "responses")
-
-        self.summary_output_label = QLabel("History_summary (из сессии):")
-        self.summary_output_box = QTextEdit()
-        self.summary_output_box.setReadOnly(True)
-        self.summary_output_box.setMinimumHeight(180)
-        self.summary_output_box.setPlaceholderText("Здесь будет появляться суммаризация истории...")
+        self.summary = SummarizationController()
+        self.summary.setContentsMargins(0, 0, 0, 0) 
 
         # ============ РАССТАНОВКА ЭЛЕМЕНТОВ
-        tab_layout = QVBoxLayout(self.top_widget)
-        tab_layout.setContentsMargins(0, 0, 0, 0)
-        tab_layout.setSpacing(8)
-
-        # --- Header wrap: слева сессии, справа параметры (параметры прижаты вправо)
-        header_wrap = QWidget()
-        header_wrap_layout = QHBoxLayout(header_wrap)
-        header_wrap_layout.setContentsMargins(0, 0, 25, 0)
-        header_wrap_layout.setSpacing(12)
-
-        # контейнер параметров: лейбл слева, поле справа (2 колонки)
-        params_container = QWidget()
-        params_layout = QVBoxLayout(params_container)
-        params_layout.setContentsMargins(0, 0, 0, 0)
-        params_layout.setSpacing(6)
-
-        def _row(lbl: QLabel, widget: QWidget):
-            r = QWidget()
-            r_l = QHBoxLayout(r)
-            r_l.setContentsMargins(0, 0, 0, 0)
-            r_l.setSpacing(8)
-            r_l.addWidget(lbl, alignment=Qt.AlignLeft)
-            r_l.addStretch()
-            r_l.addWidget(widget, alignment=Qt.AlignRight)
-            return r
-
-        params_layout.addWidget(_row(self.model_label, self.model_selector))
-        params_layout.addWidget(_row(self.endpoint_label, self.endpoint_selector))
-        params_layout.addWidget(_row(self.temperature_label, self.temperature_input))
-        params_layout.addWidget(_row(self.char_limit_label, self.char_limit_input))
-        params_layout.addWidget(_row(self.keep_last_n_label, self.keep_last_n_input))
-        params_layout.addStretch()
-
-        header_wrap_layout.addWidget(session_container, alignment=Qt.AlignTop)
-        header_wrap_layout.addStretch()
-        header_wrap_layout.addWidget(params_container, alignment=Qt.AlignTop | Qt.AlignRight)
-
-        # --- Ввод (выровнен по верху)
-        input_container = QWidget()
-        input_container.setFixedWidth(400)
-        input_layout = QVBoxLayout(input_container)
-        input_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout.setSpacing(5)
-        input_layout.addWidget(self.input_editbox, alignment=Qt.AlignTop)
-        input_layout.addWidget(self.progress_bar, alignment=Qt.AlignTop)
-
-        # --- Выводы (2 окна)
-        outbox_plain_buttons_container = QWidget()
-        outbox_plain_layout = QHBoxLayout(outbox_plain_buttons_container)
-        outbox_plain_layout.setContentsMargins(0, 0, 0, 0)
-        outbox_plain_layout.addWidget(self.stop_button_plain, alignment=Qt.AlignLeft)
-        outbox_plain_layout.addWidget(self.clear_button_plain, alignment=Qt.AlignRight)
-
-        plain_output_container = QWidget()
-        plain_output_layout = QVBoxLayout(plain_output_container)
-        plain_output_layout.setContentsMargins(0, 0, 0, 0)
-        plain_output_layout.setSpacing(4)
-        plain_output_layout.addWidget(self.plain_len_label, alignment=Qt.AlignLeft)
-        plain_output_layout.addWidget(self.output_editbox)
-        plain_output_layout.addWidget(outbox_plain_buttons_container)
-
-        outbox_condition_buttons_container = QWidget()
-        outbox_condition_layout = QHBoxLayout(outbox_condition_buttons_container)
-        outbox_condition_layout.setContentsMargins(0, 0, 0, 0)
-        outbox_condition_layout.addWidget(self.stop_button_condition, alignment=Qt.AlignLeft)
-        outbox_condition_layout.addWidget(self.clear_button_condition, alignment=Qt.AlignRight)
-
-        condition_output_container = QWidget()
-        condition_output_layout = QVBoxLayout(condition_output_container)
-        condition_output_layout.setContentsMargins(0, 0, 0, 0)
-        condition_output_layout.setSpacing(4)
-        condition_output_layout.addWidget(self.condition_len_label, alignment=Qt.AlignLeft)
-        condition_output_layout.addWidget(self.output_editbox_with_condition)
-        condition_output_layout.addWidget(outbox_condition_buttons_container)
-
-        output_container = QWidget()
-        output_container.setFixedWidth(820)
-        output_layout = QHBoxLayout(output_container)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_layout.setSpacing(8)
-        output_layout.addWidget(plain_output_container)
-        output_layout.addWidget(condition_output_container)
-
-        union_container = QWidget()
-        union_layout = QVBoxLayout(union_container)
-        union_layout.setContentsMargins(0, 0, 0, 0)
-        union_layout.setSpacing(8)
-        union_layout.addWidget(input_container, alignment=Qt.AlignTop | Qt.AlignHCenter)
-        union_layout.addWidget(output_container, alignment=Qt.AlignTop | Qt.AlignHCenter)
-        union_layout.addStretch()
-
         left_panel_container = QWidget()
-        left_panel_layout = QVBoxLayout(left_panel_container)
-        left_panel_layout.setContentsMargins(0, 0, 0, 0)
-        left_panel_layout.addWidget(header_wrap)
-        left_panel_layout.addWidget(union_container, alignment=Qt.AlignTop | Qt.AlignLeft)
-        left_panel_layout.addStretch()
+        left_panel = QVBoxLayout(left_panel_container)
+        left_panel.addWidget(self.session_list)
+        left_panel.addWidget(self.inbox)
+        left_panel.addWidget(self.outbox)
+        left_panel.addStretch()
 
-        # --- Правая панель: начинается с самого верха
         right_panel_container = QWidget()
-        right_panel_layout = QVBoxLayout(right_panel_container)
-        right_panel_layout.setContentsMargins(0, 0, 0, 0)
-        right_panel_layout.setSpacing(8)
+        right_panel = QVBoxLayout(right_panel_container)
+        right_panel.addWidget(self.condition_parameters)
+        right_panel.addWidget(self.metrics)
+        right_panel.addWidget(self.summary)
+        right_panel.addStretch()
 
-        condition_toggle_layout = QHBoxLayout()
-        condition_toggle_layout.setContentsMargins(0, 0, 0, 0)
-        condition_toggle_layout.addWidget(self.condition_label, alignment=Qt.AlignLeft)
-        condition_toggle_layout.addWidget(self.condition_toggle, alignment=Qt.AlignLeft)
-        condition_toggle_layout.addStretch()
+        self.horizontal_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.horizontal_splitter.addWidget(left_panel_container)
+        self.horizontal_splitter.addWidget(right_panel_container)
 
-        format_layout = QHBoxLayout()
-        format_layout.setContentsMargins(0, 0, 0, 0)
-        format_layout.addWidget(self.format_label, alignment=Qt.AlignLeft)
-        format_layout.addWidget(self.format_input, alignment=Qt.AlignLeft)
-
-        length_layout = QHBoxLayout()
-        length_layout.setContentsMargins(0, 0, 0, 0)
-        length_layout.addWidget(self.length_label, alignment=Qt.AlignLeft)
-        length_layout.addWidget(self.length_input, alignment=Qt.AlignLeft)
-
-        stop_seq_layout = QHBoxLayout()
-        stop_seq_layout.setContentsMargins(0, 0, 0, 0)
-        stop_seq_layout.addWidget(self.stop_seq_label, alignment=Qt.AlignLeft)
-        stop_seq_layout.addWidget(self.stop_seq_input, alignment=Qt.AlignLeft)
-
-        max_tokens_layout = QHBoxLayout()
-        max_tokens_layout.setContentsMargins(0, 0, 0, 0)
-        max_tokens_layout.addWidget(self.max_tokens_label, alignment=Qt.AlignLeft)
-        max_tokens_layout.addWidget(self.max_tokens_input, alignment=Qt.AlignLeft)
-
-        right_panel_layout.addLayout(condition_toggle_layout)
-        right_panel_layout.addLayout(format_layout)
-        right_panel_layout.addLayout(length_layout)
-        right_panel_layout.addLayout(stop_seq_layout)
-        right_panel_layout.addLayout(max_tokens_layout)
-
-        right_panel_layout.addSpacing(6)
-        right_panel_layout.addWidget(self.metrics_label)
-        right_panel_layout.addWidget(self.metrics_box)
-
-        # --- НОВОЕ: блок суммаризации под логами
-        right_panel_layout.addSpacing(8)
-        right_panel_layout.addWidget(self.summary_model_label)
-        right_panel_layout.addWidget(self.summary_model_selector)
-        right_panel_layout.addWidget(self.summary_endpoint_label)
-        right_panel_layout.addWidget(self.summary_endpoint_selector)
-        right_panel_layout.addWidget(self.summary_output_label)
-        right_panel_layout.addWidget(self.summary_output_box)
-
-        right_panel_layout.addStretch()
-
-        # --- Сплиттер: слева чат, справа параметры/метрики/summary
-        self.vertical_splitter = QSplitter(Qt.Horizontal)
-        self.vertical_splitter.addWidget(left_panel_container)
-        self.vertical_splitter.addWidget(right_panel_container)
-
-        tab_layout.addWidget(self.vertical_splitter)
-
-        # сразу обновим лейблы лимитов (порог поменяется/перезапуск)
-        self.on_threshold_changed()
+        widget_layout = QVBoxLayout(self.top_widget)
+        widget_layout.addWidget(self.horizontal_splitter)
     
-    def on_threshold_changed(self):
-        try:
-            limit = int(self.char_limit_input.value())
-        except Exception:
-            limit = 0
-
-        # длина new_message обновляется только при отправке,
-        # но порог/подписи должны обновляться сразу при изменении порога.
-        # Поэтому тут меняем только знаменатель.
-        try:
-            left_plain = self.plain_len_label.text().split("/")[0].strip()
-            left_cond = self.condition_len_label.text().split("/")[0].strip()
-        except Exception:
-            left_plain, left_cond = "0", "0"
-
-        self.plain_len_label.setText(f"{left_plain} / {limit}")
-        self.condition_len_label.setText(f"{left_cond} / {limit}")
+    def on_char_limit_changed(self, value):
+        self.outbox.set_length_threshold(value)
 
     def render_sessions_list_offline(self):
         try:
@@ -449,80 +123,6 @@ class ChatTab(BaseTab):
                 self.sessions_list.blockSignals(False)
             except Exception:
                 pass
-
-    async def preload_agent_status(self):
-        try:
-            self.logger.info("Подключение к агенту (локальный сервер)...")
-            ok = await self.agent.ping()
-            self.is_agent_connected = bool(ok)
-
-            if self.is_agent_connected:
-                self.logger.success("Агент найден: подключение успешно")
-                await self.refresh_sessions_list()
-            else:
-                self.logger.warning("Агент не отвечает. Запусти agent_server.py перед запуском UI.")
-        except Exception as e:
-            self.is_agent_connected = False
-            self.logger.warning(f"Не удалось подключиться к агенту: {e}")
-
-    async def agent_connection_watchdog(self):
-        while True:
-            try:
-                if not self.is_agent_connected:
-                    self.logger.warning("Агент OFFLINE: попытка подключиться к серверу...")
-                    ok = await self.agent.ping()
-
-                    if ok:
-                        self.is_agent_connected = True
-                        self.logger.success("Агент ONLINE: соединение восстановлено")
-                        await self.refresh_sessions_list()
-            except Exception as e:
-                self.is_agent_connected = False
-                self.logger.warning(f"Ошибка проверки агента: {e}")
-
-            await asyncio.sleep(5)
-
-    async def refresh_sessions_list(self):
-        if not self.is_agent_connected:
-            self.render_sessions_list_offline()
-            return
-
-        try:
-            sessions = await self.agent.list_sessions()
-        except Exception as e:
-            self.logger.warning(f"Не удалось получить список сессий: {e}")
-            self.render_sessions_list_offline()
-            return
-
-        self.sessions_list.blockSignals(True)
-        self.sessions_list.clear()
-        self.sessions_index = {}
-
-        found_current = False
-
-        for s in sessions:
-            sid = (s.get("session_id") or "").strip()
-            title = (s.get("title") or "").strip()
-            if not sid:
-                continue
-
-            if sid == self.current_session_id:
-                found_current = True
-
-            label = f"{sid} — {title or 'Без темы'}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, sid)
-            self.sessions_list.addItem(item)
-            self.sessions_index[sid] = title or "Без темы"
-
-        if not found_current:
-            label = f"{self.current_session_id} — (текущая, новая)"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, self.current_session_id)
-            self.sessions_list.insertItem(0, item)
-            self.sessions_index[self.current_session_id] = "(текущая, новая)"
-
-        self.sessions_list.blockSignals(False)
 
     async def preload_pricing(self):
         try:
@@ -738,136 +338,6 @@ class ChatTab(BaseTab):
             self.logger.warning("Для gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
         else:
             self.logger.info(f"Выбрана модель {model_text}. temperature доступна.")
-
-    def set_enable_clear_button_plain(self):
-        state = True if self.output_editbox.toPlainText().strip() != "" else False
-        self.clear_button_plain.setEnabled(state) 
-
-    def set_enable_clear_button_condition(self):
-        state = True if self.output_editbox_with_condition.toPlainText().strip() != "" else False
-        self.clear_button_condition.setEnabled(state) 
-
-    def clear_output_editbox(self):
-        self.output_editbox.clear()
-        self.set_enable_clear_button_plain()
-
-    def clear_output_editbox_with_condition(self):
-        self.output_editbox_with_condition.clear()
-        self.set_enable_clear_button_condition()
-
-    def condition_toggle_changed(self, state: bool):
-        self.logger.info(f"Значение condition_toggle изменилось на {state}")
-        self.history = []
-        self.output_editbox_with_condition.clear() if state else self.output_editbox.clear()
-
-
-    # ========= Enter отправляет, Shift+Enter перенос строки =========
-    def eventFilter(self, obj, event):
-        if obj is self.input_editbox and event.type() == QEvent.KeyPress:
-            key = event.key()
-            mods = event.modifiers()
-
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                # Shift+Enter — оставить стандартное поведение (новая строка)
-                if mods & Qt.ShiftModifier:
-                    return False
-
-                # Enter — отправить
-                self.on_send_message()
-                return True
-
-        return super().eventFilter(obj, event)
-
-    def set_loading(self, is_loading: bool):
-        if is_loading:
-            self.progress_bar.setRange(0, 0)
-        else:
-            self.progress_bar.setRange(0, 1)
-            self.progress_bar.setValue(0)
-
-    def on_send_message(self):
-        if self.is_generating:
-            self.logger.warning("Модель ещё отвечает — подожди.")
-            return
-
-        text = self.input_editbox.toPlainText().strip()
-        if not text:
-            self.logger.warning("Отсутствует текст для отправки!")
-            return
-
-        self.input_editbox.clear()
-
-        use_conditions = self.condition_toggle.isChecked()
-        target_output = self.output_editbox_with_condition if use_conditions else self.output_editbox
-
-        self.stop_button_plain.setEnabled(False)
-        self.stop_button_condition.setEnabled(False)
-
-        if use_conditions:
-            self.stop_button_condition.setEnabled(True)
-        else:
-            self.stop_button_plain.setEnabled(True)
-
-        target_output.append(f"Ты: {text} \n")
-        target_output.append("GPT: ")
-
-        self.set_loading(True)
-
-        # --- условия
-        if use_conditions:
-            fmt = self.format_input.text().strip()
-            length_rule = self.length_input.text().strip()
-            stop_seq = self.stop_seq_input.text().strip()
-
-            instructions = []
-            if fmt:
-                instructions.append(f"Формат ответа: {fmt}")
-            if length_rule:
-                instructions.append(f"Ограничение длины: {length_rule}")
-            if stop_seq:
-                instructions.append(f"Условие завершения: в конце добавь строку {stop_seq} и после неё ничего не пиши.")
-
-            controlled_text = text
-            if instructions:
-                controlled_text = text + "\n\n" + "\n".join(instructions)
-
-            try:
-                max_tokens = int(self.max_tokens_input.text().strip())
-            except Exception:
-                max_tokens = 200
-                self.logger.warning("max_tokens задан неверно, использую 200.")
-        else:
-            controlled_text = text
-            max_tokens = 800
-
-        # --- параметры “сжатия”
-        try:
-            char_limit = int(self.char_limit_input.value())
-        except Exception:
-            char_limit = 12000
-
-        try:
-            keep_last_n = int(self.keep_last_n_input.value())
-        except Exception:
-            keep_last_n = 8
-
-        summary_model = self.summary_model_selector.currentText().strip()
-        summary_endpoint = self.summary_endpoint_selector.currentData()
-
-        self.stop_requested = False
-        self.is_generating = True
-        self.current_task = asyncio.create_task(
-            self.ask_and_stream_answer(
-                controlled_text,
-                target_output,
-                use_conditions,
-                max_tokens,
-                char_limit,
-                keep_last_n,
-                summary_model,
-                summary_endpoint,
-            )
-        )
 
     async def ask_and_stream_answer(
         self,
@@ -1093,6 +563,7 @@ class ChatTab(BaseTab):
 
         self.logger.warning("Стрим остановлен пользователем.")
 
+    # ===================================
     def on_splitter_moved(self):
         self.splitter_move_timer.start(300)
 
@@ -1102,8 +573,8 @@ class ChatTab(BaseTab):
             if hasattr(self, "log_splitter"):
                 state["log_splitter"] = self.log_splitter.saveState().toHex().data().decode()
 
-            if hasattr(self, "vertical_splitter"):
-                state["vertical_splitter"] = self.vertical_splitter.saveState().toHex().data().decode()
+            if hasattr(self, "horizontal_splitter"):
+                state["horizontal_splitter"] = self.horizontal_splitter.saveState().toHex().data().decode()
 
             with open(self.CONFIG_FILE, "w") as f:
                 json.dump(state, f)
@@ -1127,12 +598,12 @@ class ChatTab(BaseTab):
                     self.logger.error(f"Ошибка восстановления состояния log_splitter для вкладки \"Chat_tab\": {e}")
                     return
                 
-            if "vertical_splitter" in state:
+            if "horizontal_splitter" in state:
                 try:
-                    splitter_state = QByteArray.fromHex(str(state["vertical_splitter"]).encode())
-                    self.vertical_splitter.restoreState(splitter_state)
+                    splitter_state = QByteArray.fromHex(str(state["horizontal_splitter"]).encode())
+                    self.horizontal_splitter.restoreState(splitter_state)
                 except Exception as e:
-                    self.logger.error(f"Ошибка восстановления состояния vertical_splitter вкладки \"Chat_tab\": {e}")
+                    self.logger.error(f"Ошибка восстановления состояния horizontal_splitter вкладки \"Chat_tab\": {e}")
                     return
 
         except Exception as e:

@@ -39,6 +39,11 @@ class LLMAgentServer:
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
 
+    async def send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        writer.write(data)
+        await writer.drain()
+
     async def preload_pricing(self) -> None:
         try:
             self.logger.write("INFO", "Загрузка тарифов ProxyAPI (pricing/list)...")
@@ -64,12 +69,7 @@ class LLMAgentServer:
         except Exception:
             return None
 
-    async def _send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        writer.write(data)
-        await writer.drain()
-
-    async def _send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
+    async def send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
         """
         Если payload слишком большой для одной строки readline() у клиента — шлём в несколько строк.
 
@@ -180,18 +180,18 @@ class LLMAgentServer:
             try:
                 request = json.loads(line.decode("utf-8", errors="replace"))
             except Exception:
-                await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
+                await self.send_json(writer, {"type": "error", "message": "Invalid JSON"})
                 return
 
             action = request.get("action")
 
             if action == "ping":
-                await self._send_json(writer, {"type": "pong"})
+                await self.send_json(writer, {"type": "pong"})
                 return
 
             if action == "list_sessions":
                 sessions = self.memory_store.list_sessions()
-                await self._send_json(
+                await self.send_json(
                     writer,
                     {
                         "type": "sessions",
@@ -211,37 +211,37 @@ class LLMAgentServer:
             if action == "get_session":
                 session_id = (request.get("session_id") or "").strip()
                 if not session_id:
-                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    await self.send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
                 session = self.memory_store.load_session(session_id)
 
                 # ВАЖНО: сессия может быть огромной -> шлём chunked, чтобы readline() у клиента не падал
-                await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
+                await self.send_json_maybe_chunked(writer, {"type": "session", "session": session})
                 return
 
             if action == "reset_session":
                 session_id = (request.get("session_id") or "").strip()
                 if not session_id:
-                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    await self.send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
                 self.memory_store.delete_session_file(session_id)
-                await self._send_json(writer, {"type": "ok"})
+                await self.send_json(writer, {"type": "ok"})
                 return
 
             if action != "stream_chat":
-                await self._send_json(writer, {"type": "error", "message": "Unknown action"})
+                await self.send_json(writer, {"type": "error", "message": "Unknown action"})
                 return
 
             user_text = (request.get("user_text") or "").strip()
             session_id = (request.get("session_id") or "").strip()
 
             if not session_id:
-                await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                await self.send_json(writer, {"type": "error", "message": "session_id is required"})
                 return
             if not user_text:
-                await self._send_json(writer, {"type": "error", "message": "Empty user_text"})
+                await self.send_json(writer, {"type": "error", "message": "Empty user_text"})
                 return
 
             model = (request.get("model") or "").strip() or self.gpt.model
@@ -420,7 +420,7 @@ class LLMAgentServer:
 
                 async for chunk in gen:
                     assistant_answer += chunk
-                    await self._send_json(writer, {"type": "chunk", "chunk": chunk})
+                    await self.send_json(writer, {"type": "chunk", "chunk": chunk})
 
                 usage = getattr(self.gpt, "last_usage", None) or {}
                 cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
@@ -461,7 +461,7 @@ class LLMAgentServer:
                     "history_summary": history_summary,
                 }
 
-                await self._send_json(
+                await self.send_json(
                     writer,
                     {
                         "type": "done",
@@ -487,7 +487,7 @@ class LLMAgentServer:
             msg = str(e) or "Unknown error"
             self.logger.write("ERROR", "Ошибка обработки клиента", extra=msg)
             self.logger.write("ERROR", "TRACEBACK", extra=tb)
-            await self._send_json(writer, {"type": "error", "message": msg})
+            await self.send_json(writer, {"type": "error", "message": msg})
 
         finally:
             try:
@@ -506,7 +506,6 @@ class LLMAgentServer:
 
         async with server:
             await server.serve_forever()
-
 
 async def main() -> None:
     agent = LLMAgentServer()

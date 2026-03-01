@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         central_widget_layout = QVBoxLayout(central_widget)
-        central_widget_layout.setContentsMargins(0, 5, 0, 0)
+        central_widget_layout.setContentsMargins(0, 0, 0, 0)
         central_widget_layout.addWidget(self.tab_widget)
         
     def save_window_state(self):

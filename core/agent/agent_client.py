@@ -3,10 +3,19 @@ import json, sys
 sys.dont_write_bytecode = True
 
 from typing import Any, AsyncIterator, Dict, Optional, List
+from core.logger.advanced_logger import Logger
+from PySide6.QtCore import Signal, QObject
 
 
-class AgentClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
+class AgentClient(QObject):
+
+    agent_connection_established = Signal()
+    sessions_list_updated = Signal()
+
+    def __init__(self, logger: Logger, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
+        super().__init__()
+
+        self.logger = logger
         self.host = host
         self.port = port
         self.timeout_sec = timeout_sec
@@ -18,6 +27,56 @@ class AgentClient:
         self.last_title: Optional[str] = None
 
         self.last_message_stats: Dict[str, Any] = {}
+
+        self.is_connected = False
+        self.agent_watchdog_task = None
+        self.sessions_list = []
+
+        # --- агент: вечный watchdog переподключения
+        self.agent_watchdog_task = asyncio.get_event_loop().create_task(self.agent_connection_watchdog())
+
+        self.agent_connection_established.connect(
+            lambda: asyncio.get_event_loop().create_task(self.get_list_sessions())
+        )
+
+    async def connect_to_server(self):
+        try:
+            self.logger.info("Попытка подключения к серверу...")
+            state = await self.ping()
+            
+            if state:
+                self.is_connected = True
+                self.logger.success("Сервер ONLINE: соединение установлено")
+                self.agent_connection_established.emit()
+            else:
+                self.is_connected = False
+                self.logger.warning("Сервер недоступен. Проверьте запуск сервера.")
+        except Exception as e:
+            self.is_connected = False
+            self.logger.warning(f"Ошибка при попытке связи: {e}")
+        
+    async def agent_connection_watchdog(self):
+        await self.connect_to_server()
+
+        while True:
+            await asyncio.sleep(5)
+            try:
+                state = await self.ping()
+                
+                if not state:
+                    if self.is_connected:
+                        self.logger.warning("Связь с сервером потеряна!")
+                    
+                    self.is_connected = False
+                    await self.connect_to_server() 
+                else:
+                    if not self.is_connected: 
+                        self.is_connected = True
+                        self.logger.success("Соединение восстановлено")
+                        self.agent_connection_established.emit()
+                        
+            except Exception as e:
+                self.logger.error(f"Критическая ошибка в watchdog: {e}")
 
     async def ping(self) -> bool:
         try:
@@ -31,6 +90,7 @@ class AgentClient:
             line = await asyncio.wait_for(reader.readline(), timeout=self.timeout_sec)
 
             writer.close()
+
             try:
                 await writer.wait_closed()
             except Exception:
@@ -41,10 +101,11 @@ class AgentClient:
 
             data = json.loads(line.decode("utf-8", errors="replace"))
             return data.get("type") == "pong"
+        
         except Exception:
             return False
 
-    async def list_sessions(self) -> List[dict]:
+    async def get_list_sessions(self):
         reader, writer = await asyncio.open_connection(self.host, self.port)
         writer.write((json.dumps({"action": "list_sessions"}, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
@@ -52,21 +113,22 @@ class AgentClient:
         try:
             line = await reader.readline()
             if not line:
-                return []
+                self.sessions_list = []
 
             msg = json.loads(line.decode("utf-8", errors="replace"))
+            self.sessions_list = []
             if msg.get("type") == "sessions":
-                return msg.get("sessions") or []
-            return []
+                self.sessions_list = msg.get("sessions") or []
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+            
+        self.sessions_list_updated.emit()
 
     async def get_session(self, session_id: str) -> Optional[dict]:
-        # ВАЖНО: увеличиваем лимит StreamReader, чтобы readline() не падал на больших JSON-строках
         reader, writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
 
         writer.write(
