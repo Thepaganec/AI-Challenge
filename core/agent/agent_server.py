@@ -5,8 +5,9 @@ import asyncio
 import json
 import os
 import traceback
+import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -14,9 +15,24 @@ load_dotenv(override=True)
 from core.api.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
 from core.agent.memory_store import AgentMemoryStore
+from core.agent.strategies import (
+    build_sliding_window,
+    parse_facts_from_user_text,
+    build_facts_strategy,
+)
 
 
 class LLMAgentServer:
+    """
+    Локальный TCP сервер (JSONL протокол).
+    Клиент шлёт одну строку JSON -> сервер отвечает либо одной строкой, либо стримом (chunk/done).
+
+    В рамках Day 10:
+    - Sliding Window
+    - Sticky Facts (key-value facts) + последние N сообщений
+    - Branching (ветки от checkpoint)
+    """
+
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -39,7 +55,7 @@ class LLMAgentServer:
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
 
-    async def load_pricing(self) -> None:
+    async def preload_pricing(self) -> None:
         try:
             self.logger.write("INFO", "Загрузка тарифов ProxyAPI (pricing/list)...")
             self.pricing_cache = await self.gpt.get_pricing_rub_per_1m()
@@ -47,11 +63,6 @@ class LLMAgentServer:
         except Exception as e:
             self.logger.write("WARN", "Не удалось загрузить тарифы ProxyAPI", extra=str(e))
             self.pricing_cache = {}
-
-    async def send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        writer.write(data)
-        await writer.drain()
 
     def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> Optional[float]:
         try:
@@ -69,15 +80,12 @@ class LLMAgentServer:
         except Exception:
             return None
 
-    async def send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
-        """
-        Если payload слишком большой для одной строки readline() у клиента — шлём в несколько строк.
+    async def _send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        writer.write(data)
+        await writer.drain()
 
-        Протокол:
-        1) {"type":"chunked_start","orig_type":"session","chunks":N}
-        2) N строк {"type":"chunked_part","orig_type":"session","i":0..N-1,"data":"..."}
-        3) {"type":"chunked_end","orig_type":"session"}
-        """
+    async def _send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
         text = json.dumps(payload, ensure_ascii=False)
         raw = (text + "\n").encode("utf-8")
 
@@ -102,71 +110,49 @@ class LLMAgentServer:
         writer.write((json.dumps(end, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
 
-    async def _summarize_history_text(
-        self,
-        *,
-        history_text: str,
-        model: str,
-        endpoint: str,
-    ) -> str:
-        """
-        Делает суммаризацию истории через GPTModel.stream_chat (стрим), собирает в строку.
-        """
-        prompt = (
-            "Сожми историю диалога в компактную выжимку, сохранив смысл, факты, договорённости и контекст.\n"
-            "Требования:\n"
-            "- Пиши по-русски.\n"
-            "- Без воды.\n"
-            "- Сохраняй имена переменных/методов/классов как есть.\n"
-            "- Если есть требования/правила — вынеси их отдельным списком.\n\n"
-            "ИСТОРИЯ:\n"
-            f"{history_text}"
-        )
+    def _get_branch(self, session: Dict[str, Any], branch_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+        branches = session.get("branches") or {}
+        if not isinstance(branches, dict):
+            branches = {}
+            session["branches"] = branches
 
-        out = ""
-        gen = self.gpt.stream_chat(
-            user_text=prompt,
-            system_text=None,
-            history=None,
-            max_tokens=700,
-            model=model,
-            endpoint=endpoint,
-            temperature=None,
-            include_usage=False,
-        )
-        try:
-            async for ch in gen:
-                out += ch
-        finally:
-            try:
-                await gen.aclose()
-            except Exception:
-                pass
+        active = (session.get("active_branch") or "main").strip() or "main"
+        if branch_id:
+            bid = str(branch_id).strip()
+        else:
+            bid = active
 
-        return out.strip()
+        if bid not in branches:
+            # если ветки нет — создаём пустую
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            branches[bid] = {
+                "branch_id": bid,
+                "name": bid,
+                "created_at": now,
+                "updated_at": now,
+                "facts": {},
+                "checkpoints": {},
+                "history": [],
+            }
 
-    def _history_for_llm(self, session: dict) -> list:
-        history = session.get("history") or {}
-        if not isinstance(history, dict):
-            return []
+        session["active_branch"] = bid
+        return bid, branches[bid]
 
+    def _branch_history(self, branch: Dict[str, Any]) -> List[Dict[str, str]]:
+        h = branch.get("history")
+        if not isinstance(h, list):
+            h = []
+            branch["history"] = h
         out = []
-        try:
-            keys = sorted(history.keys(), key=lambda x: int(x))
-        except Exception:
-            keys = list(history.keys())
-
-        for k in keys:
-            turn = history.get(k) or {}
-            user_text = turn.get("user_text")
-            assistant_text = turn.get("assistant_text")
-
-            if isinstance(user_text, str) and user_text:
-                out.append({"role": "user", "content": user_text})
-            if isinstance(assistant_text, str) and assistant_text:
-                out.append({"role": "assistant", "content": assistant_text})
-
+        for m in h:
+            role = (m.get("role") or "").strip()
+            content = m.get("content")
+            if role and content is not None:
+                out.append({"role": role, "content": str(content)})
         return out
+
+    def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
+        self.memory_store.set_title_if_empty(session, user_text)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -180,18 +166,18 @@ class LLMAgentServer:
             try:
                 request = json.loads(line.decode("utf-8", errors="replace"))
             except Exception:
-                await self.send_json(writer, {"type": "error", "message": "Invalid JSON"})
+                await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
                 return
 
             action = request.get("action")
 
             if action == "ping":
-                await self.send_json(writer, {"type": "pong"})
+                await self._send_json(writer, {"type": "pong"})
                 return
 
             if action == "list_sessions":
                 sessions = self.memory_store.list_sessions()
-                await self.send_json(
+                await self._send_json(
                     writer,
                     {
                         "type": "sessions",
@@ -211,41 +197,131 @@ class LLMAgentServer:
             if action == "get_session":
                 session_id = (request.get("session_id") or "").strip()
                 if not session_id:
-                    await self.send_json(writer, {"type": "error", "message": "session_id is required"})
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
                 session = self.memory_store.load_session(session_id)
-
-                # ВАЖНО: сессия может быть огромной -> шлём chunked, чтобы readline() у клиента не падал
-                await self.send_json_maybe_chunked(writer, {"type": "session", "session": session})
+                await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
                 return
 
             if action == "reset_session":
                 session_id = (request.get("session_id") or "").strip()
                 if not session_id:
-                    await self.send_json(writer, {"type": "error", "message": "session_id is required"})
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                     return
 
                 self.memory_store.delete_session_file(session_id)
-                await self.send_json(writer, {"type": "ok"})
+                await self._send_json(writer, {"type": "ok"})
+                return
+
+            if action == "create_checkpoint":
+                session_id = (request.get("session_id") or "").strip()
+                branch_id = (request.get("branch_id") or "").strip() or None
+                name = (request.get("name") or "").strip()
+
+                if not session_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    return
+
+                session = self.memory_store.load_session(session_id)
+                bid, branch = self._get_branch(session, branch_id)
+                history = self._branch_history(branch)
+
+                cp_id = (name or f"cp_{len(branch.get('checkpoints') or {}) + 1}").strip()
+                if not isinstance(branch.get("checkpoints"), dict):
+                    branch["checkpoints"] = {}
+
+                branch["checkpoints"][cp_id] = len(history)  # индекс = длина (точка "после последнего сообщения")
+                branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session["updated_at"] = branch["updated_at"]
+                session["active_branch"] = bid
+
+                self.memory_store.save_session(session)
+
+                await self._send_json(writer, {"type": "ok", "checkpoint_id": cp_id, "branch_id": bid})
+                return
+
+            if action == "create_branch":
+                session_id = (request.get("session_id") or "").strip()
+                from_branch_id = (request.get("from_branch_id") or "").strip() or None
+                checkpoint_id = (request.get("checkpoint_id") or "").strip()
+                new_branch_name = (request.get("new_branch_name") or "").strip()
+
+                if not session_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    return
+                if not checkpoint_id:
+                    await self._send_json(writer, {"type": "error", "message": "checkpoint_id is required"})
+                    return
+
+                session = self.memory_store.load_session(session_id)
+                src_bid, src_branch = self._get_branch(session, from_branch_id)
+                cps = src_branch.get("checkpoints") or {}
+                if not isinstance(cps, dict) or checkpoint_id not in cps:
+                    await self._send_json(writer, {"type": "error", "message": "checkpoint not found"})
+                    return
+
+                cut = int(cps.get(checkpoint_id) or 0)
+                src_history = self._branch_history(src_branch)
+                new_history = list(src_history[:cut])
+
+                new_bid = str(uuid.uuid4())[:8]
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                session["branches"][new_bid] = {
+                    "branch_id": new_bid,
+                    "name": new_branch_name or f"{src_bid}:{checkpoint_id}",
+                    "created_at": now,
+                    "updated_at": now,
+                    "facts": dict(src_branch.get("facts") or {}),
+                    "checkpoints": {},
+                    "history": new_history,
+                }
+
+                session["active_branch"] = new_bid
+                session["updated_at"] = now
+                self.memory_store.save_session(session)
+
+                await self._send_json(writer, {"type": "ok", "branch_id": new_bid})
+                return
+
+            if action == "switch_branch":
+                session_id = (request.get("session_id") or "").strip()
+                branch_id = (request.get("branch_id") or "").strip()
+
+                if not session_id:
+                    await self._send_json(writer, {"type": "error", "message": "session_id is required"})
+                    return
+                if not branch_id:
+                    await self._send_json(writer, {"type": "error", "message": "branch_id is required"})
+                    return
+
+                session = self.memory_store.load_session(session_id)
+                bid, _ = self._get_branch(session, branch_id)
+                session["active_branch"] = bid
+                session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.memory_store.save_session(session)
+
+                await self._send_json(writer, {"type": "ok", "active_branch": bid})
                 return
 
             if action != "stream_chat":
-                await self.send_json(writer, {"type": "error", "message": "Unknown action"})
+                await self._send_json(writer, {"type": "error", "message": "Unknown action"})
                 return
 
-            user_text = (request.get("user_text") or "").strip()
+            # ===== stream_chat =====
             session_id = (request.get("session_id") or "").strip()
+            branch_id = (request.get("branch_id") or "").strip() or None
+            user_text = (request.get("user_text") or "").strip()
 
             if not session_id:
-                await self.send_json(writer, {"type": "error", "message": "session_id is required"})
+                await self._send_json(writer, {"type": "error", "message": "session_id is required"})
                 return
             if not user_text:
-                await self.send_json(writer, {"type": "error", "message": "Empty user_text"})
+                await self._send_json(writer, {"type": "error", "message": "Empty user_text"})
                 return
 
             model = (request.get("model") or "").strip() or self.gpt.model
-            endpoint = request.get("endpoint") or "chat"
+            endpoint = (request.get("endpoint") or "chat").strip() or "chat"
             max_tokens = int(request.get("max_tokens") or 512)
 
             temperature = request.get("temperature", None)
@@ -255,156 +331,43 @@ class LLMAgentServer:
                 except Exception:
                     temperature = None
 
-            # NEW: параметры контроля длины и суммаризации
-            try:
-                char_limit = int(request.get("char_limit") or 12000)
-            except Exception:
-                char_limit = 12000
-
+            strategy = (request.get("context_strategy") or "sliding").strip().lower()
             try:
                 keep_last_n = int(request.get("keep_last_n") or 8)
             except Exception:
                 keep_last_n = 8
 
-            summary_model = (request.get("summary_model") or "").strip() or model
-            summary_endpoint = (request.get("summary_endpoint") or "").strip() or "chat"
-
+            # load session + branch
             session = self.memory_store.load_session(session_id)
-            self.memory_store.set_title_if_empty(session, user_text)
+            self._ensure_title(session, user_text)
 
-            history = session.get("history") or {}
-            if not isinstance(history, dict):
-                history = {}
+            bid, branch = self._get_branch(session, branch_id)
+            history = self._branch_history(branch)
 
-            # подтянем прошлую суммаризацию
-            history_summary = session.get("history_summary") or ""
-            if not isinstance(history_summary, str):
-                history_summary = ""
+            # 1) update facts after each user message (только для facts стратегии, но хранить можно всегда)
+            facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
+            facts = parse_facts_from_user_text(user_text, facts)
+            branch["facts"] = facts
 
-            # история для LLM (полная) до добавления текущего сообщения
-            session["history"] = history
-            history_for_llm_full = self._history_for_llm(session)
+            # 2) append user message
+            history.append({"role": "user", "content": user_text})
 
-            # turn_id
-            try:
-                last_idx = max([int(k) for k in history.keys()] or [0])
-            except Exception:
-                last_idx = 0
-            turn_id = str(last_idx + 1)
+            # 3) build prompt context based on strategy
+            system_text: Optional[str] = None
+            history_for_llm: List[Dict[str, str]] = []
 
-            # r_prev_prompt_total (из предыдущего turn)
-            r_prev_prompt_total = 0
-            if last_idx > 0:
-                prev_turn = history.get(str(last_idx)) or {}
-                r_prev_prompt_total = int(prev_turn.get("r_prompt_total") or 0)
+            if strategy == "facts":
+                system_text, history_for_llm = build_facts_strategy(history[:-1], facts, keep_last_n)  # без текущего user_text
+            elif strategy == "branching":
+                # branching по сути = sliding, но по ветке
+                history_for_llm = build_sliding_window(history[:-1], keep_last_n)
+            else:
+                # default sliding
+                history_for_llm = build_sliding_window(history[:-1], keep_last_n)
 
-            # сохраняем turn с user_text заранее
-            history[turn_id] = {
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "user_text": user_text,
-                "assistant_text": "",
-                "model": model,
-                "endpoint": endpoint,
-                "max_tokens": int(max_tokens),
-                "temperature": temperature,
-                "usage": {},
-                "cost_rub": None,
-                "r_prompt_total": 0,
-                "c_completion": 0,
-                "total_tokens_call": 0,
-                "r_prev_prompt_total": int(r_prev_prompt_total),
-                "current_message_tokens": 0,
-            }
-
-            session["history"] = history
-            session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            session["history_summary"] = history_summary
-            self.memory_store.save_session(session)
-
+            # 4) call model (user_text отдельно)
             gen = None
             assistant_answer = ""
-
-            # ====== NEW_MESSAGE сборка на сервере ======
-            # New_message (для измерения длины):
-            # HISTORY_SUMMARY + последние N сообщений + NEW_MESSAGE(user_text)
-            msgs_flat = list(history_for_llm_full)
-
-            if keep_last_n > 0:
-                tail_msgs = msgs_flat[-keep_last_n:]
-                old_msgs = msgs_flat[:-keep_last_n]
-            else:
-                tail_msgs = []
-                old_msgs = msgs_flat
-
-            def _to_text(msgs):
-                out = []
-                for m in msgs:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if not content:
-                        continue
-                    if role == "user":
-                        out.append("USER: " + str(content))
-                    elif role == "assistant":
-                        out.append("ASSISTANT: " + str(content))
-                    else:
-                        out.append(str(content))
-                return "\n".join(out).strip()
-
-            old_text = _to_text(old_msgs)
-            tail_text = _to_text(tail_msgs)
-
-            def _build_new_message_preview(summary_text: str) -> str:
-                s = ""
-                if isinstance(summary_text, str) and summary_text.strip():
-                    s += "HISTORY_SUMMARY:\n" + summary_text.strip() + "\n\n"
-                if tail_text:
-                    s += "LAST_MESSAGES:\n" + tail_text + "\n\n"
-                s += "NEW_MESSAGE:\n" + user_text
-                return s
-
-            new_message_preview = _build_new_message_preview(history_summary)
-            new_message_len = len(new_message_preview)
-
-            history_summarized = False
-
-            # Если превышаем порог — суммаризируем old_text и сохраняем history_summary
-            if char_limit > 0 and new_message_len > char_limit:
-                if old_text.strip():
-                    try:
-                        self.logger.write(
-                            "INFO",
-                            "История превышает порог, делаю суммаризацию",
-                            extra=f"len={new_message_len}/{char_limit}",
-                        )
-
-                        # ВАЖНО: метод _summarize_history_text должен быть добавлен в класс LLMAgentServer
-                        new_summary = await self._summarize_history_text(
-                            history_text=old_text,
-                            model=summary_model,
-                            endpoint=summary_endpoint,
-                        )
-
-                        if isinstance(new_summary, str) and new_summary.strip():
-                            history_summary = new_summary.strip()
-                            session["history_summary"] = history_summary
-                            session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            self.memory_store.save_session(session)
-                            history_summarized = True
-
-                            # пересчёт длины после обновления summary
-                            new_message_len = len(_build_new_message_preview(history_summary))
-
-                    except Exception as e:
-                        self.logger.write("WARN", "Суммаризация не удалась", extra=str(e))
-
-            # ====== Формируем запрос для GPT ======
-            system_text = None
-            if isinstance(history_summary, str) and history_summary.strip():
-                system_text = "History summary (compressed context):\n" + history_summary.strip()
-
-            # В историю для LLM кладём только хвост последних сообщений
-            history_for_llm = tail_msgs
 
             try:
                 gen = self.gpt.stream_chat(
@@ -420,48 +383,31 @@ class LLMAgentServer:
 
                 async for chunk in gen:
                     assistant_answer += chunk
-                    await self.send_json(writer, {"type": "chunk", "chunk": chunk})
+                    await self._send_json(writer, {"type": "chunk", "chunk": chunk})
 
+                # 5) usage/cost
                 usage = getattr(self.gpt, "last_usage", None) or {}
                 cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
 
-                r = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-                c = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-                total_call = int(usage.get("total_tokens") or (r + c))
+                # 6) append assistant and save
+                history.append({"role": "assistant", "content": assistant_answer})
 
-                current_message_tokens = int(max(r - int(r_prev_prompt_total), 0) + c)
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                branch["updated_at"] = now
+                session["updated_at"] = now
+                session["active_branch"] = bid
 
-                history[turn_id]["assistant_text"] = assistant_answer
-                history[turn_id]["usage"] = usage
-                history[turn_id]["cost_rub"] = cost_rub
-                history[turn_id]["r_prompt_total"] = int(r)
-                history[turn_id]["c_completion"] = int(c)
-                history[turn_id]["total_tokens_call"] = int(total_call)
-                history[turn_id]["r_prev_prompt_total"] = int(r_prev_prompt_total)
-                history[turn_id]["current_message_tokens"] = int(current_message_tokens)
-
-                session["history"] = history
-                session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                session["history_summary"] = history_summary
                 self.memory_store.save_session(session)
 
+                # prompt tokens estimation for "sent" messages: system + history_for_llm + user_text
                 message_stats = {
-                    "turn_id": turn_id,
-                    "r_prompt_total": int(r),
-                    "r_prev_prompt_total": int(r_prev_prompt_total),
-                    "c_completion": int(c),
-                    "current_message_tokens": int(current_message_tokens),
-                    "total_tokens_call": int(total_call),
-                    "cost_rub": cost_rub,
-
-                    # NEW: для UI
-                    "new_message_len": int(new_message_len),
-                    "char_limit": int(char_limit),
-                    "history_summarized": bool(history_summarized),
-                    "history_summary": history_summary,
+                    "strategy": strategy,
+                    "branch_id": bid,
+                    "keep_last_n": int(keep_last_n),
+                    "facts_count": int(len(facts) if isinstance(facts, dict) else 0),
                 }
 
-                await self.send_json(
+                await self._send_json(
                     writer,
                     {
                         "type": "done",
@@ -471,7 +417,9 @@ class LLMAgentServer:
                         "cost_rub": cost_rub,
                         "session_id": session_id,
                         "title": session.get("title") or "",
+                        "active_branch": bid,
                         "message_stats": message_stats,
+                        "facts": facts if strategy == "facts" else None,
                     },
                 )
 
@@ -487,7 +435,7 @@ class LLMAgentServer:
             msg = str(e) or "Unknown error"
             self.logger.write("ERROR", "Ошибка обработки клиента", extra=msg)
             self.logger.write("ERROR", "TRACEBACK", extra=tb)
-            await self.send_json(writer, {"type": "error", "message": msg})
+            await self._send_json(writer, {"type": "error", "message": msg})
 
         finally:
             try:
@@ -498,18 +446,20 @@ class LLMAgentServer:
             self.logger.write("INFO", "Клиент отключился", extra=str(peer))
 
     async def run(self) -> None:
-        await self.load_pricing()
+        await self.preload_pricing()
 
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-        self.logger.write("INFO", "Сервер запущен и слушает", extra=addrs)
+        self.logger.write("INFO", "Агент запущен и слушает", extra=addrs)
 
         async with server:
             await server.serve_forever()
 
+
 async def main() -> None:
     agent = LLMAgentServer()
     await agent.run()
+
 
 if __name__ == "__main__":
     try:

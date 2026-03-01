@@ -3,19 +3,10 @@ import json, sys
 sys.dont_write_bytecode = True
 
 from typing import Any, AsyncIterator, Dict, Optional, List
-from core.logger.advanced_logger import Logger
-from PySide6.QtCore import Signal, QObject
 
 
-class AgentClient(QObject):
-
-    agent_connection_established = Signal()
-    sessions_list_updated = Signal()
-
-    def __init__(self, logger: Logger, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
-        super().__init__()
-
-        self.logger = logger
+class AgentClient:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
         self.host = host
         self.port = port
         self.timeout_sec = timeout_sec
@@ -25,132 +16,25 @@ class AgentClient(QObject):
         self.last_model: Optional[str] = None
         self.last_endpoint: Optional[str] = None
         self.last_title: Optional[str] = None
-
         self.last_message_stats: Dict[str, Any] = {}
+        self.last_active_branch: Optional[str] = None
+        self.last_facts: Optional[dict] = None
 
-        self.is_connected = False
-        self.agent_watchdog_task = None
-        self.sessions_list = []
-
-        # --- агент: вечный watchdog переподключения
-        self.agent_watchdog_task = asyncio.get_event_loop().create_task(self.agent_connection_watchdog())
-
-        self.agent_connection_established.connect(
-            lambda: asyncio.get_event_loop().create_task(self.get_list_sessions())
-        )
-
-    async def connect_to_server(self):
-        try:
-            self.logger.info("Попытка подключения к серверу...")
-            state = await self.ping()
-            
-            if state:
-                self.is_connected = True
-                self.logger.success("Сервер ONLINE: соединение установлено")
-                self.agent_connection_established.emit()
-            else:
-                self.is_connected = False
-                self.logger.warning("Сервер недоступен. Проверьте запуск сервера.")
-        except Exception as e:
-            self.is_connected = False
-            self.logger.warning(f"Ошибка при попытке связи: {e}")
-        
-    async def agent_connection_watchdog(self):
-        await self.connect_to_server()
-
-        while True:
-            await asyncio.sleep(5)
-            try:
-                state = await self.ping()
-                
-                if not state:
-                    if self.is_connected:
-                        self.logger.warning("Связь с сервером потеряна!")
-                    
-                    self.is_connected = False
-                    await self.connect_to_server() 
-                else:
-                    if not self.is_connected: 
-                        self.is_connected = True
-                        self.logger.success("Соединение восстановлено")
-                        self.agent_connection_established.emit()
-                        
-            except Exception as e:
-                self.logger.error(f"Критическая ошибка в watchdog: {e}")
-
-    async def ping(self) -> bool:
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=self.timeout_sec,
-            )
-            writer.write((json.dumps({"action": "ping"}) + "\n").encode("utf-8"))
-            await writer.drain()
-
-            line = await asyncio.wait_for(reader.readline(), timeout=self.timeout_sec)
-
-            writer.close()
-
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-            if not line:
-                return False
-
-            data = json.loads(line.decode("utf-8", errors="replace"))
-            return data.get("type") == "pong"
-        
-        except Exception:
-            return False
-
-    async def get_list_sessions(self):
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        writer.write((json.dumps({"action": "list_sessions"}, ensure_ascii=False) + "\n").encode("utf-8"))
-        await writer.drain()
-
-        try:
-            line = await reader.readline()
-            if not line:
-                self.sessions_list = []
-
-            msg = json.loads(line.decode("utf-8", errors="replace"))
-            self.sessions_list = []
-            if msg.get("type") == "sessions":
-                self.sessions_list = msg.get("sessions") or []
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-            
-        self.sessions_list_updated.emit()
-
-    async def get_session(self, session_id: str) -> Optional[dict]:
+    async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         reader, writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
-
-        writer.write(
-            (json.dumps({"action": "get_session", "session_id": session_id}, ensure_ascii=False) + "\n").encode("utf-8")
-        )
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
 
         try:
-            line = await reader.readline()
+            line = await asyncio.wait_for(reader.readline(), timeout=self.timeout_sec)
             if not line:
-                return None
+                return {"type": "error", "message": "Empty response"}
 
             msg = json.loads(line.decode("utf-8", errors="replace"))
 
-            # обычный короткий ответ
-            if msg.get("type") == "session":
-                return msg.get("session")
-            if msg.get("type") == "error":
-                raise RuntimeError(msg.get("message") or "Agent error")
-
-            # chunked ответ (если сервер уже умеет)
-            if msg.get("type") == "chunked_start" and msg.get("orig_type") == "session":
+            # chunked response support
+            if msg.get("type") == "chunked_start":
+                orig = msg.get("orig_type")
                 chunks = int(msg.get("chunks") or 0)
                 parts = [""] * chunks
 
@@ -158,61 +42,90 @@ class AgentClient(QObject):
                     line2 = await reader.readline()
                     if not line2:
                         break
-
                     m2 = json.loads(line2.decode("utf-8", errors="replace"))
                     t = m2.get("type")
 
-                    if t == "chunked_part" and m2.get("orig_type") == "session":
+                    if t == "chunked_part" and m2.get("orig_type") == orig:
                         i = int(m2.get("i") or 0)
                         data = m2.get("data") or ""
                         if 0 <= i < chunks:
                             parts[i] = data
                         continue
 
-                    if t == "chunked_end" and m2.get("orig_type") == "session":
+                    if t == "chunked_end" and m2.get("orig_type") == orig:
                         break
 
                     if t == "error":
-                        raise RuntimeError(m2.get("message") or "Agent error")
+                        return m2
 
                 full_text = "".join(parts)
-                payload = json.loads(full_text)
+                return json.loads(full_text)
 
-                if payload.get("type") == "session":
-                    return payload.get("session")
-                if payload.get("type") == "error":
-                    raise RuntimeError(payload.get("message") or "Agent error")
-                return None
-
-            return None
-
+            return msg
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def ping(self) -> bool:
+        try:
+            msg = await self._rpc({"action": "ping"})
+            return msg.get("type") == "pong"
+        except Exception:
+            return False
+
+    async def list_sessions(self) -> List[dict]:
+        msg = await self._rpc({"action": "list_sessions"})
+        if msg.get("type") == "sessions":
+            return msg.get("sessions") or []
+        return []
+
+    async def get_session(self, session_id: str) -> Optional[dict]:
+        msg = await self._rpc({"action": "get_session", "session_id": session_id})
+        if msg.get("type") == "session":
+            return msg.get("session")
+        if msg.get("type") == "error":
+            raise RuntimeError(msg.get("message") or "Agent error")
+        return None
 
     async def reset_session(self, session_id: str) -> bool:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        writer.write(
-            (json.dumps({"action": "reset_session", "session_id": session_id}, ensure_ascii=False) + "\n").encode("utf-8")
-        )
-        await writer.drain()
+        msg = await self._rpc({"action": "reset_session", "session_id": session_id})
+        return msg.get("type") == "ok"
 
-        try:
-            line = await reader.readline()
-            if not line:
-                return False
+    async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
+        msg = await self._rpc({
+            "action": "create_checkpoint",
+            "session_id": session_id,
+            "branch_id": branch_id,
+            "name": name,
+        })
+        if msg.get("type") == "ok":
+            return msg.get("checkpoint_id") or ""
+        raise RuntimeError(msg.get("message") or "Agent error")
 
-            msg = json.loads(line.decode("utf-8", errors="replace"))
-            return msg.get("type") == "ok"
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+    async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
+        msg = await self._rpc({
+            "action": "create_branch",
+            "session_id": session_id,
+            "from_branch_id": from_branch_id,
+            "checkpoint_id": checkpoint_id,
+            "new_branch_name": new_branch_name,
+        })
+        if msg.get("type") == "ok":
+            return msg.get("branch_id") or ""
+        raise RuntimeError(msg.get("message") or "Agent error")
+
+    async def switch_branch(self, session_id: str, branch_id: str) -> str:
+        msg = await self._rpc({
+            "action": "switch_branch",
+            "session_id": session_id,
+            "branch_id": branch_id,
+        })
+        if msg.get("type") == "ok":
+            return msg.get("active_branch") or branch_id
+        raise RuntimeError(msg.get("message") or "Agent error")
 
     async def stream_chat(
         self,
@@ -222,10 +135,9 @@ class AgentClient(QObject):
         max_tokens: int,
         temperature: Optional[float],
         session_id: str,
-        char_limit: int,
+        branch_id: str,
         keep_last_n: int,
-        summary_model: str,
-        summary_endpoint: str,
+        context_strategy: str,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -233,23 +145,22 @@ class AgentClient(QObject):
         self.last_endpoint = None
         self.last_title = None
         self.last_message_stats = {}
+        self.last_active_branch = None
+        self.last_facts = None
 
         reader, writer = await asyncio.open_connection(self.host, self.port)
 
         request = {
             "action": "stream_chat",
             "session_id": session_id,
+            "branch_id": branch_id,
             "user_text": user_text,
             "model": model,
             "endpoint": endpoint,
             "max_tokens": int(max_tokens),
             "temperature": temperature,
-
-            # NEW: параметры контроля длины и суммаризации
-            "char_limit": int(char_limit),
             "keep_last_n": int(keep_last_n),
-            "summary_model": str(summary_model or "").strip(),
-            "summary_endpoint": str(summary_endpoint or "chat"),
+            "context_strategy": str(context_strategy or "sliding"),
         }
 
         writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -277,6 +188,8 @@ class AgentClient(QObject):
                     self.last_cost_rub = msg.get("cost_rub", None)
                     self.last_title = msg.get("title") or None
                     self.last_message_stats = msg.get("message_stats") or {}
+                    self.last_active_branch = msg.get("active_branch") or None
+                    self.last_facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else None
                     break
 
                 if msg_type == "error":
