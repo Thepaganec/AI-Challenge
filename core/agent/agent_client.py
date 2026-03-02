@@ -1,8 +1,9 @@
 import asyncio
-import json, sys
-sys.dont_write_bytecode = True
+import json
+import sys
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-from typing import Any, AsyncIterator, Dict, Optional, List
+sys.dont_write_bytecode = True
 
 
 class AgentClient:
@@ -19,6 +20,8 @@ class AgentClient:
         self.last_message_stats: Dict[str, Any] = {}
         self.last_active_branch: Optional[str] = None
         self.last_facts: Optional[dict] = None
+        self.last_memory_layers: Optional[dict] = None
+        self.last_token_stats: Dict[str, Any] = {}
 
     async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         reader, writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
@@ -32,7 +35,6 @@ class AgentClient:
 
             msg = json.loads(line.decode("utf-8", errors="replace"))
 
-            # chunked response support
             if msg.get("type") == "chunked_start":
                 orig = msg.get("orig_type")
                 chunks = int(msg.get("chunks") or 0)
@@ -69,27 +71,9 @@ class AgentClient:
             except Exception:
                 pass
 
-    async def switch_branch(self, session_id: str, branch_id: str) -> str:
-        """
-        Переключает активную ветку на сервере.
-        Сервер поддерживает action 'switch_branch' (алиас для 'set_active_branch').
-
-        Возвращает active_branch (branch_id), который подтвердил сервер.
-        """
-        msg = await self._rpc({
-            "action": "switch_branch",
-            "session_id": session_id,
-            "branch_id": branch_id,
-        })
-
-        t = msg.get("type")
-        if t == "ok":
-            return (msg.get("active_branch") or branch_id or "main").strip() or "main"
-
-        if t == "error":
+    def _raise_if_error(self, msg: Dict[str, Any]) -> None:
+        if msg.get("type") == "error":
             raise RuntimeError(msg.get("message") or "Agent error")
-
-        raise RuntimeError(msg.get("message") or "Agent error")
 
     async def ping(self) -> bool:
         try:
@@ -108,70 +92,123 @@ class AgentClient:
         msg = await self._rpc({"action": "get_session", "session_id": session_id})
         if msg.get("type") == "session":
             return msg.get("session")
-        if msg.get("type") == "error":
-            raise RuntimeError(msg.get("message") or "Agent error")
+        self._raise_if_error(msg)
         return None
 
     async def reset_session(self, session_id: str) -> bool:
         msg = await self._rpc({"action": "reset_session", "session_id": session_id})
+        self._raise_if_error(msg)
         return msg.get("type") == "ok"
 
-    async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
-        msg = await self._rpc({
-            "action": "create_checkpoint",
-            "session_id": session_id,
-            "branch_id": branch_id,
-            "name": name,
-        })
+    async def switch_branch(self, session_id: str, branch_id: str) -> str:
+        msg = await self._rpc(
+            {
+                "action": "switch_branch",
+                "session_id": session_id,
+                "branch_id": branch_id,
+            }
+        )
+        self._raise_if_error(msg)
+        if msg.get("type") == "ok":
+            return (msg.get("active_branch") or branch_id or "main").strip() or "main"
+        raise RuntimeError(msg.get("message") or "Agent error")
 
+    async def list_branches(self, session_id: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "list_branches", "session_id": session_id})
+        self._raise_if_error(msg)
+        if msg.get("type") == "branches":
+            return {
+                "branches": msg.get("branches") or [],
+                "active_branch": msg.get("active_branch") or "main",
+            }
+        return {"branches": [], "active_branch": "main"}
+
+    async def list_checkpoints(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
+        msg = await self._rpc(
+            {
+                "action": "list_checkpoints",
+                "session_id": session_id,
+                "branch_id": branch_id,
+            }
+        )
+        self._raise_if_error(msg)
+        if msg.get("type") == "checkpoints":
+            return {
+                "checkpoints": msg.get("checkpoints") or [],
+                "active_branch": msg.get("active_branch") or branch_id or "main",
+            }
+        return {"checkpoints": [], "active_branch": branch_id or "main"}
+
+    async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
+        msg = await self._rpc(
+            {
+                "action": "create_checkpoint",
+                "session_id": session_id,
+                "branch_id": branch_id,
+                "name": name,
+            }
+        )
         t = msg.get("type")
         if t == "ok":
             return msg.get("checkpoint_id") or ""
-
-        # backward compatibility (если сервер ещё отдаёт старый тип)
         if t == "checkpoint_created":
             cp = msg.get("checkpoint") if isinstance(msg.get("checkpoint"), dict) else {}
             return str(cp.get("id") or "")
-
         raise RuntimeError(msg.get("message") or "Agent error")
 
     async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
-        msg = await self._rpc({
-            "action": "create_branch",
-            "session_id": session_id,
-            "from_branch_id": from_branch_id,
-            "checkpoint_id": checkpoint_id,
-            "new_branch_name": new_branch_name,
-        })
+        msg = await self._rpc(
+            {
+                "action": "create_branch",
+                "session_id": session_id,
+                "from_branch_id": from_branch_id,
+                "checkpoint_id": checkpoint_id,
+                "new_branch_name": new_branch_name,
+            }
+        )
 
         t = msg.get("type")
         if t == "ok":
             return msg.get("branch_id") or ""
-
-        # backward compatibility
         if t == "branch_created":
             return msg.get("branch_id") or ""
-
         raise RuntimeError(msg.get("message") or "Agent error")
 
-    async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
-        msg = await self._rpc({
-            "action": "create_branch",
-            "session_id": session_id,
-            "from_branch_id": from_branch_id,
-            "checkpoint_id": checkpoint_id,
-            "new_branch_name": new_branch_name,
-        })
+    async def get_memory(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
+        msg = await self._rpc(
+            {
+                "action": "get_memory",
+                "session_id": session_id,
+                "branch_id": branch_id,
+            }
+        )
+        self._raise_if_error(msg)
+        if msg.get("type") == "memory":
+            layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
+            self.last_memory_layers = layers
+            return {
+                "active_branch": msg.get("active_branch") or branch_id or "main",
+                "memory_layers": layers,
+            }
+        return {"active_branch": branch_id or "main", "memory_layers": {}}
 
-        t = msg.get("type")
-        if t == "ok":
-            return msg.get("branch_id") or ""
-
-        # backward compatibility
-        if t == "branch_created":
-            return msg.get("branch_id") or ""
-
-        raise RuntimeError(msg.get("message") or "Agent error")
+    async def save_memory(self, session_id: str, branch_id: str, layer: str, value: str, key: str = "") -> Dict[str, Any]:
+        msg = await self._rpc(
+            {
+                "action": "save_memory",
+                "session_id": session_id,
+                "branch_id": branch_id,
+                "layer": layer,
+                "key": key,
+                "value": value,
+            }
+        )
+        self._raise_if_error(msg)
+        if msg.get("type") == "ok":
+            layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
+            self.last_memory_layers = layers
+            return {"ok": True, "active_branch": msg.get("active_branch"), "memory_layers": layers}
+        return {"ok": False, "active_branch": branch_id, "memory_layers": {}}
 
     async def stream_chat(
         self,
@@ -184,6 +221,7 @@ class AgentClient:
         branch_id: str,
         keep_last_n: int,
         context_strategy: str,
+        memory_write: Optional[Dict[str, str]] = None,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -193,10 +231,12 @@ class AgentClient:
         self.last_message_stats = {}
         self.last_active_branch = None
         self.last_facts = None
+        self.last_memory_layers = None
+        self.last_token_stats = {}
 
         reader, writer = await asyncio.open_connection(self.host, self.port)
 
-        request = {
+        request: Dict[str, Any] = {
             "action": "stream_chat",
             "session_id": session_id,
             "branch_id": branch_id,
@@ -208,6 +248,8 @@ class AgentClient:
             "keep_last_n": int(keep_last_n),
             "context_strategy": str(context_strategy or "sliding"),
         }
+        if isinstance(memory_write, dict):
+            request["memory_write"] = memory_write
 
         writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
@@ -236,6 +278,8 @@ class AgentClient:
                     self.last_message_stats = msg.get("message_stats") or {}
                     self.last_active_branch = msg.get("active_branch") or None
                     self.last_facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else None
+                    self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
+                    self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
                     break
 
                 if msg_type == "error":

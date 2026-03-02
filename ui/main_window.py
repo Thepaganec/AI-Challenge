@@ -14,7 +14,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.logger = logger
 
-        self.setWindowTitle("AI Challenge — Day 10 (Context Strategies)")
+        self.setWindowTitle("AI Challenge")
         self.setMinimumSize(1000, 720)
         self.setStyleSheet(qdarkstyle.load_stylesheet_pyside6())
 
@@ -27,7 +27,7 @@ class MainWindow(QMainWindow):
         self.chat_tab = ChatTab(logger=self.logger)
 
         self.tab_widget = QTabWidget()
-        self.tab_widget.addTab(self.chat_tab, "Chat (Day 10)")
+        self.tab_widget.addTab(self.chat_tab, "Chat")
         self.tab_widget.setCurrentIndex(0)
 
         central_widget = QWidget()

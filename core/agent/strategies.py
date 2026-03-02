@@ -168,3 +168,54 @@ def build_facts_strategy(history: List[dict], facts: Dict[str, str], keep_last_n
     system_text = facts_to_system_text(facts)
     tail = build_sliding_window(history, keep_last_n)
     return system_text, tail
+
+
+def build_summary_strategy(
+    history: List[dict],
+    keep_last_n: int,
+    previous_summary: str = "",
+    max_summary_lines: int = 28,
+    max_line_len: int = 220,
+) -> Tuple[Optional[str], List[dict], str]:
+    """
+    Summary-compression strategy:
+    - tail: последние N сообщений (как есть)
+    - summary: сжатие более старой части диалога в краткий текст
+    """
+    if keep_last_n < 1:
+        keep_last_n = 1
+
+    safe_history = history or []
+    if len(safe_history) <= keep_last_n:
+        summary_text = (previous_summary or "").strip()
+        system_text = f"SUMMARY OF PREVIOUS DIALOG:\n{summary_text}" if summary_text else None
+        return system_text, list(safe_history), summary_text
+
+    older = safe_history[:-keep_last_n]
+    tail = safe_history[-keep_last_n:]
+
+    new_lines: List[str] = []
+    for msg in older:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower() or "unknown"
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        short = content.replace("\n", " ")
+        short = re.sub(r"\s+", " ", short).strip()
+        if len(short) > max_line_len:
+            short = short[: max_line_len - 3].rstrip() + "..."
+        new_lines.append(f"- {role}: {short}")
+
+    merged: List[str] = []
+    if previous_summary and previous_summary.strip():
+        merged.extend([ln.strip() for ln in previous_summary.splitlines() if ln.strip()])
+    merged.extend(new_lines)
+
+    if len(merged) > max_summary_lines:
+        merged = merged[-max_summary_lines:]
+
+    summary_text = "\n".join(merged).strip()
+    system_text = f"SUMMARY OF PREVIOUS DIALOG:\n{summary_text}" if summary_text else None
+    return system_text, tail, summary_text

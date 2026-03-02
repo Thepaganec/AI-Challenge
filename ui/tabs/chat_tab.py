@@ -35,6 +35,7 @@ class ChatTab(BaseTab):
         self.is_generating = False
         self.stop_requested = False
         self.current_task = None
+        self.pending_memory_write = None
 
         self.init_content()
         self.load_window_state()
@@ -116,6 +117,7 @@ class ChatTab(BaseTab):
         self.strategy_selector.setFixedWidth(240)
         self.strategy_selector.addItem("Sliding Window (последние N)", "sliding")
         self.strategy_selector.addItem("Sticky Facts + последние N", "facts")
+        self.strategy_selector.addItem("Summary + последние N", "summary")
         self.strategy_selector.addItem("Branching (ветки) + последние N", "branching")
         self.strategy_selector.currentIndexChanged.connect(self.on_strategy_changed)
 
@@ -152,6 +154,7 @@ class ChatTab(BaseTab):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
+        self.sent_len_label = QLabel("API context tokens(est): N/A")
 
         self.output_editbox = QTextEdit()
         self.output_editbox.setFont(font)
@@ -306,10 +309,48 @@ class ChatTab(BaseTab):
         fg.setContentsMargins(8, 8, 8, 8)
         fg.addWidget(self.facts_box)
 
+        self.memory_layer_selector = QComboBox()
+        self.memory_layer_selector.setFixedWidth(140)
+        self.memory_layer_selector.addItem("short_term", "short_term")
+        self.memory_layer_selector.addItem("working", "working")
+        self.memory_layer_selector.addItem("long_term", "long_term")
+
+        self.memory_key_input = QLineEdit()
+        self.memory_key_input.setPlaceholderText("Ключ (опционально)")
+
+        self.memory_value_input = QLineEdit()
+        self.memory_value_input.setPlaceholderText("Значение для сохранения в память")
+
+        self.save_memory_btn = QPushButton("Сохранить в память")
+        self.save_memory_btn.clicked.connect(self.on_save_memory_clicked)
+
+        self.memory_box = QTextEdit()
+        self.memory_box.setReadOnly(True)
+        self.memory_box.setMinimumHeight(110)
+
+        memory_group = QGroupBox("Memory layers:")
+        ml = QVBoxLayout(memory_group)
+        ml.setContentsMargins(8, 8, 8, 8)
+        ml.setSpacing(6)
+
+        mem_row1 = QWidget()
+        mr1 = QHBoxLayout(mem_row1)
+        mr1.setContentsMargins(0, 0, 0, 0)
+        mr1.addWidget(QLabel("Слой:"))
+        mr1.addStretch(1)
+        mr1.addWidget(self.memory_layer_selector)
+
+        ml.addWidget(mem_row1)
+        ml.addWidget(self.memory_key_input)
+        ml.addWidget(self.memory_value_input)
+        ml.addWidget(self.save_memory_btn)
+        ml.addWidget(self.memory_box)
+
         rp.addWidget(params_box)
         rp.addWidget(branch_box)
         rp.addWidget(metrics_group)
         rp.addWidget(facts_group)
+        rp.addWidget(memory_group)
         rp.addStretch(1)
 
         # ===== main splitter =====
@@ -321,6 +362,7 @@ class ChatTab(BaseTab):
         lp.addWidget(session_box)
         lp.addWidget(QLabel("Ввод:"))
         lp.addWidget(self.input_editbox)
+        lp.addWidget(self.sent_len_label)
         lp.addWidget(self.progress_bar)
         lp.addWidget(QLabel("Вывод:"))
         lp.addWidget(self.output_editbox)
@@ -352,6 +394,21 @@ class ChatTab(BaseTab):
         История в сессии не трогается.
         """
         self.output_editbox.clear()
+
+    def _clear_session_dependent_ui(self, clear_input: bool = False):
+        self.output_editbox.clear()
+        self.metrics_box.clear()
+        self.facts_box.clear()
+        self.memory_box.clear()
+        self.sent_len_label.setText("API context tokens(est): N/A")
+        self.branch_selector.blockSignals(True)
+        self.branch_selector.clear()
+        self.branch_selector.blockSignals(False)
+        self.checkpoint_selector.clear()
+        self.checkpoint_name.clear()
+        self.new_branch_name.clear()
+        if clear_input:
+            self.input_editbox.clear()
 
     def _tick_refresh_sessions_list(self):
         """
@@ -462,6 +519,7 @@ class ChatTab(BaseTab):
         if not sid or self.is_generating:
             return
         self.current_session_id = str(sid)
+        self._clear_session_dependent_ui(clear_input=True)
         asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
 
     async def load_session_to_ui(self, session_id: str):
@@ -479,9 +537,7 @@ class ChatTab(BaseTab):
         if not session:
             return
 
-        self.output_editbox.clear()
-        self.metrics_box.clear()
-        self.facts_box.clear()
+        self._clear_session_dependent_ui()
 
         # restore active branch
         active_branch = (session.get("active_branch") or "main").strip() or "main"
@@ -521,6 +577,8 @@ class ChatTab(BaseTab):
         # show facts if exists
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
         self.render_facts(facts)
+        memory_layers = branch.get("memory_layers") if isinstance(branch.get("memory_layers"), dict) else {}
+        self.render_memory_layers(memory_layers)
 
         self.logger.debug(f"Сессия загружена. session={session_id} branch={self.current_branch_id}")
 
@@ -566,15 +624,50 @@ class ChatTab(BaseTab):
         lines = [f"{k}: {v}" for k, v in facts.items()]
         self.facts_box.setPlainText("\n".join(lines))
 
+    def render_memory_layers(self, memory_layers: dict):
+        if not isinstance(memory_layers, dict) or not memory_layers:
+            self.memory_box.setPlainText("")
+            return
+        lines = []
+        short_term = memory_layers.get("short_term")
+        working = memory_layers.get("working")
+        long_term = memory_layers.get("long_term")
+
+        lines.append("[short_term]")
+        if isinstance(short_term, list) and short_term:
+            for item in short_term[-8:]:
+                if isinstance(item, dict):
+                    k = str(item.get("key") or "note")
+                    v = str(item.get("value") or "")
+                    lines.append(f"- {k}: {v}")
+        else:
+            lines.append("- (empty)")
+
+        lines.append("")
+        lines.append("[working]")
+        if isinstance(working, dict) and working:
+            for k, v in working.items():
+                lines.append(f"- {k}: {v}")
+        else:
+            lines.append("- (empty)")
+
+        lines.append("")
+        lines.append("[long_term]")
+        if isinstance(long_term, dict) and long_term:
+            for k, v in long_term.items():
+                lines.append(f"- {k}: {v}")
+        else:
+            lines.append("- (empty)")
+
+        self.memory_box.setPlainText("\n".join(lines))
+
     def on_new_session_clicked(self):
         if self.is_generating:
             self.logger.warning("Нельзя сменить сессию во время генерации.")
             return
         self.current_session_id = str(uuid.uuid4())
         self.current_branch_id = "main"
-        self.output_editbox.clear()
-        self.metrics_box.clear()
-        self.facts_box.clear()
+        self._clear_session_dependent_ui(clear_input=True)
         self.render_sessions_list_offline()
         if self.is_agent_connected:
             asyncio.get_event_loop().create_task(self.refresh_sessions_list())
@@ -592,9 +685,7 @@ class ChatTab(BaseTab):
             try:
                 ok = await self.agent.reset_session(self.current_session_id)
                 if ok:
-                    self.output_editbox.clear()
-                    self.metrics_box.clear()
-                    self.facts_box.clear()
+                    self._clear_session_dependent_ui(clear_input=True)
                     self.current_branch_id = "main"
                     await self.refresh_sessions_list()
                     await self.load_session_to_ui(self.current_session_id)
@@ -622,6 +713,8 @@ class ChatTab(BaseTab):
             self.logger.info("Стратегия: Branching. История ведётся по выбранной ветке.")
         elif strategy == "facts":
             self.logger.info("Стратегия: Sticky Facts. Facts обновляются после каждого сообщения пользователя.")
+        elif strategy == "summary":
+            self.logger.info("Стратегия: Summary. Старые сообщения сжимаются в summary + последние N отправляются как есть.")
         else:
             self.logger.info("Стратегия: Sliding Window. В модель отправляются только последние N сообщений.")
 
@@ -722,10 +815,12 @@ class ChatTab(BaseTab):
                 temperature=selected_temperature,
                 keep_last_n=keep_last_n,
                 strategy=strategy,
+                memory_write=self.pending_memory_write,
             )
         )
+        self.pending_memory_write = None
 
-    async def ask_and_stream_answer(self, user_text: str, model: str, endpoint: str, temperature, keep_last_n: int, strategy: str):
+    async def ask_and_stream_answer(self, user_text: str, model: str, endpoint: str, temperature, keep_last_n: int, strategy: str, memory_write=None):
         t0 = time.perf_counter()
         ttft_sec = None
         got_first = False
@@ -750,6 +845,7 @@ class ChatTab(BaseTab):
                 branch_id=self.current_branch_id,
                 keep_last_n=keep_last_n,
                 context_strategy=strategy,
+                memory_write=memory_write,
             )
 
             async for chunk in gen:
@@ -791,18 +887,24 @@ class ChatTab(BaseTab):
             temp_str = f"{temperature}" if temperature is not None else "locked(1.0)"
 
             ms = getattr(self.agent, "last_message_stats", None) or {}
+            token_stats = getattr(self.agent, "last_token_stats", None) or {}
             active_branch = getattr(self.agent, "last_active_branch", None) or self.current_branch_id
             self.current_branch_id = active_branch
 
             strategy_used = ms.get("strategy") or strategy
             facts_count = ms.get("facts_count")
             sent_messages = ms.get("sent_messages")
+            api_context_tokens = token_stats.get("context_tokens_est")
+            dialog_tokens = token_stats.get("dialog_tokens_est")
+            user_tokens = token_stats.get("user_text_tokens_est")
+            may_exceed = token_stats.get("may_exceed_context")
+            self.sent_len_label.setText(f"API context tokens(est): {api_context_tokens if api_context_tokens is not None else 'N/A'}")
 
             line = (
                 f"Strategy={strategy_used} | Branch={active_branch} | sent_msgs={sent_messages} | keep_last_n={keep_last_n} | "
                 f"TTFT={ttft_str} | Total={total_sec:.3f}s | "
                 f"prompt={prompt_tokens} | completion={completion_tokens} | total={total_tokens_call} | Cost={cost_str} | "
-                f"Temp={temp_str}"
+                f"Temp={temp_str} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed}"
             )
             if facts_count is not None:
                 line += f" | facts={facts_count}"
@@ -819,6 +921,9 @@ class ChatTab(BaseTab):
             last_facts = getattr(self.agent, "last_facts", None)
             if strategy_used == "facts" and isinstance(last_facts, dict):
                 self.render_facts(last_facts)
+            last_memory = getattr(self.agent, "last_memory_layers", None)
+            if isinstance(last_memory, dict):
+                self.render_memory_layers(last_memory)
 
             # refresh session list (title updates) — без перезагрузки UI (иначе может чистить поля)
             if self.is_agent_connected:
@@ -839,6 +944,45 @@ class ChatTab(BaseTab):
         self.stop_button.setEnabled(False)
         self.set_loading(False)
         self.logger.warning("Стрим остановлен пользователем.")
+
+    def on_save_memory_clicked(self):
+        layer = self.memory_layer_selector.currentData()
+        key = self.memory_key_input.text().strip()
+        value = self.memory_value_input.text().strip()
+        if not layer:
+            self.logger.warning("Не выбран слой памяти.")
+            return
+        if not value:
+            self.logger.warning("Значение памяти пустое.")
+            return
+
+        self.pending_memory_write = {
+            "layer": str(layer),
+            "key": key,
+            "value": value,
+        }
+
+        async def _persist():
+            if not self.is_agent_connected:
+                self.logger.warning("Агент OFFLINE: запись памяти будет выполнена только при следующей отправке.")
+                return
+            try:
+                payload = await self.agent.save_memory(
+                    session_id=self.current_session_id,
+                    branch_id=self.current_branch_id,
+                    layer=str(layer),
+                    key=key,
+                    value=value,
+                )
+                self.render_memory_layers(payload.get("memory_layers") or {})
+                self.memory_key_input.clear()
+                self.memory_value_input.clear()
+                self.pending_memory_write = None
+                self.logger.success(f"Сохранено в memory layer: {layer}")
+            except Exception as e:
+                self.logger.warning(f"Не удалось сохранить память: {e}")
+
+        asyncio.get_event_loop().create_task(_persist())
 
     def on_splitter_moved(self):
         self.splitter_move_timer.start(300)

@@ -19,6 +19,7 @@ from core.agent.strategies import (
     build_sliding_window,
     parse_facts_from_user_text,
     build_facts_strategy,
+    build_summary_strategy,
 )
 
 
@@ -65,7 +66,15 @@ class LLMAgentServer:
             "list_checkpoints": self._handle_list_checkpoints,
             "create_checkpoint": self._handle_create_checkpoint,
             "create_branch": self._handle_create_branch,
+            "get_memory": self._handle_get_memory,
+            "save_memory": self._handle_save_memory,
             "stream_chat": self._handle_stream_chat,
+        }
+        self._model_context_limit: Dict[str, int] = {
+            "gpt-3.5-turbo": 16384,
+            "gpt-4o-mini": 128000,
+            "gpt-4o": 128000,
+            "gpt-5.2-chat-latest": 400000,
         }
 
     async def preload_pricing(self) -> None:
@@ -145,9 +154,16 @@ class LLMAgentServer:
                 "facts": {},
                 "checkpoints": [],   # <<< ВАЖНО: список, не dict
                 "history": [],
+                "summary": "",
+                "memory_layers": {
+                    "short_term": [],
+                    "working": {},
+                    "long_term": {},
+                },
             }
 
         session["active_branch"] = bid
+        self._ensure_branch_memory_model(branches[bid])
         return bid, branches[bid]
 
     def _make_checkpoint(self, history: List[Dict[str, str]], name: Optional[str] = None) -> Dict[str, Any]:
@@ -197,6 +213,8 @@ class LLMAgentServer:
             "history": new_history,
             "facts": dict(base_branch.get("facts") or {}) if isinstance(base_branch.get("facts"), dict) else {},
             "checkpoints": [],
+            "summary": str(base_branch.get("summary") or ""),
+            "memory_layers": self._copy_memory_layers(base_branch.get("memory_layers")),
             "created_at": now,
             "updated_at": now,
         }
@@ -221,6 +239,110 @@ class LLMAgentServer:
 
         branch["history"] = normalized
         return branch["history"]
+
+    def _copy_memory_layers(self, layers: Any) -> Dict[str, Any]:
+        if not isinstance(layers, dict):
+            return {"short_term": [], "working": {}, "long_term": {}}
+        short_term = layers.get("short_term")
+        working = layers.get("working")
+        long_term = layers.get("long_term")
+        return {
+            "short_term": list(short_term) if isinstance(short_term, list) else [],
+            "working": dict(working) if isinstance(working, dict) else {},
+            "long_term": dict(long_term) if isinstance(long_term, dict) else {},
+        }
+
+    def _ensure_branch_memory_model(self, branch: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(branch.get("summary"), str):
+            branch["summary"] = ""
+        branch["memory_layers"] = self._copy_memory_layers(branch.get("memory_layers"))
+        return branch["memory_layers"]
+
+    def _estimate_tokens_text(self, text: str) -> int:
+        clean = (text or "").strip()
+        if not clean:
+            return 0
+        return max(1, int(len(clean) / 4))
+
+    def _estimate_tokens_messages(self, messages: List[Dict[str, str]]) -> int:
+        total = 0
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            total += self._estimate_tokens_text(str(msg.get("content") or ""))
+            total += 4
+        return int(total)
+
+    def _resolve_context_limit(self, model: str) -> int:
+        model_id = (model or "").strip()
+        return int(self._model_context_limit.get(model_id, 128000))
+
+    def _build_memory_system_text(self, memory_layers: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(memory_layers, dict):
+            return None
+        working = memory_layers.get("working")
+        long_term = memory_layers.get("long_term")
+        lines: List[str] = []
+        if isinstance(working, dict) and working:
+            lines.append("WORKING MEMORY:")
+            for k, v in working.items():
+                if k and v is not None:
+                    lines.append(f"- {k}: {v}")
+        if isinstance(long_term, dict) and long_term:
+            lines.append("LONG-TERM MEMORY:")
+            for k, v in long_term.items():
+                if k and v is not None:
+                    lines.append(f"- {k}: {v}")
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    def _merge_system_text(self, *chunks: Optional[str]) -> Optional[str]:
+        parts = [str(c).strip() for c in chunks if isinstance(c, str) and str(c).strip()]
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
+        layer_key = (layer or "").strip().lower()
+        memory_layers = memory_layers if isinstance(memory_layers, dict) else {}
+        if layer_key == "short_term":
+            short_term = memory_layers.get("short_term")
+            if not isinstance(short_term, list):
+                short_term = []
+            short_term.append(
+                {
+                    "key": key or "note",
+                    "value": value,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            if len(short_term) > 50:
+                short_term = short_term[-50:]
+            memory_layers["short_term"] = short_term
+            return True
+        if layer_key in ("working", "long_term"):
+            bucket = memory_layers.get(layer_key)
+            if not isinstance(bucket, dict):
+                bucket = {}
+            clean_key = (key or "").strip() or "note"
+            bucket[clean_key] = value
+            memory_layers[layer_key] = bucket
+            return True
+        return False
+
+    def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, str]], max_items: int = 20) -> None:
+        if not isinstance(memory_layers, dict):
+            return
+        synced: List[Dict[str, str]] = []
+        for msg in history[-max_items:]:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = str(msg.get("content") or "").strip()
+            if role and content:
+                synced.append({"key": role, "value": content})
+        memory_layers["short_term"] = synced
 
     def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
         self.memory_store.set_title_if_empty(session, user_text)
@@ -255,6 +377,11 @@ class LLMAgentServer:
             await self._send_error(writer, "session_id is required")
             return
         session = self.memory_store.load_session(session_id)
+        branches = session.get("branches")
+        if isinstance(branches, dict):
+            for _, branch in branches.items():
+                if isinstance(branch, dict):
+                    self._ensure_branch_memory_model(branch)
         await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
 
     async def _handle_reset_session(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
@@ -410,6 +537,66 @@ class LLMAgentServer:
 
         await self._send_json(writer, {"type": "ok", "ok": True, "branch_id": new_bid, "active_branch": new_bid})
 
+    async def _handle_get_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = (request.get("session_id") or "").strip()
+        branch_id = (request.get("branch_id") or "").strip() or None
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+
+        session = self.memory_store.load_session(session_id)
+        bid, branch = self._get_branch(session, branch_id)
+        memory_layers = self._ensure_branch_memory_model(branch)
+
+        await self._send_json(
+            writer,
+            {
+                "type": "memory",
+                "session_id": session_id,
+                "active_branch": bid,
+                "memory_layers": memory_layers,
+            },
+        )
+
+    async def _handle_save_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = (request.get("session_id") or "").strip()
+        branch_id = (request.get("branch_id") or "").strip() or None
+        layer = (request.get("layer") or "").strip()
+        key = str(request.get("key") or "").strip()
+        value = str(request.get("value") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        if not layer or not value:
+            await self._send_error(writer, "layer and value are required")
+            return
+
+        session = self.memory_store.load_session(session_id)
+        bid, branch = self._get_branch(session, branch_id)
+        memory_layers = self._ensure_branch_memory_model(branch)
+        ok = self._save_memory_item(memory_layers, layer, key, value)
+        if not ok:
+            await self._send_error(writer, "layer must be one of: short_term, working, long_term")
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        branch["memory_layers"] = memory_layers
+        branch["updated_at"] = now
+        session["branches"][bid] = branch
+        session["active_branch"] = bid
+        session["updated_at"] = now
+        self.memory_store.save_session(session)
+
+        await self._send_json(
+            writer,
+            {
+                "type": "ok",
+                "ok": True,
+                "active_branch": bid,
+                "memory_layers": memory_layers,
+            },
+        )
+
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         user_text = (request.get("user_text") or "").strip()
         session_id = (request.get("session_id") or "").strip()
@@ -456,18 +643,42 @@ class LLMAgentServer:
 
         branch = branches.get(bid) if isinstance(branches.get(bid), dict) else {"title": bid, "history": [], "facts": {}, "checkpoints": []}
         history = self._branch_history(branch)
+        memory_layers = self._ensure_branch_memory_model(branch)
 
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
         facts = parse_facts_from_user_text(user_text, facts)
         branch["facts"] = facts
 
+        strategy_for_context = strategy if strategy in ("sliding", "facts", "summary", "branching") else "sliding"
+        strategy_display = "sliding" if strategy_for_context == "branching" else strategy_for_context
+
         system_text = None
         history_for_llm: List[Dict[str, str]] = []
 
-        if strategy == "facts":
+        if strategy_for_context == "facts":
             system_text, history_for_llm = build_facts_strategy(history, facts, keep_last_n)
+        elif strategy_for_context == "summary":
+            previous_summary = str(branch.get("summary") or "")
+            system_text, history_for_llm, updated_summary = build_summary_strategy(
+                history=history,
+                keep_last_n=keep_last_n,
+                previous_summary=previous_summary,
+            )
+            branch["summary"] = updated_summary
         else:
             history_for_llm = build_sliding_window(history, keep_last_n)
+
+        memory_system_text = self._build_memory_system_text(memory_layers)
+        system_text = self._merge_system_text(memory_system_text, system_text)
+
+        explicit_memory = request.get("memory_write")
+        if isinstance(explicit_memory, dict):
+            layer = str(explicit_memory.get("layer") or "").strip()
+            key = str(explicit_memory.get("key") or "").strip()
+            value = str(explicit_memory.get("value") or "").strip()
+            if layer and value:
+                self._save_memory_item(memory_layers, layer, key, value)
+                branch["memory_layers"] = memory_layers
 
         history.append({"role": "user", "content": user_text})
 
@@ -494,6 +705,8 @@ class LLMAgentServer:
             cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
 
             history.append({"role": "assistant", "content": assistant_answer})
+            self._sync_short_term_from_history(memory_layers, history)
+            branch["memory_layers"] = memory_layers
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             branch["history"] = history
@@ -505,13 +718,39 @@ class LLMAgentServer:
             self.memory_store.save_session(session)
 
             sent_messages = int(len(history_for_llm) + (1 if system_text else 0) + 1)
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            total_tokens_call = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+            full_history_tokens_est = self._estimate_tokens_messages(history)
+            context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
+            user_tokens_est = self._estimate_tokens_text(user_text)
+            assistant_tokens_est = completion_tokens if completion_tokens > 0 else self._estimate_tokens_text(assistant_answer)
+            model_context_limit = self._resolve_context_limit(model)
+            may_exceed_context = bool((context_tokens_est + user_tokens_est) > model_context_limit)
+
+            token_stats = {
+                "user_text_tokens_est": int(user_tokens_est),
+                "context_tokens_est": int(context_tokens_est),
+                "assistant_tokens": int(assistant_tokens_est),
+                "total_tokens_call": int(total_tokens_call),
+                "dialog_tokens_est": int(full_history_tokens_est),
+                "model_context_limit": int(model_context_limit),
+                "may_exceed_context": may_exceed_context,
+            }
 
             message_stats = {
-                "strategy": strategy,
+                "strategy": strategy_display,
                 "branch_id": bid,
                 "keep_last_n": int(keep_last_n),
                 "sent_messages": int(sent_messages),
                 "facts_count": int(len(facts) if isinstance(facts, dict) else 0),
+                "memory_layers_counts": {
+                    "short_term": int(len(memory_layers.get("short_term") or [])) if isinstance(memory_layers.get("short_term"), list) else 0,
+                    "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
+                    "long_term": int(len(memory_layers.get("long_term") or {})) if isinstance(memory_layers.get("long_term"), dict) else 0,
+                },
+                "token_stats": token_stats,
             }
 
             await self._send_json(
@@ -527,6 +766,8 @@ class LLMAgentServer:
                     "active_branch": bid,
                     "message_stats": message_stats,
                     "facts": facts if isinstance(facts, dict) else {},
+                    "memory_layers": memory_layers,
+                    "token_stats": token_stats,
                 },
             )
 

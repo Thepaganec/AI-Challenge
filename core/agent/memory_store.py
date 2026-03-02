@@ -213,6 +213,12 @@ class AgentMemoryStore:
                             "history": [],          # список сообщений role/content
                             "facts": {},
                             "checkpoints": [],
+                            "summary": "",
+                            "memory_layers": {
+                                "short_term": [],
+                                "working": {},
+                                "long_term": {},
+                            },
                             "created_at": data.get("created_at") or _now_iso(),
                             "updated_at": data.get("updated_at") or _now_iso(),
                         }
@@ -257,6 +263,19 @@ class AgentMemoryStore:
                             b["facts"] = {}
                         if not isinstance(b.get("checkpoints"), list):
                             b["checkpoints"] = []
+                        if not isinstance(b.get("summary"), str):
+                            b["summary"] = ""
+                        layers = b.get("memory_layers")
+                        if not isinstance(layers, dict):
+                            layers = {}
+                        short_term = layers.get("short_term")
+                        working = layers.get("working")
+                        long_term = layers.get("long_term")
+                        b["memory_layers"] = {
+                            "short_term": short_term if isinstance(short_term, list) else [],
+                            "working": working if isinstance(working, dict) else {},
+                            "long_term": long_term if isinstance(long_term, dict) else {},
+                        }
                         if not isinstance(b.get("created_at"), str):
                             b["created_at"] = data.get("created_at") or _now_iso()
                         if not isinstance(b.get("updated_at"), str):
@@ -284,6 +303,12 @@ class AgentMemoryStore:
                     "history": [],
                     "facts": {},
                     "checkpoints": [],
+                    "summary": "",
+                    "memory_layers": {
+                        "short_term": [],
+                        "working": {},
+                        "long_term": {},
+                    },
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -405,6 +430,12 @@ class AgentMemoryStore:
                 "history": [],
                 "facts": {},
                 "checkpoints": [],
+                "summary": "",
+                "memory_layers": {
+                    "short_term": [],
+                    "working": {},
+                    "long_term": {},
+                },
                 "created_at": session.get("created_at") or _now_iso(),
                 "updated_at": session.get("updated_at") or _now_iso(),
             }
@@ -422,6 +453,19 @@ class AgentMemoryStore:
                 b["facts"] = {}
             if not isinstance(b.get("checkpoints"), list):
                 b["checkpoints"] = []
+            if not isinstance(b.get("summary"), str):
+                b["summary"] = ""
+            layers = b.get("memory_layers")
+            if not isinstance(layers, dict):
+                layers = {}
+            short_term = layers.get("short_term")
+            working = layers.get("working")
+            long_term = layers.get("long_term")
+            b["memory_layers"] = {
+                "short_term": short_term if isinstance(short_term, list) else [],
+                "working": working if isinstance(working, dict) else {},
+                "long_term": long_term if isinstance(long_term, dict) else {},
+            }
             if not isinstance(b.get("created_at"), str):
                 b["created_at"] = session.get("created_at") or _now_iso()
             if not isinstance(b.get("updated_at"), str):
