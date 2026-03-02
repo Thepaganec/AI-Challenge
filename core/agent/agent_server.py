@@ -138,6 +138,33 @@ class LLMAgentServer:
         session["active_branch"] = bid
         return bid, branches[bid]
 
+    def _make_checkpoint(self, history, name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Создаёт checkpoint для Branching.
+
+        checkpoint хранит:
+        - id: уникальный идентификатор
+        - name: отображаемое имя (если не задано — авто)
+        - cut: позиция в истории (len(history)), то есть "после последнего сообщения"
+        - created_at: время создания
+        """
+        try:
+            cut = int(len(history) if isinstance(history, list) else 0)
+        except Exception:
+            cut = 0
+
+        cp_id = str(uuid.uuid4())
+        cp_name = (name or "").strip()
+        if not cp_name:
+            cp_name = f"checkpoint_{cut}"
+
+        return {
+            "id": cp_id,
+            "name": cp_name,
+            "cut": cut,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
     def _branch_history(self, branch: Dict[str, Any]) -> List[Dict[str, str]]:
         h = branch.get("history")
         if not isinstance(h, list):
