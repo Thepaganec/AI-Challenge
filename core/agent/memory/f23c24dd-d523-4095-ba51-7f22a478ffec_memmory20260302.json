@@ -1,0 +1,47 @@
+{
+  "session_id": "f23c24dd-d523-4095-ba51-7f22a478ffec",
+  "title": "фыа",
+  "created_at": "2026-03-02 22:29:08",
+  "updated_at": "2026-03-02 22:29:23",
+  "history": {},
+  "history_summary": "",
+  "active_branch": "3818809e",
+  "branches": {
+    "main": {
+      "title": "main",
+      "history": [],
+      "facts": {},
+      "checkpoints": [
+        {
+          "id": "1713b478-f462-4324-8b82-d6d22eac7491",
+          "name": "ветка 1",
+          "cut": 0,
+          "created_at": "2026-03-02 22:29:08"
+        }
+      ],
+      "created_at": "2026-03-02 22:29:08",
+      "updated_at": "2026-03-02 22:29:08"
+    },
+    "3818809e": {
+      "title": "а",
+      "history": [
+        {
+          "role": "user",
+          "content": "фыа"
+        },
+        {
+          "role": "assistant",
+          "content": "Привет! Чем могу помочь?"
+        }
+      ],
+      "facts": {
+        "Последний запрос": "фыа",
+        "Цель": "фыа"
+      },
+      "checkpoints": [],
+      "created_at": "2026-03-02 22:29:17",
+      "updated_at": "2026-03-02 22:29:23"
+    }
+  },
+  "file_path": "C:\\Development\\Python\\Projects\\AI Challenge\\core\\agent\\memory\\f23c24dd-d523-4095-ba51-7f22a478ffec_memmory20260302.json"
+}
