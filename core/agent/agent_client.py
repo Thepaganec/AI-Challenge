@@ -69,6 +69,28 @@ class AgentClient:
             except Exception:
                 pass
 
+    async def switch_branch(self, session_id: str, branch_id: str) -> str:
+        """
+        Переключает активную ветку на сервере.
+        Сервер поддерживает action 'switch_branch' (алиас для 'set_active_branch').
+
+        Возвращает active_branch (branch_id), который подтвердил сервер.
+        """
+        msg = await self._rpc({
+            "action": "switch_branch",
+            "session_id": session_id,
+            "branch_id": branch_id,
+        })
+
+        t = msg.get("type")
+        if t == "ok":
+            return (msg.get("active_branch") or branch_id or "main").strip() or "main"
+
+        if t == "error":
+            raise RuntimeError(msg.get("message") or "Agent error")
+
+        raise RuntimeError(msg.get("message") or "Agent error")
+
     async def ping(self) -> bool:
         try:
             msg = await self._rpc({"action": "ping"})
