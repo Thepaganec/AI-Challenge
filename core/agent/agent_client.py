@@ -101,8 +101,16 @@ class AgentClient:
             "branch_id": branch_id,
             "name": name,
         })
-        if msg.get("type") == "ok":
+
+        t = msg.get("type")
+        if t == "ok":
             return msg.get("checkpoint_id") or ""
+
+        # backward compatibility (если сервер ещё отдаёт старый тип)
+        if t == "checkpoint_created":
+            cp = msg.get("checkpoint") if isinstance(msg.get("checkpoint"), dict) else {}
+            return str(cp.get("id") or "")
+
         raise RuntimeError(msg.get("message") or "Agent error")
 
     async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
@@ -113,18 +121,34 @@ class AgentClient:
             "checkpoint_id": checkpoint_id,
             "new_branch_name": new_branch_name,
         })
-        if msg.get("type") == "ok":
+
+        t = msg.get("type")
+        if t == "ok":
             return msg.get("branch_id") or ""
+
+        # backward compatibility
+        if t == "branch_created":
+            return msg.get("branch_id") or ""
+
         raise RuntimeError(msg.get("message") or "Agent error")
 
-    async def switch_branch(self, session_id: str, branch_id: str) -> str:
+    async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
         msg = await self._rpc({
-            "action": "switch_branch",
+            "action": "create_branch",
             "session_id": session_id,
-            "branch_id": branch_id,
+            "from_branch_id": from_branch_id,
+            "checkpoint_id": checkpoint_id,
+            "new_branch_name": new_branch_name,
         })
-        if msg.get("type") == "ok":
-            return msg.get("active_branch") or branch_id
+
+        t = msg.get("type")
+        if t == "ok":
+            return msg.get("branch_id") or ""
+
+        # backward compatibility
+        if t == "branch_created":
+            return msg.get("branch_id") or ""
+
         raise RuntimeError(msg.get("message") or "Agent error")
 
     async def stream_chat(

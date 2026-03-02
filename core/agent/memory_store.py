@@ -137,31 +137,160 @@ class AgentMemoryStore:
 
                 if isinstance(data, dict) and data.get("session_id") == session_id:
                     data["file_path"] = path
-                    return self._migrate(data)
+
+                    # --- миграция старого формата messages -> history
+                    if "history" not in data:
+                        old_messages = data.get("messages")
+                        if isinstance(old_messages, list):
+                            history: Dict[str, Any] = {}
+                            idx = 0
+                            pending_user = None
+
+                            for m in old_messages:
+                                role = (m.get("role") or "").strip()
+                                content = m.get("content")
+
+                                if role == "user" and isinstance(content, str):
+                                    pending_user = {"text": content, "ts": m.get("ts")}
+                                elif role == "assistant" and isinstance(content, str):
+                                    if pending_user is None:
+                                        pending_user = {"text": "", "ts": m.get("ts")}
+                                    idx += 1
+                                    history[str(idx)] = {
+                                        "ts": pending_user.get("ts"),
+                                        "user_text": pending_user.get("text") or "",
+                                        "assistant_text": content,
+                                        "model": None,
+                                        "endpoint": None,
+                                        "usage": {},
+                                        "cost_rub": None,
+                                        "r_prompt_total": 0,
+                                        "c_completion": 0,
+                                        "total_tokens_call": 0,
+                                        "r_prev_prompt_total": 0,
+                                        "current_message_tokens": 0,
+                                    }
+                                    pending_user = None
+
+                            if pending_user is not None:
+                                idx += 1
+                                history[str(idx)] = {
+                                    "ts": pending_user.get("ts"),
+                                    "user_text": pending_user.get("text") or "",
+                                    "assistant_text": "",
+                                    "model": None,
+                                    "endpoint": None,
+                                    "usage": {},
+                                    "cost_rub": None,
+                                    "r_prompt_total": 0,
+                                    "c_completion": 0,
+                                    "total_tokens_call": 0,
+                                    "r_prev_prompt_total": 0,
+                                    "current_message_tokens": 0,
+                                }
+
+                            data["history"] = history
+                            data.pop("messages", None)
+
+                    if not isinstance(data.get("history"), dict):
+                        data["history"] = {}
+
+                    # --- гарантируем наличие history_summary (может остаться пустым, в Day10 summary не используем)
+                    if "history_summary" not in data or not isinstance(data.get("history_summary"), str):
+                        data["history_summary"] = ""
+
+                    # --- NEW: Branching структура
+                    # branches: { "main": {title, history(list), facts(dict), checkpoints(list), created_at, updated_at}, ... }
+                    if not isinstance(data.get("branches"), dict):
+                        data["branches"] = {}
+
+                    branches: Dict[str, Any] = data["branches"]
+
+                    # Миграция: если branches пустые, а history(dict) есть — переложим в main как список сообщений
+                    if "main" not in branches:
+                        branches["main"] = {
+                            "title": "main",
+                            "history": [],          # список сообщений role/content
+                            "facts": {},
+                            "checkpoints": [],
+                            "created_at": data.get("created_at") or _now_iso(),
+                            "updated_at": data.get("updated_at") or _now_iso(),
+                        }
+
+                        # Перенос turn-based history -> messages list
+                        # history: {"1": {user_text, assistant_text}, ...}
+                        h = data.get("history") if isinstance(data.get("history"), dict) else {}
+                        keys = []
+                        try:
+                            keys = sorted([int(k) for k in h.keys() if str(k).isdigit()])
+                        except Exception:
+                            keys = []
+
+                        out = []
+                        for k in keys:
+                            t = h.get(str(k)) or {}
+                            ut = t.get("user_text")
+                            at = t.get("assistant_text")
+                            if isinstance(ut, str) and ut.strip():
+                                out.append({"role": "user", "content": ut})
+                            if isinstance(at, str) and at.strip():
+                                out.append({"role": "assistant", "content": at})
+
+                        branches["main"]["history"] = out
+
+                    # active_branch
+                    if not isinstance(data.get("active_branch"), str) or not data.get("active_branch"):
+                        data["active_branch"] = "main"
+                    if data["active_branch"] not in branches:
+                        data["active_branch"] = "main"
+
+                    # нормализация веток
+                    for bid, b in list(branches.items()):
+                        if not isinstance(b, dict):
+                            branches.pop(bid, None)
+                            continue
+                        if not isinstance(b.get("title"), str):
+                            b["title"] = bid
+                        if not isinstance(b.get("history"), list):
+                            b["history"] = []
+                        if not isinstance(b.get("facts"), dict):
+                            b["facts"] = {}
+                        if not isinstance(b.get("checkpoints"), list):
+                            b["checkpoints"] = []
+                        if not isinstance(b.get("created_at"), str):
+                            b["created_at"] = data.get("created_at") or _now_iso()
+                        if not isinstance(b.get("updated_at"), str):
+                            b["updated_at"] = data.get("updated_at") or _now_iso()
+
+                    data["branches"] = branches
+                    return data
+
             except Exception:
                 pass
 
-        created_at = _now_iso()
-        session = {
+        # --- если сессии нет, создаём новую
+        now = _now_iso()
+        data = {
             "session_id": session_id,
             "title": "",
-            "created_at": created_at,
-            "updated_at": created_at,
+            "created_at": now,
+            "updated_at": now,
+            "history": {},            # старое поле оставляем пустым
+            "history_summary": "",
             "active_branch": "main",
             "branches": {
                 "main": {
-                    "branch_id": "main",
-                    "name": "main",
-                    "created_at": created_at,
-                    "updated_at": created_at,
-                    "facts": {},
-                    "checkpoints": {},
+                    "title": "main",
                     "history": [],
+                    "facts": {},
+                    "checkpoints": [],
+                    "created_at": now,
+                    "updated_at": now,
                 }
             },
             "file_path": self._session_file_path_today(session_id),
         }
-        return session
+        return data
 
     def _migrate(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # На всякий — если остался старый формат history(dict turns) — конвертируем в messages list
@@ -262,7 +391,53 @@ class AgentMemoryStore:
         path = session.get("file_path") or self._session_file_path_today(session_id)
         session["file_path"] = path
 
-        session = self._migrate(session)
+        # --- гарантируем branching структуру
+        if not isinstance(session.get("branches"), dict):
+            session["branches"] = {}
+
+        if not isinstance(session.get("active_branch"), str) or not session.get("active_branch"):
+            session["active_branch"] = "main"
+
+        branches = session["branches"]
+        if "main" not in branches or not isinstance(branches.get("main"), dict):
+            branches["main"] = {
+                "title": "main",
+                "history": [],
+                "facts": {},
+                "checkpoints": [],
+                "created_at": session.get("created_at") or _now_iso(),
+                "updated_at": session.get("updated_at") or _now_iso(),
+            }
+
+        # Нормализация веток
+        for bid, b in list(branches.items()):
+            if not isinstance(b, dict):
+                branches.pop(bid, None)
+                continue
+            if not isinstance(b.get("title"), str):
+                b["title"] = bid
+            if not isinstance(b.get("history"), list):
+                b["history"] = []
+            if not isinstance(b.get("facts"), dict):
+                b["facts"] = {}
+            if not isinstance(b.get("checkpoints"), list):
+                b["checkpoints"] = []
+            if not isinstance(b.get("created_at"), str):
+                b["created_at"] = session.get("created_at") or _now_iso()
+            if not isinstance(b.get("updated_at"), str):
+                b["updated_at"] = session.get("updated_at") or _now_iso()
+
+        if session["active_branch"] not in branches:
+            session["active_branch"] = "main"
+
+        session["branches"] = branches
+
+        # --- старые поля оставляем, но не обязаны их наполнять
+        if "history" not in session or not isinstance(session.get("history"), dict):
+            session["history"] = {}
+
+        if "history_summary" not in session or not isinstance(session.get("history_summary"), str):
+            session["history_summary"] = ""
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=2)

@@ -525,10 +525,39 @@ class ChatTab(BaseTab):
         self.logger.debug(f"Сессия загружена. session={session_id} branch={self.current_branch_id}")
 
     def refresh_checkpoints_ui(self, branch: dict):
-        cps = branch.get("checkpoints") if isinstance(branch.get("checkpoints"), dict) else {}
+        """
+        Сервер хранит checkpoints как list[dict], но на всякий случай поддержим и старый формат dict.
+        В combo кладём data = checkpoint_id, а текст делаем читаемым.
+        """
+        cps_raw = branch.get("checkpoints")
+
+        checkpoints = []
+
+        if isinstance(cps_raw, list):
+            for cp in cps_raw:
+                if isinstance(cp, dict) and cp.get("id"):
+                    checkpoints.append(cp)
+
+        elif isinstance(cps_raw, dict):
+            # старый формат (на всякий случай)
+            for cp_id, cp_val in cps_raw.items():
+                if isinstance(cp_val, dict):
+                    cp = dict(cp_val)
+                    cp["id"] = cp.get("id") or cp_id
+                    checkpoints.append(cp)
+                else:
+                    checkpoints.append({"id": str(cp_id), "name": str(cp_id)})
+
         self.checkpoint_selector.clear()
-        for cp_id in cps.keys():
-            self.checkpoint_selector.addItem(cp_id, cp_id)
+
+        for cp in checkpoints:
+            cp_id = str(cp.get("id"))
+            cp_name = (cp.get("name") or "").strip()
+            if cp_name and cp_name != cp_id:
+                label = f"{cp_name} ({cp_id})"
+            else:
+                label = cp_id
+            self.checkpoint_selector.addItem(label, cp_id)
 
     def render_facts(self, facts: dict):
         if not isinstance(facts, dict) or not facts:
