@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, QByteArray, QTimer, QEvent
 from PySide6.QtGui import QTextCursor, QFont
 
 from ui.tabs.base_tab import BaseTab
+from ui.tabs.metrics_memory_tab import MetricsMemoryTab
 from core.agent.agent_client import AgentClient
 from extra.global_utils import set_editbox_height
 
@@ -19,7 +20,7 @@ class ChatTab(BaseTab):
     file_name = f"{os.path.splitext(os.path.basename(__file__))[0]}.json"
     CONFIG_FILE = os.path.join(path, file_name)
 
-    def __init__(self, logger):
+    def __init__(self, logger, metrics_memory_tab: MetricsMemoryTab | None = None):
         super().__init__(logger)
 
         self.agent = AgentClient()
@@ -36,6 +37,16 @@ class ChatTab(BaseTab):
         self.stop_requested = False
         self.current_task = None
         self.pending_memory_write = None
+        self._memory_layer_hint_logged = False
+
+        self.metrics_memory_tab = metrics_memory_tab or MetricsMemoryTab()
+        self.metrics_box = self.metrics_memory_tab.metrics_box
+        self.memory_layer_selector = self.metrics_memory_tab.memory_layer_selector
+        self.memory_key_input = self.metrics_memory_tab.memory_key_input
+        self.memory_value_input = self.metrics_memory_tab.memory_value_input
+        self.save_memory_btn = self.metrics_memory_tab.save_memory_btn
+        self.memory_box = self.metrics_memory_tab.memory_box
+        self.save_memory_btn.clicked.connect(self.on_save_memory_clicked)
 
         self.init_content()
         self.load_window_state()
@@ -290,15 +301,6 @@ class ChatTab(BaseTab):
         b_l.addWidget(b_row5)
         b_l.addWidget(b_row6)
 
-        self.metrics_box = QTextEdit()
-        self.metrics_box.setReadOnly(True)
-        self.metrics_box.setMinimumHeight(120)
-
-        metrics_group = QGroupBox("Metrics:")
-        mg = QVBoxLayout(metrics_group)
-        mg.setContentsMargins(8, 8, 8, 8)
-        mg.addWidget(self.metrics_box)
-
         self.facts_box = QTextEdit()
         self.facts_box.setReadOnly(True)
         self.facts_box.setMinimumHeight(90)
@@ -309,48 +311,9 @@ class ChatTab(BaseTab):
         fg.setContentsMargins(8, 8, 8, 8)
         fg.addWidget(self.facts_box)
 
-        self.memory_layer_selector = QComboBox()
-        self.memory_layer_selector.setFixedWidth(140)
-        self.memory_layer_selector.addItem("short_term", "short_term")
-        self.memory_layer_selector.addItem("working", "working")
-        self.memory_layer_selector.addItem("long_term", "long_term")
-
-        self.memory_key_input = QLineEdit()
-        self.memory_key_input.setPlaceholderText("Ключ (опционально)")
-
-        self.memory_value_input = QLineEdit()
-        self.memory_value_input.setPlaceholderText("Значение для сохранения в память")
-
-        self.save_memory_btn = QPushButton("Сохранить в память")
-        self.save_memory_btn.clicked.connect(self.on_save_memory_clicked)
-
-        self.memory_box = QTextEdit()
-        self.memory_box.setReadOnly(True)
-        self.memory_box.setMinimumHeight(110)
-
-        memory_group = QGroupBox("Memory layers:")
-        ml = QVBoxLayout(memory_group)
-        ml.setContentsMargins(8, 8, 8, 8)
-        ml.setSpacing(6)
-
-        mem_row1 = QWidget()
-        mr1 = QHBoxLayout(mem_row1)
-        mr1.setContentsMargins(0, 0, 0, 0)
-        mr1.addWidget(QLabel("Слой:"))
-        mr1.addStretch(1)
-        mr1.addWidget(self.memory_layer_selector)
-
-        ml.addWidget(mem_row1)
-        ml.addWidget(self.memory_key_input)
-        ml.addWidget(self.memory_value_input)
-        ml.addWidget(self.save_memory_btn)
-        ml.addWidget(self.memory_box)
-
         rp.addWidget(params_box)
         rp.addWidget(branch_box)
-        rp.addWidget(metrics_group)
         rp.addWidget(facts_group)
-        rp.addWidget(memory_group)
         rp.addStretch(1)
 
         # ===== main splitter =====
@@ -397,9 +360,8 @@ class ChatTab(BaseTab):
 
     def _clear_session_dependent_ui(self, clear_input: bool = False):
         self.output_editbox.clear()
-        self.metrics_box.clear()
         self.facts_box.clear()
-        self.memory_box.clear()
+        self.metrics_memory_tab.clear_panels()
         self.sent_len_label.setText("API context tokens(est): N/A")
         self.branch_selector.blockSignals(True)
         self.branch_selector.clear()
@@ -955,6 +917,13 @@ class ChatTab(BaseTab):
         if not value:
             self.logger.warning("Значение памяти пустое.")
             return
+
+        if layer != "short_term" and not self._memory_layer_hint_logged:
+            self._memory_layer_hint_logged = True
+            self.logger.info(
+                "short_term заполняется автоматически из диалога после каждого ответа. "
+                "Селектор слоя влияет только на ручное сохранение по кнопке."
+            )
 
         self.pending_memory_write = {
             "layer": str(layer),

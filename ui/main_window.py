@@ -2,6 +2,7 @@ import json, os, qdarkstyle
 
 from core.logger.advanced_logger import Logger
 from ui.tabs.chat_tab import ChatTab
+from ui.tabs.metrics_memory_tab import MetricsMemoryTab
 from PySide6.QtWidgets import QMainWindow, QTabWidget, QVBoxLayout, QWidget
 
 
@@ -24,10 +25,12 @@ class MainWindow(QMainWindow):
         self.logger.success("Главное окно готово к работе")
 
     def init_ui(self):
-        self.chat_tab = ChatTab(logger=self.logger)
+        self.metrics_memory_tab = MetricsMemoryTab(logger=self.logger)
+        self.chat_tab = ChatTab(logger=self.logger, metrics_memory_tab=self.metrics_memory_tab)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(self.chat_tab, "Chat")
+        self.tab_widget.addTab(self.metrics_memory_tab, "Metrics & Memory")
         self.tab_widget.setCurrentIndex(0)
 
         central_widget = QWidget()
