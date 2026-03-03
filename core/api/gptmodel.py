@@ -13,6 +13,7 @@ class GPTModel:
         base_url: str = "https://openai.api.proxyapi.ru/v1",
         model: str = "gpt-5.2-chat-latest",
         timeout_sec: int = 60,
+        logger: Optional[Any] = None,
     ):
         self.api_key = os.getenv(api_key_env)
         if not self.api_key:
@@ -24,9 +25,27 @@ class GPTModel:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_sec = timeout_sec
+        self.logger = logger
 
         # Последняя статистика usage по стриму (токены и т.п.)
         self.last_usage: Optional[Dict[str, Any]] = None
+
+    def _mask_api_key(self, value: str) -> str:
+        token = str(value or "")
+        if len(token) <= 10:
+            return "***"
+        return token[:6] + "***" + token[-4:]
+
+    def _log_struct(self, level: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        if self.logger is None:
+            return
+        extra: Optional[str] = None
+        if isinstance(payload, dict):
+            extra = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            self.logger.write(level, message, extra=extra)
+        except Exception:
+            pass
 
     async def get_model_price_rub_per_1m(self, model_id: str) -> Optional[Dict[str, float]]:
         table = await self.get_pricing_rub_per_1m()
@@ -158,6 +177,7 @@ class GPTModel:
         endpoint: str = "chat",
         temperature: Optional[float] = None,
         include_usage: bool = True,
+        trace_id: Optional[str] = None,
     ):
         selected_model = model or self.model
 
@@ -185,12 +205,52 @@ class GPTModel:
 
         async def _post_chat(payload: Dict[str, object]) -> AsyncIterator[str]:
             url = f"{self.base_url}/chat/completions"
+            t0 = time.perf_counter()
+            chunks = 0
+            chars_out = 0
+            self._log_struct(
+                "INFO",
+                "GPTMODEL_API_REQUEST",
+                {
+                    "req_id": trace_id,
+                    "source": "GPTMODEL",
+                    "endpoint": "chat",
+                    "url": url,
+                    "headers": {
+                        "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
+                        "Content-Type": "application/json",
+                    },
+                    "payload": payload,
+                },
+            )
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, headers=headers, json=payload) as resp:
+                    self._log_struct(
+                        "INFO",
+                        "GPTMODEL_API_RESPONSE_META",
+                        {
+                            "req_id": trace_id,
+                            "source": "GPTMODEL",
+                            "endpoint": "chat",
+                            "status": int(resp.status),
+                            "ok": bool(200 <= int(resp.status) < 300),
+                        },
+                    )
 
                     if resp.status < 200 or resp.status >= 300:
                         body_text = await resp.text()
+                        self._log_struct(
+                            "ERROR",
+                            "GPTMODEL_API_RESPONSE_ERROR",
+                            {
+                                "req_id": trace_id,
+                                "source": "GPTMODEL",
+                                "endpoint": "chat",
+                                "status": int(resp.status),
+                                "body": body_text,
+                            },
+                        )
                         raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
 
                     async for raw_line in resp.content:
@@ -220,9 +280,24 @@ class GPTModel:
                                 if isinstance(delta, dict):
                                     content = delta.get("content")
                                     if content:
+                                        chunks += 1
+                                        chars_out += len(content)
                                         yield content
                         except Exception:
                             continue
+            self._log_struct(
+                "INFO",
+                "GPTMODEL_API_STREAM_DONE",
+                {
+                    "req_id": trace_id,
+                    "source": "GPTMODEL",
+                    "endpoint": "chat",
+                    "duration_sec": round(time.perf_counter() - t0, 3),
+                    "chunks": int(chunks),
+                    "chars_out": int(chars_out),
+                    "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
+                },
+            )
 
         if endpoint == "chat":
             # --- 1) Сначала пробуем max_completion_tokens (нужно для gpt-5.2-chat-latest)
@@ -280,11 +355,51 @@ class GPTModel:
             if temperature is not None and float(temperature) != 1.0:
                 payload_r["temperature"] = float(temperature)
 
+            t0 = time.perf_counter()
+            chunks = 0
+            chars_out = 0
+            self._log_struct(
+                "INFO",
+                "GPTMODEL_API_REQUEST",
+                {
+                    "req_id": trace_id,
+                    "source": "GPTMODEL",
+                    "endpoint": "responses",
+                    "url": url,
+                    "headers": {
+                        "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
+                        "Content-Type": "application/json",
+                    },
+                    "payload": payload_r,
+                },
+            )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, headers=headers, json=payload_r) as resp:
+                    self._log_struct(
+                        "INFO",
+                        "GPTMODEL_API_RESPONSE_META",
+                        {
+                            "req_id": trace_id,
+                            "source": "GPTMODEL",
+                            "endpoint": "responses",
+                            "status": int(resp.status),
+                            "ok": bool(200 <= int(resp.status) < 300),
+                        },
+                    )
 
                     if resp.status < 200 or resp.status >= 300:
                         body_text = await resp.text()
+                        self._log_struct(
+                            "ERROR",
+                            "GPTMODEL_API_RESPONSE_ERROR",
+                            {
+                                "req_id": trace_id,
+                                "source": "GPTMODEL",
+                                "endpoint": "responses",
+                                "status": int(resp.status),
+                                "body": body_text,
+                            },
+                        )
                         raise RuntimeError(
                             f"ProxyAPI error: HTTP {resp.status}\n{body_text}"
                         )
@@ -317,8 +432,21 @@ class GPTModel:
                             if obj.get("type") == "response.output_text.delta":
                                 delta_text = obj.get("delta")
                                 if delta_text:
+                                    chunks += 1
+                                    chars_out += len(delta_text)
                                     yield delta_text
                         except Exception:
                             continue
-
-
+            self._log_struct(
+                "INFO",
+                "GPTMODEL_API_STREAM_DONE",
+                {
+                    "req_id": trace_id,
+                    "source": "GPTMODEL",
+                    "endpoint": "responses",
+                    "duration_sec": round(time.perf_counter() - t0, 3),
+                    "chunks": int(chunks),
+                    "chars_out": int(chars_out),
+                    "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
+                },
+            )

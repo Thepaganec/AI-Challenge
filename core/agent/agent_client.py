@@ -11,6 +11,9 @@ class AgentClient:
         self.host = host
         self.port = port
         self.timeout_sec = timeout_sec
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._conn_lock = asyncio.Lock()
 
         self.last_usage: Dict[str, Any] = {}
         self.last_cost_rub: Optional[float] = None
@@ -23,53 +26,84 @@ class AgentClient:
         self.last_memory_layers: Optional[dict] = None
         self.last_token_stats: Dict[str, Any] = {}
 
-    async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        reader, writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
-        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        await writer.drain()
+    def _is_connected(self) -> bool:
+        return self._writer is not None and not self._writer.is_closing() and self._reader is not None
 
+    async def _ensure_connection(self) -> None:
+        if self._is_connected():
+            return
+        self._reader, self._writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
+
+    async def _close_connection(self) -> None:
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        if writer is None:
+            return
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout=self.timeout_sec)
-            if not line:
-                return {"type": "error", "message": "Empty response"}
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
-            msg = json.loads(line.decode("utf-8", errors="replace"))
+    def _is_connection_error(self, e: Exception) -> bool:
+        return isinstance(e, (ConnectionError, BrokenPipeError, ConnectionResetError, OSError, asyncio.IncompleteReadError))
 
-            if msg.get("type") == "chunked_start":
-                orig = msg.get("orig_type")
-                chunks = int(msg.get("chunks") or 0)
-                parts = [""] * chunks
+    async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        async with self._conn_lock:
+            last_error: Optional[Exception] = None
+            for attempt in range(2):
+                try:
+                    await self._ensure_connection()
+                    assert self._reader is not None and self._writer is not None
 
-                while True:
-                    line2 = await reader.readline()
-                    if not line2:
-                        break
-                    m2 = json.loads(line2.decode("utf-8", errors="replace"))
-                    t = m2.get("type")
+                    self._writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await self._writer.drain()
 
-                    if t == "chunked_part" and m2.get("orig_type") == orig:
-                        i = int(m2.get("i") or 0)
-                        data = m2.get("data") or ""
-                        if 0 <= i < chunks:
-                            parts[i] = data
+                    line = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout_sec)
+                    if not line:
+                        raise ConnectionError("Connection closed by server")
+
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+
+                    if msg.get("type") == "chunked_start":
+                        orig = msg.get("orig_type")
+                        chunks = int(msg.get("chunks") or 0)
+                        parts = [""] * chunks
+
+                        while True:
+                            line2 = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout_sec)
+                            if not line2:
+                                raise ConnectionError("Connection closed during chunked response")
+                            m2 = json.loads(line2.decode("utf-8", errors="replace"))
+                            t = m2.get("type")
+
+                            if t == "chunked_part" and m2.get("orig_type") == orig:
+                                i = int(m2.get("i") or 0)
+                                data = m2.get("data") or ""
+                                if 0 <= i < chunks:
+                                    parts[i] = data
+                                continue
+
+                            if t == "chunked_end" and m2.get("orig_type") == orig:
+                                break
+
+                            if t == "error":
+                                return m2
+
+                        full_text = "".join(parts)
+                        return json.loads(full_text)
+
+                    return msg
+                except Exception as e:
+                    last_error = e
+                    if self._is_connection_error(e) and attempt == 0:
+                        await self._close_connection()
                         continue
-
-                    if t == "chunked_end" and m2.get("orig_type") == orig:
-                        break
-
-                    if t == "error":
-                        return m2
-
-                full_text = "".join(parts)
-                return json.loads(full_text)
-
-            return msg
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+                    raise
+            if last_error:
+                raise last_error
+            raise RuntimeError("RPC failed")
 
     def _raise_if_error(self, msg: Dict[str, Any]) -> None:
         if msg.get("type") == "error":
@@ -234,8 +268,6 @@ class AgentClient:
         self.last_memory_layers = None
         self.last_token_stats = {}
 
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-
         request: Dict[str, Any] = {
             "action": "stream_chat",
             "session_id": session_id,
@@ -251,42 +283,43 @@ class AgentClient:
         if isinstance(memory_write, dict):
             request["memory_write"] = memory_write
 
-        writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
-        await writer.drain()
-
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-
-                msg = json.loads(line.decode("utf-8", errors="replace"))
-                msg_type = msg.get("type")
-
-                if msg_type == "chunk":
-                    chunk = msg.get("chunk") or ""
-                    if chunk:
-                        yield chunk
-                    continue
-
-                if msg_type == "done":
-                    self.last_model = msg.get("model")
-                    self.last_endpoint = msg.get("endpoint")
-                    self.last_usage = msg.get("usage") or {}
-                    self.last_cost_rub = msg.get("cost_rub", None)
-                    self.last_title = msg.get("title") or None
-                    self.last_message_stats = msg.get("message_stats") or {}
-                    self.last_active_branch = msg.get("active_branch") or None
-                    self.last_facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else None
-                    self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
-                    self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
-                    break
-
-                if msg_type == "error":
-                    raise RuntimeError(msg.get("message") or "Agent error")
-        finally:
+        async with self._conn_lock:
             try:
-                writer.close()
-                await writer.wait_closed()
+                await self._ensure_connection()
+                assert self._reader is not None and self._writer is not None
+
+                self._writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+                await self._writer.drain()
+
+                while True:
+                    line = await self._reader.readline()
+                    if not line:
+                        raise ConnectionError("Connection closed by server during stream")
+
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                    msg_type = msg.get("type")
+
+                    if msg_type == "chunk":
+                        chunk = msg.get("chunk") or ""
+                        if chunk:
+                            yield chunk
+                        continue
+
+                    if msg_type == "done":
+                        self.last_model = msg.get("model")
+                        self.last_endpoint = msg.get("endpoint")
+                        self.last_usage = msg.get("usage") or {}
+                        self.last_cost_rub = msg.get("cost_rub", None)
+                        self.last_title = msg.get("title") or None
+                        self.last_message_stats = msg.get("message_stats") or {}
+                        self.last_active_branch = msg.get("active_branch") or None
+                        self.last_facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else None
+                        self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
+                        self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
+                        break
+
+                    if msg_type == "error":
+                        raise RuntimeError(msg.get("message") or "Agent error")
             except Exception:
-                pass
+                await self._close_connection()
+                raise

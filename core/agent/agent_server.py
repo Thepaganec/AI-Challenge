@@ -52,7 +52,7 @@ class LLMAgentServer:
         self.memory_dir = os.path.join(self.base_dir, "memory")
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
 
-        self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec)
+        self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
         self._action_handlers: Dict[str, Callable[[Dict[str, Any], asyncio.StreamWriter], Awaitable[None]]] = {
@@ -276,6 +276,54 @@ class LLMAgentServer:
     def _resolve_context_limit(self, model: str) -> int:
         model_id = (model or "").strip()
         return int(self._model_context_limit.get(model_id, 128000))
+
+    def _log_api_request(
+        self,
+        *,
+        req_id: str,
+        session_id: str,
+        branch_id: str,
+        model: str,
+        endpoint: str,
+        max_tokens: int,
+        temperature: Optional[float],
+        keep_last_n: int,
+        strategy: str,
+        user_text: str,
+        history_for_llm: List[Dict[str, str]],
+        system_text: Optional[str],
+        explicit_memory: Any,
+    ) -> None:
+        try:
+            context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
+            user_tokens_est = self._estimate_tokens_text(user_text)
+            payload: Dict[str, Any] = {
+                "req_id": req_id,
+                "session_id": session_id,
+                "branch_id": branch_id,
+                "model": model,
+                "endpoint": endpoint,
+                "max_tokens": int(max_tokens),
+                "temperature": temperature,
+                "keep_last_n": int(keep_last_n),
+                "context_strategy": strategy,
+                "history_messages": int(len(history_for_llm)),
+                "system_text_len": int(len(system_text or "")),
+                "user_text_len": int(len(user_text or "")),
+                "context_tokens_est": int(context_tokens_est),
+                "user_tokens_est": int(user_tokens_est),
+                "include_usage": True,
+            }
+            if isinstance(explicit_memory, dict):
+                payload["memory_write"] = {
+                    "layer": str(explicit_memory.get("layer") or ""),
+                    "has_key": bool(str(explicit_memory.get("key") or "").strip()),
+                    "value_len": int(len(str(explicit_memory.get("value") or ""))),
+                }
+            payload["source"] = "SERVER"
+            self.logger.write("INFO", "SERVER_API_REQUEST", extra=json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as e:
+            self.logger.write("WARN", "Не удалось сформировать API_REQUEST лог", extra=str(e))
 
     def _build_memory_system_text(self, memory_layers: Dict[str, Any]) -> Optional[str]:
         if not isinstance(memory_layers, dict):
@@ -598,6 +646,7 @@ class LLMAgentServer:
         )
 
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        req_id = str(uuid.uuid4())[:8]
         user_text = (request.get("user_text") or "").strip()
         session_id = (request.get("session_id") or "").strip()
         branch_id = (request.get("branch_id") or "").strip() or None
@@ -686,6 +735,21 @@ class LLMAgentServer:
         assistant_answer = ""
 
         try:
+            self._log_api_request(
+                req_id=req_id,
+                session_id=session_id,
+                branch_id=bid,
+                model=model,
+                endpoint=endpoint,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                keep_last_n=keep_last_n,
+                strategy=strategy_for_context,
+                user_text=user_text,
+                history_for_llm=history_for_llm,
+                system_text=system_text,
+                explicit_memory=explicit_memory,
+            )
             gen = self.gpt.stream_chat(
                 user_text=user_text,
                 system_text=system_text,
@@ -695,6 +759,7 @@ class LLMAgentServer:
                 endpoint=endpoint,
                 temperature=temperature,
                 include_usage=True,
+                trace_id=req_id,
             )
 
             async for chunk in gen:
@@ -783,22 +848,23 @@ class LLMAgentServer:
         self.logger.write("INFO", "Клиент подключился", extra=str(peer))
 
         try:
-            line = await reader.readline()
-            if not line:
-                return
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
 
-            try:
-                request = json.loads(line.decode("utf-8", errors="replace"))
-            except Exception:
-                await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
-                return
+                try:
+                    request = json.loads(line.decode("utf-8", errors="replace"))
+                except Exception:
+                    await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
+                    continue
 
-            action = (request.get("action") or "").strip()
-            handler = self._action_handlers.get(action)
-            if handler is None:
-                await self._send_error(writer, "Unknown action")
-                return
-            await handler(request, writer)
+                action = (request.get("action") or "").strip()
+                handler = self._action_handlers.get(action)
+                if handler is None:
+                    await self._send_error(writer, "Unknown action")
+                    continue
+                await handler(request, writer)
 
         except Exception as e:
             tb = traceback.format_exc()
