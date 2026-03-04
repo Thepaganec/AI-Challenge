@@ -386,6 +386,15 @@ class ChatTab(BaseTab):
         if clear_input:
             self.input_editbox.clear()
 
+    def _reset_branch_ui_to_main(self):
+        self.current_branch_id = "main"
+        self.branch_selector.blockSignals(True)
+        self.branch_selector.clear()
+        self.branch_selector.addItem("main (main)", "main")
+        self.branch_selector.setCurrentIndex(0)
+        self.branch_selector.blockSignals(False)
+        self.checkpoint_selector.clear()
+
     def _tick_refresh_sessions_list(self):
         """
         Таймер раз в N мс обновляет список сессий.
@@ -818,8 +827,8 @@ class ChatTab(BaseTab):
             self.logger.warning("Нельзя сменить сессию во время генерации.")
             return
         self.current_session_id = str(uuid.uuid4())
-        self.current_branch_id = "main"
         self._clear_session_dependent_ui(clear_input=True)
+        self._reset_branch_ui_to_main()
         self.render_sessions_list_offline()
         if self.is_agent_connected:
             asyncio.get_event_loop().create_task(self.refresh_sessions_list())
