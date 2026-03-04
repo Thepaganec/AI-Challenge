@@ -189,38 +189,6 @@ class AgentClient:
             return (msg.get("active_branch") or branch_id or "main").strip() or "main"
         raise RuntimeError(msg.get("message") or "Agent error")
 
-    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
-
-    async def list_branches(self, session_id: str) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "list_branches", "session_id": session_id})
-        self._raise_if_error(msg)
-        if msg.get("type") == "branches":
-            return {
-                "branches": msg.get("branches") or [],
-                "active_branch": msg.get("active_branch") or "main",
-            }
-        return {"branches": [], "active_branch": "main"}
-
-    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
-
-    async def list_checkpoints(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
-        msg = await self._rpc(
-            {
-                "action": "list_checkpoints",
-                "session_id": session_id,
-                "branch_id": branch_id,
-            }
-        )
-        self._raise_if_error(msg)
-        if msg.get("type") == "checkpoints":
-            return {
-                "checkpoints": msg.get("checkpoints") or [],
-                "active_branch": msg.get("active_branch") or branch_id or "main",
-            }
-        return {"checkpoints": [], "active_branch": branch_id or "main"}
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
         msg = await self._rpc(
             {
@@ -258,41 +226,9 @@ class AgentClient:
             return msg.get("branch_id") or ""
         raise RuntimeError(msg.get("message") or "Agent error")
 
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
-
-    async def get_memory(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
-        msg = await self._rpc(
-            {
-                "action": "get_memory",
-                "session_id": session_id,
-                "branch_id": branch_id,
-            }
-        )
-        self._raise_if_error(msg)
-        if msg.get("type") == "memory":
-            layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
-            self.last_memory_layers = layers
-            return {
-                "active_branch": msg.get("active_branch") or branch_id or "main",
-                "memory_layers": layers,
-            }
-        return {"active_branch": branch_id or "main", "memory_layers": {}}
-
     # === Операции с профилями ===
 
     # CRUD-операции профилей пользователя и переключение активного профиля, который влияет на системный контекст запроса.
-
-    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
-
-    async def list_profiles(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "list_profiles"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "profiles":
-            return {
-                "profiles": msg.get("profiles") or [],
-                "active_profile": msg.get("active_profile") or "",
-            }
-        return {"profiles": [], "active_profile": ""}
 
     # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
 

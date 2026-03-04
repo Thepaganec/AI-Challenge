@@ -180,12 +180,6 @@ class GPTModel:
         self._pricing_cache = pricing
         return pricing
 
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
-
-    async def get_model_price_rub_per_1m(self, model_id: str) -> Optional[Dict[str, float]]:
-        table = await self.get_pricing_rub_per_1m()
-        return table.get((model_id or "").strip())
-
     # === Стриминг через ProxyAPI ===
 
     # Собирает messages из system/history/user, открывает SSE-стрим и отдаёт чанки текста с обновлением usage-статистики.

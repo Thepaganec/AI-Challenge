@@ -409,11 +409,11 @@ class ChatTab(BaseTab):
         self.on_model_changed(self.model_selector.currentText())
         self.on_strategy_changed()
         self.refresh_sessions_timer = QTimer(self)
+        # TODO: Рассмотреть увеличение интервала/переход на event-driven обновление списка сессий (минимизация polling).
         self.refresh_sessions_timer.setInterval(1000)
         self.refresh_sessions_timer.timeout.connect(self._tick_refresh_sessions_list)
         self.refresh_sessions_timer.start()
 
-        self.input_editbox.installEventFilter(self)
         self.output_editbox.setMinimumHeight(160)
 
     # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.

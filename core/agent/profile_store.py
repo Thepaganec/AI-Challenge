@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 def _now_str() -> str:
@@ -97,14 +97,6 @@ class AgentProfileStore:
     # === Управление профилями ===
 
     # Предоставляет список, чтение, сохранение, удаление и переключение активного профиля для серверного контекста.
-
-    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
-
-    def list_profiles(self) -> List[str]:
-        data = self.load()
-        names = list((data.get("profiles") or {}).keys())
-        names.sort(key=lambda x: x.lower())
-        return names
 
     # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
 

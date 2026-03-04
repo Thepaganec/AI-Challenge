@@ -58,11 +58,6 @@ def build_sliding_window(history: List[dict], keep_last_n: int) -> List[dict]:
     flattened: List[dict] = [m for t in last_turns for m in t]
     return flattened
 
-def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    facts, _ = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=prev_facts)
-    return facts
-
-
 def parse_facts_and_strip_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, str], str]:
     """
     Извлекает факты и возвращает (updated_facts, cleaned_user_text).
