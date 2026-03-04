@@ -334,14 +334,14 @@ class ChatTab(BaseTab):
         self.facts_box.setMinimumHeight(90)
         self.facts_box.setPlaceholderText("FACTS для стратегии Sticky Facts (показывается, когда она активна).")
 
-        facts_group = QGroupBox("Facts:")
-        fg = QVBoxLayout(facts_group)
+        self.facts_group = QGroupBox("Facts:")
+        fg = QVBoxLayout(self.facts_group)
         fg.setContentsMargins(8, 8, 8, 8)
         fg.addWidget(self.facts_box)
 
         rp.addWidget(params_box)
         rp.addWidget(branch_box)
-        rp.addWidget(facts_group)
+        rp.addWidget(self.facts_group)
         rp.addStretch(1)
 
         # ===== main splitter =====
@@ -756,9 +756,12 @@ class ChatTab(BaseTab):
             else:
                 self.output_editbox.append(f"{role}: {content}\n")
 
-        # show facts if exists
+        # show facts only for Sticky Facts strategy
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
-        self.render_facts(facts)
+        if strategy == "facts":
+            self.render_facts(facts)
+        else:
+            self.facts_box.clear()
         memory_layers = branch.get("memory_layers") if isinstance(branch.get("memory_layers"), dict) else {}
         self.render_memory_layers(memory_layers)
 
@@ -890,12 +893,17 @@ class ChatTab(BaseTab):
     def on_strategy_changed(self):
         strategy = self.strategy_selector.currentData()
         is_branching = (strategy == "branching")
+        is_facts = (strategy == "facts")
         self.branch_selector.setEnabled(is_branching)
         self.checkpoint_name.setEnabled(is_branching)
         self.create_checkpoint_btn.setEnabled(is_branching)
         self.checkpoint_selector.setEnabled(is_branching)
         self.new_branch_name.setEnabled(is_branching)
         self.create_branch_btn.setEnabled(is_branching)
+        self.facts_group.setEnabled(is_facts)
+        self.facts_box.setEnabled(is_facts)
+        if not is_facts:
+            self.facts_box.clear()
 
         if is_branching:
             self.logger.info("Стратегия: Branching. История ведётся по выбранной ветке.")
@@ -1144,6 +1152,8 @@ class ChatTab(BaseTab):
             last_facts = getattr(self.agent, "last_facts", None)
             if strategy_used == "facts" and isinstance(last_facts, dict):
                 self.render_facts(last_facts)
+            else:
+                self.facts_box.clear()
             last_memory = getattr(self.agent, "last_memory_layers", None)
             if isinstance(last_memory, dict):
                 self.render_memory_layers(last_memory)

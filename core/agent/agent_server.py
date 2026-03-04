@@ -809,8 +809,9 @@ class LLMAgentServer:
         memory_layers = self._ensure_branch_memory_model(branch)
 
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
-        facts = parse_facts_from_user_text(user_text, facts)
-        branch["facts"] = facts
+        if strategy_for_context == "facts":
+            facts = parse_facts_from_user_text(user_text, facts)
+            branch["facts"] = facts
 
         system_text = None
         history_for_llm: List[Dict[str, str]] = []
@@ -942,6 +943,7 @@ class LLMAgentServer:
                 "may_exceed_context": may_exceed_context,
             }
 
+            facts_count = int(len(facts) if isinstance(facts, dict) else 0) if strategy_for_context == "facts" else None
             message_stats = {
                 "strategy": strategy_display,
                 "branch_id": bid,
@@ -951,7 +953,7 @@ class LLMAgentServer:
                 "profile_applied": profile_applied,
                 "keep_last_n": int(keep_last_n),
                 "sent_messages": int(sent_messages),
-                "facts_count": int(len(facts) if isinstance(facts, dict) else 0),
+                "facts_count": facts_count,
                 "memory_layers_counts": {
                     "short_term": int(len(memory_layers.get("short_term") or [])) if isinstance(memory_layers.get("short_term"), list) else 0,
                     "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
@@ -972,7 +974,7 @@ class LLMAgentServer:
                     "title": session.get("title") or "",
                     "active_branch": bid,
                     "message_stats": message_stats,
-                    "facts": facts if isinstance(facts, dict) else {},
+                    "facts": (facts if strategy_for_context == "facts" and isinstance(facts, dict) else {}),
                     "memory_layers": memory_layers,
                     "token_stats": token_stats,
                     "profile_info": {
