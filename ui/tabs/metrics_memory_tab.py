@@ -9,10 +9,19 @@ from core.logger.advanced_logger import Logger
 
 
 class MetricsMemoryTab(BaseTab):
+
+    # === Инициализация вкладки ===
+
+    # Создаёт базовый контейнер вкладки метрик и памяти поверх общего BaseTab.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, logger: Logger):
         super().__init__(logger)
         
         self.init_content()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def init_content(self):
         layout = QVBoxLayout(self.top_widget)
@@ -153,6 +162,12 @@ class MetricsMemoryTab(BaseTab):
         self.metrics_splitter.setStretchFactor(1, 2)
 
         layout.addWidget(self.metrics_splitter)
+
+    # === Очистка панелей ===
+
+    # Сбрасывает отображаемые метрики и снимок memory layers без изменения данных на сервере.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def clear_panels(self):
         self.metrics_box.clear()

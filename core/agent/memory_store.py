@@ -46,17 +46,30 @@ class AgentMemoryStore:
       }
     }
     """
+
+    # === Инициализация и файловые пути ===
+
+    # Готовит каталог хранилища, нормализует session_id и вычисляет актуальный путь файла сессии по дате.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
         os.makedirs(self.base_dir, exist_ok=True)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _safe_id(self, session_id: str) -> str:
         return "".join(ch for ch in session_id if ch.isalnum() or ch in ("-", "_"))
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _session_file_path_today(self, session_id: str) -> str:
         day = datetime.now().strftime("%Y%m%d")
         safe_id = self._safe_id(session_id)
         return os.path.join(self.base_dir, f"{safe_id}_memmory{day}.json")
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _find_latest_file_for_session(self, session_id: str) -> Optional[str]:
         safe_id = self._safe_id(session_id)
@@ -77,6 +90,12 @@ class AgentMemoryStore:
             pass
 
         return candidates[0]
+
+    # === Чтение и миграция сессий ===
+
+    # Сканирует доступные файлы сессий, загружает нужную запись и приводит старые форматы истории к текущей веточной структуре.
+
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
 
     def list_sessions(self) -> List[SessionInfo]:
         sessions: Dict[str, SessionInfo] = {}
@@ -126,6 +145,8 @@ class AgentMemoryStore:
         except Exception:
             pass
         return result
+
+    # Читает последнюю версию сессии с диска, выполняет миграцию старого формата и гарантирует целостную branching-структуру перед дальнейшей работой.
 
     def load_session(self, session_id: str) -> Dict[str, Any]:
         path = self._find_latest_file_for_session(session_id)
@@ -317,6 +338,8 @@ class AgentMemoryStore:
         }
         return data
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _migrate(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # На всякий — если остался старый формат history(dict turns) — конвертируем в messages list
         if "branches" not in data:
@@ -408,6 +431,12 @@ class AgentMemoryStore:
 
         return data
 
+    # === Сохранение и сервисные операции ===
+
+    # Перед записью нормализует структуру веток/памяти, удаляет файл сессии по id и генерирует заголовок из первого user-запроса.
+
+    # Проводит финальную нормализацию веток/слоёв памяти и атомарно сохраняет сессию в JSON, сохраняя совместимость со старыми полями.
+
     def save_session(self, session: Dict[str, Any]) -> str:
         session_id = (session.get("session_id") or "").strip()
         if not session_id:
@@ -488,6 +517,8 @@ class AgentMemoryStore:
 
         return path
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def delete_session_file(self, session_id: str) -> bool:
         path = self._find_latest_file_for_session(session_id)
         if not path:
@@ -498,6 +529,8 @@ class AgentMemoryStore:
             return True
         except Exception:
             return False
+
+    # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
 
     def set_title_if_empty(self, session: Dict[str, Any], user_text: str) -> None:
         title = (session.get("title") or "").strip()

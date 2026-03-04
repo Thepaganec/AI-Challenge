@@ -7,6 +7,13 @@ from html import unescape
 from typing import AsyncIterator, List, Dict, Optional, Literal, Any
 
 class GPTModel:
+
+    # === Инициализация и базовая диагностика ===
+
+    # Читает API-ключ, фиксирует базовые параметры модели и готовит безопасный структурный лог запросов.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(
         self,
         api_key_env: str = "PROXYAPI_KEY",
@@ -30,11 +37,15 @@ class GPTModel:
         # Последняя статистика usage по стриму (токены и т.п.)
         self.last_usage: Optional[Dict[str, Any]] = None
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _mask_api_key(self, value: str) -> str:
         token = str(value or "")
         if len(token) <= 10:
             return "***"
         return token[:6] + "***" + token[-4:]
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _log_struct(self, level: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if self.logger is None:
@@ -47,10 +58,12 @@ class GPTModel:
         except Exception:
             pass
 
-    async def get_model_price_rub_per_1m(self, model_id: str) -> Optional[Dict[str, float]]:
-        table = await self.get_pricing_rub_per_1m()
-        return table.get((model_id or "").strip())
-    
+    # === Тарифы и стоимость ===
+
+    # Получает/кэширует таблицу цен ProxyAPI и возвращает цену конкретной модели в формате RUB за 1M токенов.
+
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+
     async def get_pricing_rub_per_1m(self) -> Dict[str, Dict[str, float]]:
         """
         Парсит https://proxyapi.ru/pricing/list по таблице (<tr>/<td>) и возвращает:
@@ -166,6 +179,18 @@ class GPTModel:
 
         self._pricing_cache = pricing
         return pricing
+
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+
+    async def get_model_price_rub_per_1m(self, model_id: str) -> Optional[Dict[str, float]]:
+        table = await self.get_pricing_rub_per_1m()
+        return table.get((model_id or "").strip())
+
+    # === Стриминг через ProxyAPI ===
+
+    # Собирает messages из system/history/user, открывает SSE-стрим и отдаёт чанки текста с обновлением usage-статистики.
+
+    # Унифицирует стриминг chat/responses endpoint: собирает payload, обрабатывает SSE-события, извлекает usage и отдаёт текст по мере генерации.
 
     async def stream_chat(
         self,

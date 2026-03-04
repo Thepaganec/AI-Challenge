@@ -7,6 +7,13 @@ sys.dont_write_bytecode = True
 
 
 class AgentClient:
+
+    # === Инициализация и состояние клиента ===
+
+    # Создаёт транспортные поля клиента и кеши последнего ответа, чтобы UI мог читать метрики после любого RPC/стрима.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
         self.host = host
         self.port = port
@@ -27,13 +34,23 @@ class AgentClient:
         self.last_token_stats: Dict[str, Any] = {}
         self.last_profile_info: Dict[str, Any] = {}
 
+    # === Управление TCP-соединением ===
+
+    # Проверяет живость сокета, открывает/закрывает подключение и классифицирует сетевые ошибки для повторной попытки запроса.
+
+    # Вычисляет булев признак состояния, который используется для ветвления дальнейшей логики.
+
     def _is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing() and self._reader is not None
+
+    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
 
     async def _ensure_connection(self) -> None:
         if self._is_connected():
             return
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _close_connection(self) -> None:
         writer = self._writer
@@ -47,8 +64,16 @@ class AgentClient:
         except Exception:
             pass
 
+    # Вычисляет булев признак состояния, который используется для ветвления дальнейшей логики.
+
     def _is_connection_error(self, e: Exception) -> bool:
         return isinstance(e, (ConnectionError, BrokenPipeError, ConnectionResetError, OSError, asyncio.IncompleteReadError))
+
+    # === Базовый RPC-протокол ===
+
+    # Отправляет JSONL-запрос, собирает обычный или chunked-ответ и поднимает исключение, если сервер вернул ошибку.
+
+    # Базовый клиентский transport: сериализует JSONL-запрос, читает line-based ответ и прозрачно склеивает chunked-ответ в единый объект.
 
     async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with self._conn_lock:
@@ -106,9 +131,17 @@ class AgentClient:
                 raise last_error
             raise RuntimeError("RPC failed")
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _raise_if_error(self, msg: Dict[str, Any]) -> None:
         if msg.get("type") == "error":
             raise RuntimeError(msg.get("message") or "Agent error")
+
+    # === Операции с сессиями и ветками ===
+
+    # Обёртки над server-actions для списка сессий, загрузки конкретной сессии и навигации по веткам/чекпоинтам.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def ping(self) -> bool:
         try:
@@ -117,11 +150,15 @@ class AgentClient:
         except Exception:
             return False
 
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
+
     async def list_sessions(self) -> List[dict]:
         msg = await self._rpc({"action": "list_sessions"})
         if msg.get("type") == "sessions":
             return msg.get("sessions") or []
         return []
+
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
 
     async def get_session(self, session_id: str) -> Optional[dict]:
         msg = await self._rpc({"action": "get_session", "session_id": session_id})
@@ -130,10 +167,14 @@ class AgentClient:
         self._raise_if_error(msg)
         return None
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     async def reset_session(self, session_id: str) -> bool:
         msg = await self._rpc({"action": "reset_session", "session_id": session_id})
         self._raise_if_error(msg)
         return msg.get("type") == "ok"
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def switch_branch(self, session_id: str, branch_id: str) -> str:
         msg = await self._rpc(
@@ -148,6 +189,8 @@ class AgentClient:
             return (msg.get("active_branch") or branch_id or "main").strip() or "main"
         raise RuntimeError(msg.get("message") or "Agent error")
 
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
+
     async def list_branches(self, session_id: str) -> Dict[str, Any]:
         msg = await self._rpc({"action": "list_branches", "session_id": session_id})
         self._raise_if_error(msg)
@@ -157,6 +200,8 @@ class AgentClient:
                 "active_branch": msg.get("active_branch") or "main",
             }
         return {"branches": [], "active_branch": "main"}
+
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
 
     async def list_checkpoints(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
         msg = await self._rpc(
@@ -174,6 +219,8 @@ class AgentClient:
             }
         return {"checkpoints": [], "active_branch": branch_id or "main"}
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
         msg = await self._rpc(
             {
@@ -190,6 +237,8 @@ class AgentClient:
             cp = msg.get("checkpoint") if isinstance(msg.get("checkpoint"), dict) else {}
             return str(cp.get("id") or "")
         raise RuntimeError(msg.get("message") or "Agent error")
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
         msg = await self._rpc(
@@ -209,6 +258,8 @@ class AgentClient:
             return msg.get("branch_id") or ""
         raise RuntimeError(msg.get("message") or "Agent error")
 
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+
     async def get_memory(self, session_id: str, branch_id: str = "") -> Dict[str, Any]:
         msg = await self._rpc(
             {
@@ -227,6 +278,12 @@ class AgentClient:
             }
         return {"active_branch": branch_id or "main", "memory_layers": {}}
 
+    # === Операции с профилями ===
+
+    # CRUD-операции профилей пользователя и переключение активного профиля, который влияет на системный контекст запроса.
+
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
+
     async def list_profiles(self) -> Dict[str, Any]:
         msg = await self._rpc({"action": "list_profiles"})
         self._raise_if_error(msg)
@@ -237,6 +294,8 @@ class AgentClient:
             }
         return {"profiles": [], "active_profile": ""}
 
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+
     async def get_profile(self, profile_name: str) -> Optional[Dict[str, Any]]:
         msg = await self._rpc({"action": "get_profile", "profile_name": profile_name})
         self._raise_if_error(msg)
@@ -245,6 +304,8 @@ class AgentClient:
             if isinstance(profile, dict):
                 return profile
         return None
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def save_profile(self, profile_name: str, description: str) -> Dict[str, Any]:
         msg = await self._rpc(
@@ -261,6 +322,8 @@ class AgentClient:
             "active_profile": msg.get("active_profile") or "",
         }
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     async def delete_profile(self, profile_name: str) -> Dict[str, Any]:
         msg = await self._rpc({"action": "delete_profile", "profile_name": profile_name})
         self._raise_if_error(msg)
@@ -269,6 +332,8 @@ class AgentClient:
             "profiles": msg.get("profiles") or [],
             "active_profile": msg.get("active_profile") or "",
         }
+
+    # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
 
     async def set_active_profile(self, profile_name: str) -> Dict[str, Any]:
         msg = await self._rpc({"action": "set_active_profile", "profile_name": profile_name})
@@ -279,6 +344,8 @@ class AgentClient:
             "active_profile": msg.get("active_profile") or "",
         }
 
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+
     async def get_profile_state(self) -> Dict[str, Any]:
         msg = await self._rpc({"action": "get_profile_state"})
         self._raise_if_error(msg)
@@ -288,6 +355,12 @@ class AgentClient:
                 "active_profile": msg.get("active_profile") or "",
             }
         return {"profiles": [], "active_profile": ""}
+
+    # === Стриминг ответов модели ===
+
+    # Запускает stream_chat на сервере, отдаёт чанки в UI и сохраняет итоговые usage/token/profile метрики в полях клиента.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def save_memory(self, session_id: str, branch_id: str, layer: str, value: str, key: str = "") -> Dict[str, Any]:
         msg = await self._rpc(
@@ -306,6 +379,8 @@ class AgentClient:
             self.last_memory_layers = layers
             return {"ok": True, "active_branch": msg.get("active_branch"), "memory_layers": layers}
         return {"ok": False, "active_branch": branch_id, "memory_layers": {}}
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def stream_chat(
         self,

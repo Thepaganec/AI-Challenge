@@ -11,6 +11,12 @@ class MainWindow(QMainWindow):
     file_name = f"{os.path.splitext(os.path.basename(__file__))[0]}.json"
     CONFIG_FILE = os.path.join(path, file_name)
 
+    # === Инициализация окна ===
+
+    # Собирает вкладки приложения, применяет тему и восстанавливает состояние интерфейса из локального json-конфига.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, logger: Logger):
         super().__init__()
         self.logger = logger
@@ -23,6 +29,8 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.load_window_state()
         self.logger.success("Главное окно готово к работе")
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def init_ui(self):
         self.metrics_memory_tab = MetricsMemoryTab(logger=self.logger)
@@ -39,6 +47,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 5, 0, 0)
         layout.addWidget(self.tab_widget)
 
+    # === Сохранение и восстановление состояния ===
+
+    # Сериализует геометрию/вкладки главного окна и при старте аккуратно восстанавливает их из сохранённого файла.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def save_window_state(self):
         state = {
             "geometry": self.saveGeometry().toHex().data().decode(),
@@ -48,6 +62,8 @@ class MainWindow(QMainWindow):
             json.dump(state, f, ensure_ascii=False, indent=2)
 
         self.logger.success("Состояние окна сохранено")
+
+    # Загружает данные из источника, нормализует формат и возвращает объект, пригодный для дальнейшей обработки.
 
     def load_window_state(self):
         if not os.path.exists(self.CONFIG_FILE):
@@ -61,6 +77,12 @@ class MainWindow(QMainWindow):
             self.logger.debug("Состояние окна загружено")
         except Exception as e:
             self.logger.error(f"Ошибка загрузки состояния окна: {e}")
+
+    # === Завершение приложения ===
+
+    # Перед закрытием гарантированно сохраняет состояние окна, чтобы не терялась раскладка интерфейса.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def closeEvent(self, event):
         self.logger.info("Закрытие приложения, сохранение состояния")

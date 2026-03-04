@@ -9,11 +9,20 @@ def _now_str() -> str:
 
 
 class AgentProfileStore:
+
+    # === Инициализация и формат данных ===
+
+    # Подготавливает путь профилей и задаёт эталонную схему данных, чтобы все операции работали с единым форматом.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, file_path: str):
         self.file_path = file_path
         parent = os.path.dirname(self.file_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _default_data(self) -> Dict[str, Any]:
         return {
@@ -21,6 +30,8 @@ class AgentProfileStore:
             "profiles": {},
             "updated_at": _now_str(),
         }
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _normalize(self, data: Any) -> Dict[str, Any]:
         if not isinstance(data, dict):
@@ -58,6 +69,12 @@ class AgentProfileStore:
             "updated_at": str(data.get("updated_at") or _now_str()),
         }
 
+    # === Файловые операции ===
+
+    # Безопасно читает и сохраняет profiles.json, всегда возвращая валидную структуру даже после частично повреждённых данных.
+
+    # Загружает данные из источника, нормализует формат и возвращает объект, пригодный для дальнейшей обработки.
+
     def load(self) -> Dict[str, Any]:
         if not os.path.exists(self.file_path):
             return self._default_data()
@@ -68,6 +85,8 @@ class AgentProfileStore:
         except Exception:
             return self._default_data()
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def save(self, data: Dict[str, Any]) -> Dict[str, Any]:
         normalized = self._normalize(data)
         normalized["updated_at"] = _now_str()
@@ -75,11 +94,19 @@ class AgentProfileStore:
             json.dump(normalized, f, ensure_ascii=False, indent=2)
         return normalized
 
+    # === Управление профилями ===
+
+    # Предоставляет список, чтение, сохранение, удаление и переключение активного профиля для серверного контекста.
+
+    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
+
     def list_profiles(self) -> List[str]:
         data = self.load()
         names = list((data.get("profiles") or {}).keys())
         names.sort(key=lambda x: x.lower())
         return names
+
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
 
     def get_profile(self, name: str) -> Optional[Dict[str, str]]:
         clean_name = str(name or "").strip()
@@ -96,6 +123,8 @@ class AgentProfileStore:
             "created_at": str(item.get("created_at") or ""),
             "updated_at": str(item.get("updated_at") or ""),
         }
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def save_profile(self, name: str, description: str) -> Dict[str, Any]:
         clean_name = str(name or "").strip()
@@ -114,6 +143,8 @@ class AgentProfileStore:
         data["profiles"] = profiles
         return self.save(data)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def delete_profile(self, name: str) -> Dict[str, Any]:
         clean_name = str(name or "").strip()
         data = self.load()
@@ -125,12 +156,16 @@ class AgentProfileStore:
         data["profiles"] = profiles
         return self.save(data)
 
+    # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
+
     def set_active_profile(self, name: str) -> Dict[str, Any]:
         clean_name = str(name or "").strip()
         data = self.load()
         profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
         data["active_profile"] = clean_name if clean_name in profiles else ""
         return self.save(data)
+
+    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
 
     def get_state(self) -> Dict[str, Any]:
         data = self.load()

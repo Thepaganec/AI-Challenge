@@ -35,6 +35,12 @@ class LLMAgentServer:
     - Branching (ветки от checkpoint)
     """
 
+    # === Инициализация сервера ===
+
+    # Создаёт хранилища сессий/профилей, GPT-клиент, кэш тарифов и таблицу роутинга action->handler для JSONL протокола.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -85,6 +91,8 @@ class LLMAgentServer:
             "gpt-5.2-chat-latest": 400000,
         }
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     async def preload_pricing(self) -> None:
         try:
             self.logger.write("INFO", "Загрузка тарифов ProxyAPI (pricing/list)...")
@@ -94,26 +102,18 @@ class LLMAgentServer:
             self.logger.write("WARN", "Не удалось загрузить тарифы ProxyAPI", extra=str(e))
             self.pricing_cache = {}
 
-    def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> Optional[float]:
-        try:
-            price = self.pricing_cache.get((model_id or "").strip())
-            if not isinstance(price, dict):
-                return None
+    # === Транспорт JSONL ===
 
-            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    # Отправляет ответы клиенту обычной строкой или по частям, а также унифицирует отправку сообщений об ошибке.
 
-            return (
-                (float(prompt_tokens) / 1_000_000.0) * float(price.get("in", 0))
-                + (float(completion_tokens) / 1_000_000.0) * float(price.get("out", 0))
-            )
-        except Exception:
-            return None
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
         data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         writer.write(data)
         await writer.drain()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
         text = json.dumps(payload, ensure_ascii=False)
@@ -139,6 +139,17 @@ class LLMAgentServer:
         end = {"type": "chunked_end", "orig_type": payload.get("type")}
         writer.write((json.dumps(end, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    async def _send_error(self, writer: asyncio.StreamWriter, message: str) -> None:
+        await self._send_json(writer, {"type": "error", "message": message})
+
+    # === Работа с ветками и чекпоинтами ===
+
+    # Нормализует структуру ветки, подготавливает историю и память, создаёт чекпоинты и новые ветки от среза диалога.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _get_branch(self, session: Dict[str, Any], branch_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
         branches = session.get("branches") or {}
@@ -174,6 +185,28 @@ class LLMAgentServer:
         self._ensure_branch_memory_model(branches[bid])
         return bid, branches[bid]
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _branch_history(self, branch: Dict[str, Any]) -> List[Dict[str, str]]:
+        h = branch.get("history")
+        if not isinstance(h, list):
+            h = []
+            branch["history"] = h
+
+        normalized: List[Dict[str, str]] = []
+        for m in h:
+            if not isinstance(m, dict):
+                continue
+            role = (m.get("role") or "").strip()
+            content = m.get("content")
+            if role and content is not None:
+                normalized.append({"role": role, "content": str(content)})
+
+        branch["history"] = normalized
+        return branch["history"]
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _make_checkpoint(self, history: List[Dict[str, str]], name: Optional[str] = None) -> Dict[str, Any]:
         cut = 0
         try:
@@ -192,6 +225,8 @@ class LLMAgentServer:
             "cut": cut,  # индекс "после последнего сообщения"
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _create_branch_from_checkpoint(self, session: Dict[str, Any], base_branch_id: str, checkpoint: Dict[str, Any], name: Optional[str] = None) -> str:
         branches = session.get("branches")
@@ -230,23 +265,7 @@ class LLMAgentServer:
         session["branches"] = branches
         return new_id
 
-    def _branch_history(self, branch: Dict[str, Any]) -> List[Dict[str, str]]:
-        h = branch.get("history")
-        if not isinstance(h, list):
-            h = []
-            branch["history"] = h
-
-        normalized: List[Dict[str, str]] = []
-        for m in h:
-            if not isinstance(m, dict):
-                continue
-            role = (m.get("role") or "").strip()
-            content = m.get("content")
-            if role and content is not None:
-                normalized.append({"role": role, "content": str(content)})
-
-        branch["history"] = normalized
-        return branch["history"]
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _copy_memory_layers(self, layers: Any) -> Dict[str, Any]:
         if not isinstance(layers, dict):
@@ -260,17 +279,32 @@ class LLMAgentServer:
             "long_term": dict(long_term) if isinstance(long_term, dict) else {},
         }
 
+    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
+
     def _ensure_branch_memory_model(self, branch: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(branch.get("summary"), str):
             branch["summary"] = ""
         branch["memory_layers"] = self._copy_memory_layers(branch.get("memory_layers"))
         return branch["memory_layers"]
 
+    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
+
+    def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
+        self.memory_store.set_title_if_empty(session, user_text)
+
+    # === Подготовка контекста и метрик ===
+
+    # Собирает системный контекст (memory/profile/summary), оценивает токены, пишет структурные логи API и считает стоимость ответа.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _estimate_tokens_text(self, text: str) -> int:
         clean = (text or "").strip()
         if not clean:
             return 0
         return max(1, int(len(clean) / 4))
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _estimate_tokens_messages(self, messages: List[Dict[str, str]]) -> int:
         total = 0
@@ -281,9 +315,164 @@ class LLMAgentServer:
             total += 4
         return int(total)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _resolve_context_limit(self, model: str) -> int:
         model_id = (model or "").strip()
         return int(self._model_context_limit.get(model_id, 128000))
+
+    # Собирает производные данные/текст из текущего состояния, чтобы использовать их как часть контекста или итогового ответа.
+
+    def _build_memory_system_text(self, memory_layers: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(memory_layers, dict):
+            return None
+        working = memory_layers.get("working")
+        long_term = memory_layers.get("long_term")
+        lines: List[str] = []
+        if isinstance(working, dict) and working:
+            lines.append("WORKING MEMORY:")
+            for k, v in working.items():
+                if k and v is not None:
+                    lines.append(f"- {k}: {v}")
+        if isinstance(long_term, dict) and long_term:
+            lines.append("LONG-TERM MEMORY:")
+            for k, v in long_term.items():
+                if k and v is not None:
+                    lines.append(f"- {k}: {v}")
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    # Собирает производные данные/текст из текущего состояния, чтобы использовать их как часть контекста или итогового ответа.
+
+    def _build_profile_system_text(self, profile_name: str, profile_description: str) -> Optional[str]:
+        clean_name = str(profile_name or "").strip()
+        clean_desc = str(profile_description or "").strip()
+        if not clean_name or not clean_desc:
+            return None
+        return (
+            "USER PROFILE:\n"
+            f"- name: {clean_name}\n"
+            f"- description: {clean_desc}\n"
+            "Follow this profile automatically when generating the answer."
+        )
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _merge_system_text(self, *chunks: Optional[str]) -> Optional[str]:
+        parts = [str(c).strip() for c in chunks if isinstance(c, str) and str(c).strip()]
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _stringify_history_for_summary(self, messages: List[Dict[str, str]]) -> str:
+        lines: List[str] = []
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip().lower()
+            content = str(m.get("content") or "").strip()
+            if not role or not content:
+                continue
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines).strip()
+
+    # Сжимает старую часть истории через отдельный LLM-вызов, чтобы сохранить долгосрочный контекст и уменьшить объём токенов в рабочих запросах.
+
+    async def _summarize_history_with_llm(
+        self,
+        *,
+        older_history: List[Dict[str, str]],
+        model: str,
+        endpoint: str,
+        temperature: Optional[float],
+        max_tokens: int,
+        trace_id: str,
+    ) -> str:
+        transcript = self._stringify_history_for_summary(older_history)
+        if not transcript:
+            return ""
+
+        summary_system = (
+            "You summarize dialogue history in Russian.\n"
+            "Keep only durable facts, constraints, decisions, and open tasks.\n"
+            "Do not include greetings, filler, or repeated details.\n"
+            "Output compact bullet points."
+        )
+
+        parts: List[str] = []
+        gen = None
+        try:
+            gen = self.gpt.stream_chat(
+                user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
+                system_text=summary_system,
+                history=[],
+                max_tokens=max_tokens,
+                model=model,
+                endpoint=endpoint,
+                temperature=temperature,
+                include_usage=False,
+                trace_id=f"{trace_id}-summary",
+            )
+            async for chunk in gen:
+                if chunk:
+                    parts.append(chunk)
+        finally:
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except Exception:
+                    pass
+        return "".join(parts).strip()
+
+    # Сохраняет или фиксирует данные в целевом хранилище с базовой валидацией входных параметров.
+
+    def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
+        layer_key = (layer or "").strip().lower()
+        memory_layers = memory_layers if isinstance(memory_layers, dict) else {}
+        if layer_key == "short_term":
+            short_term = memory_layers.get("short_term")
+            if not isinstance(short_term, list):
+                short_term = []
+            short_term.append(
+                {
+                    "key": key or "note",
+                    "value": value,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            if len(short_term) > 50:
+                short_term = short_term[-50:]
+            memory_layers["short_term"] = short_term
+            return True
+        if layer_key in ("working", "long_term"):
+            bucket = memory_layers.get(layer_key)
+            if not isinstance(bucket, dict):
+                bucket = {}
+            clean_key = (key or "").strip() or "note"
+            bucket[clean_key] = value
+            memory_layers[layer_key] = bucket
+            return True
+        return False
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, str]], max_items: int = 20) -> None:
+        if not isinstance(memory_layers, dict):
+            return
+        synced: List[Dict[str, str]] = []
+        for msg in history[-max_items:]:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = str(msg.get("content") or "").strip()
+            if role and content:
+                synced.append({"key": role, "value": content})
+        memory_layers["short_term"] = synced
+
+    # Формирует расширенный SERVER_API_REQUEST лог с оценкой токенов, режимом контекста и параметрами памяти для последующего анализа качества запросов.
 
     def _log_api_request(
         self,
@@ -333,151 +522,34 @@ class LLMAgentServer:
         except Exception as e:
             self.logger.write("WARN", "Не удалось сформировать API_REQUEST лог", extra=str(e))
 
-    def _build_memory_system_text(self, memory_layers: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(memory_layers, dict):
-            return None
-        working = memory_layers.get("working")
-        long_term = memory_layers.get("long_term")
-        lines: List[str] = []
-        if isinstance(working, dict) and working:
-            lines.append("WORKING MEMORY:")
-            for k, v in working.items():
-                if k and v is not None:
-                    lines.append(f"- {k}: {v}")
-        if isinstance(long_term, dict) and long_term:
-            lines.append("LONG-TERM MEMORY:")
-            for k, v in long_term.items():
-                if k and v is not None:
-                    lines.append(f"- {k}: {v}")
-        if not lines:
-            return None
-        return "\n".join(lines)
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
-    def _merge_system_text(self, *chunks: Optional[str]) -> Optional[str]:
-        parts = [str(c).strip() for c in chunks if isinstance(c, str) and str(c).strip()]
-        if not parts:
-            return None
-        return "\n\n".join(parts)
-
-    def _build_profile_system_text(self, profile_name: str, profile_description: str) -> Optional[str]:
-        clean_name = str(profile_name or "").strip()
-        clean_desc = str(profile_description or "").strip()
-        if not clean_name or not clean_desc:
-            return None
-        return (
-            "USER PROFILE:\n"
-            f"- name: {clean_name}\n"
-            f"- description: {clean_desc}\n"
-            "Follow this profile automatically when generating the answer."
-        )
-
-    def _stringify_history_for_summary(self, messages: List[Dict[str, str]]) -> str:
-        lines: List[str] = []
-        for m in messages or []:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "").strip().lower()
-            content = str(m.get("content") or "").strip()
-            if not role or not content:
-                continue
-            lines.append(f"{role}: {content}")
-        return "\n".join(lines).strip()
-
-    async def _summarize_history_with_llm(
-        self,
-        *,
-        older_history: List[Dict[str, str]],
-        model: str,
-        endpoint: str,
-        temperature: Optional[float],
-        max_tokens: int,
-        trace_id: str,
-    ) -> str:
-        transcript = self._stringify_history_for_summary(older_history)
-        if not transcript:
-            return ""
-
-        summary_system = (
-            "You summarize dialogue history in Russian.\n"
-            "Keep only durable facts, constraints, decisions, and open tasks.\n"
-            "Do not include greetings, filler, or repeated details.\n"
-            "Output compact bullet points."
-        )
-
-        parts: List[str] = []
-        gen = None
+    def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> Optional[float]:
         try:
-            gen = self.gpt.stream_chat(
-                user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
-                system_text=summary_system,
-                history=[],
-                max_tokens=max_tokens,
-                model=model,
-                endpoint=endpoint,
-                temperature=temperature,
-                include_usage=False,
-                trace_id=f"{trace_id}-summary",
+            price = self.pricing_cache.get((model_id or "").strip())
+            if not isinstance(price, dict):
+                return None
+
+            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+
+            return (
+                (float(prompt_tokens) / 1_000_000.0) * float(price.get("in", 0))
+                + (float(completion_tokens) / 1_000_000.0) * float(price.get("out", 0))
             )
-            async for chunk in gen:
-                if chunk:
-                    parts.append(chunk)
-        finally:
-            if gen is not None:
-                try:
-                    await gen.aclose()
-                except Exception:
-                    pass
-        return "".join(parts).strip()
+        except Exception:
+            return None
 
-    def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
-        layer_key = (layer or "").strip().lower()
-        memory_layers = memory_layers if isinstance(memory_layers, dict) else {}
-        if layer_key == "short_term":
-            short_term = memory_layers.get("short_term")
-            if not isinstance(short_term, list):
-                short_term = []
-            short_term.append(
-                {
-                    "key": key or "note",
-                    "value": value,
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-            if len(short_term) > 50:
-                short_term = short_term[-50:]
-            memory_layers["short_term"] = short_term
-            return True
-        if layer_key in ("working", "long_term"):
-            bucket = memory_layers.get(layer_key)
-            if not isinstance(bucket, dict):
-                bucket = {}
-            clean_key = (key or "").strip() or "note"
-            bucket[clean_key] = value
-            memory_layers[layer_key] = bucket
-            return True
-        return False
+    # === Обработчики команд клиента ===
 
-    def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, str]], max_items: int = 20) -> None:
-        if not isinstance(memory_layers, dict):
-            return
-        synced: List[Dict[str, str]] = []
-        for msg in history[-max_items:]:
-            if not isinstance(msg, dict):
-                continue
-            role = str(msg.get("role") or "").strip()
-            content = str(msg.get("content") or "").strip()
-            if role and content:
-                synced.append({"key": role, "value": content})
-        memory_layers["short_term"] = synced
+    # Реализует действия протокола: сессии, ветки, checkpoints, память, профили и основной chat-stream с сохранением результатов в стор.
 
-    def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
-        self.memory_store.set_title_if_empty(session, user_text)
-
-    async def _send_error(self, writer: asyncio.StreamWriter, message: str) -> None:
-        await self._send_json(writer, {"type": "error", "message": message})
+    # Обрабатывает действие 'ping' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_ping(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         await self._send_json(writer, {"type": "pong"})
+
+    # Обрабатывает действие 'list_sessions' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_list_sessions(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         sessions = self.memory_store.list_sessions()
@@ -497,6 +569,8 @@ class LLMAgentServer:
             },
         )
 
+    # Обрабатывает действие 'get_session' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_get_session(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
         if not session_id:
@@ -510,6 +584,8 @@ class LLMAgentServer:
                     self._ensure_branch_memory_model(branch)
         await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
 
+    # Обрабатывает действие 'reset_session' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_reset_session(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
         if not session_id:
@@ -517,6 +593,8 @@ class LLMAgentServer:
             return
         self.memory_store.delete_session_file(session_id)
         await self._send_json(writer, {"type": "ok"})
+
+    # Обрабатывает действие 'list_branches' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_list_branches(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
@@ -536,6 +614,8 @@ class LLMAgentServer:
 
         await self._send_json(writer, {"type": "branches", "branches": out, "active_branch": active})
 
+    # Обрабатывает действие 'switch_branch' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_switch_branch(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
         branch_id = (request.get("branch_id") or "").strip()
@@ -553,6 +633,8 @@ class LLMAgentServer:
         session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.memory_store.save_session(session)
         await self._send_json(writer, {"type": "ok", "ok": True, "active_branch": branch_id})
+
+    # Обрабатывает действие 'list_checkpoints' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_list_checkpoints(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
@@ -575,6 +657,8 @@ class LLMAgentServer:
             branch["checkpoints"] = cps
 
         await self._send_json(writer, {"type": "checkpoints", "checkpoints": cps, "active_branch": bid})
+
+    # Обрабатывает действие 'create_checkpoint' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_create_checkpoint(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
@@ -617,6 +701,8 @@ class LLMAgentServer:
             writer,
             {"type": "ok", "ok": True, "checkpoint_id": cp.get("id"), "checkpoint": cp, "active_branch": bid},
         )
+
+    # Обрабатывает действие 'create_branch' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_create_branch(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
@@ -663,6 +749,8 @@ class LLMAgentServer:
 
         await self._send_json(writer, {"type": "ok", "ok": True, "branch_id": new_bid, "active_branch": new_bid})
 
+    # Обрабатывает действие 'get_memory' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_get_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
         branch_id = (request.get("branch_id") or "").strip() or None
@@ -683,6 +771,8 @@ class LLMAgentServer:
                 "memory_layers": memory_layers,
             },
         )
+
+    # Обрабатывает действие 'save_memory' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_save_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         session_id = (request.get("session_id") or "").strip()
@@ -723,6 +813,8 @@ class LLMAgentServer:
             },
         )
 
+    # Обрабатывает действие 'list_profiles' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_list_profiles(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         state = self.profile_store.get_state()
         await self._send_json(
@@ -734,6 +826,8 @@ class LLMAgentServer:
             },
         )
 
+    # Обрабатывает действие 'get_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_get_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         profile_name = str(request.get("profile_name") or "").strip()
         if not profile_name:
@@ -744,6 +838,8 @@ class LLMAgentServer:
             await self._send_error(writer, "profile not found")
             return
         await self._send_json(writer, {"type": "profile", "profile": profile})
+
+    # Обрабатывает действие 'save_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_save_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         profile_name = str(request.get("profile_name") or "").strip()
@@ -767,6 +863,8 @@ class LLMAgentServer:
         except Exception as e:
             await self._send_error(writer, str(e))
 
+    # Обрабатывает действие 'delete_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_delete_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         profile_name = str(request.get("profile_name") or "").strip()
         if not profile_name:
@@ -784,6 +882,8 @@ class LLMAgentServer:
             },
         )
 
+    # Обрабатывает действие 'set_active_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_set_active_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         profile_name = str(request.get("profile_name") or "").strip()
         self.profile_store.set_active_profile(profile_name)
@@ -798,6 +898,8 @@ class LLMAgentServer:
             },
         )
 
+    # Обрабатывает действие 'get_profile_state' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+
     async def _handle_get_profile_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         state = self.profile_store.get_state()
         await self._send_json(
@@ -808,6 +910,8 @@ class LLMAgentServer:
                 "profiles": state.get("available_profiles") or [],
             },
         )
+
+    # Основной сценарий запроса: читает параметры стратегии, готовит контекст, запускает стрим к модели, обновляет ветку/память и возвращает done с полной телеметрией.
 
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         req_id = str(uuid.uuid4())[:8]
@@ -1087,6 +1191,12 @@ class LLMAgentServer:
                 except Exception:
                     pass
 
+    # === Цикл обслуживания сокета ===
+
+    # Читает входящий JSONL, роутит его в нужный handler и поддерживает сервер в режиме постоянного прослушивания.
+
+    # Запускает основной рабочий цикл и управляет потоком входящих/исходящих данных в рамках текущей роли компонента.
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         self.logger.write("INFO", "Клиент подключился", extra=str(peer))
@@ -1127,6 +1237,8 @@ class LLMAgentServer:
             except Exception:
                 pass
             self.logger.write("INFO", "Клиент отключился", extra=str(peer))
+
+    # Запускает основной рабочий цикл и управляет потоком входящих/исходящих данных в рамках текущей роли компонента.
 
     async def run(self) -> None:
         await self.preload_pricing()

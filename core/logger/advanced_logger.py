@@ -19,6 +19,12 @@ logging.Logger.success = _success
 class Logger(QObject):
     log_signal = Signal(str, str)  # Сигнал для GUI (текст, цвет)
 
+    # === Инициализация логгера ===
+
+    # Создаёт директорию и конфигурирует python-logging так, чтобы сообщения одновременно шли в файл, консоль и GUI-сигнал.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self):
         super().__init__()
 
@@ -26,6 +32,8 @@ class Logger(QObject):
         self.log_dir.mkdir(exist_ok=True)
         self.setup_logging()
         self.clean_old_logs()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def setup_logging(self):
         log_file = self.log_dir / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
@@ -47,6 +55,8 @@ class Logger(QObject):
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def clean_old_logs(self):
         now = datetime.now()
         for log_file in self.log_dir.glob("bot_*.log"):
@@ -56,6 +66,12 @@ class Logger(QObject):
                     os.remove(log_file)
             except ValueError:
                 continue
+
+    # === Единая точка логирования ===
+
+    # Нормализует уровни/цвета и отправляет событие в интерфейс, а затем пишет исходный текст в стандартные обработчики logging.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def log(self, level, message):
         colors = {
@@ -86,23 +102,45 @@ class Logger(QObject):
             else:
                 log_method(message, extra=extra)
 
+    # === Удобные обёртки уровней ===
+
+    # Сокращает вызовы логирования по уровням и держит единый формат сообщений через общий метод log.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def debug(self, message):
         self.log('debug', message)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def info(self, message):
         self.log('info', message)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def warning(self, message):
         self.log('warning', message)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def error(self, message):
         self.log('error', message)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def critical(self, message):
         self.log('critical', message)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def success(self, message):
         self.log('success', message)
+
+    # === Стандартизированная обработка исключений ===
+
+    # Преобразует исключение в читаемую строку контекста и сразу пишет его в error-лог.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def error_handler(self, e, context=""):
         error_msg = f"{context}: {type(e).__name__}: {str(e)}"

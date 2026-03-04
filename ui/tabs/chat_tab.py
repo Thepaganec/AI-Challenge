@@ -20,6 +20,12 @@ class ChatTab(BaseTab):
     file_name = f"{os.path.splitext(os.path.basename(__file__))[0]}.json"
     CONFIG_FILE = os.path.join(path, file_name)
 
+    # === Инициализация и сборка UI ===
+
+    # Инициализирует состояние текущей сессии/ветки, связывает контролы с обработчиками и строит полный интерфейс чат-вкладки.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, logger, metrics_memory_tab: MetricsMemoryTab | None = None):
         super().__init__(logger)
 
@@ -77,12 +83,7 @@ class ChatTab(BaseTab):
         asyncio.get_event_loop().create_task(self.preload_agent_status())
         asyncio.get_event_loop().create_task(self.refresh_sessions_list_offline_first())
 
-    async def refresh_sessions_list_offline_first(self):
-        # сразу покажем текущую сессию (даже если агент оффлайн)
-        self.render_sessions_list_offline()
-        await asyncio.sleep(0.1)
-        if self.is_agent_connected:
-            await self.refresh_sessions_list()
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def init_content(self):
         font = QFont()
@@ -415,69 +416,16 @@ class ChatTab(BaseTab):
         self.input_editbox.installEventFilter(self)
         self.output_editbox.setMinimumHeight(160)
 
-    def on_clear_output_clicked(self):
-        """
-        Очищает только окно вывода (без влияния на историю на сервере).
-        История в сессии не трогается.
-        """
-        self.output_editbox.clear()
+    # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
 
-    def _clear_session_dependent_ui(self, clear_input: bool = False):
-        self.output_editbox.clear()
-        self.facts_box.clear()
-        self.metrics_memory_tab.clear_panels()
-        self.sent_len_label.setText("API context tokens(est): N/A")
-        self.branch_selector.blockSignals(True)
-        self.branch_selector.clear()
-        self.branch_selector.blockSignals(False)
-        self.checkpoint_selector.clear()
-        self.checkpoint_name.clear()
-        self.new_branch_name.clear()
-        if clear_input:
-            self.input_editbox.clear()
-
-    def _reset_branch_ui_to_main(self):
-        self.current_branch_id = "main"
-        self.branch_selector.blockSignals(True)
-        self.branch_selector.clear()
-        self.branch_selector.addItem("main (main)", "main")
-        self.branch_selector.setCurrentIndex(0)
-        self.branch_selector.blockSignals(False)
-        self.checkpoint_selector.clear()
-
-    def _tick_refresh_sessions_list(self):
-        """
-        Таймер раз в N мс обновляет список сессий.
-        Метод НЕ async, поэтому создаём задачу через event loop.
-        Защита от параллельных запусков, чтобы не спамить запросами к агенту.
-        """
-        if not self.is_agent_connected:
-            return
-
-        if getattr(self, "_sessions_refresh_inflight", False):
-            return
-
-        self._sessions_refresh_inflight = True
-
-        async def _run():
-            try:
-                await self.refresh_sessions_list()
-            finally:
-                self._sessions_refresh_inflight = False
-
-        try:
-            asyncio.get_event_loop().create_task(_run())
-        except Exception:
-            # если по какой-то причине нет event loop — просто снимаем флаг
-            self._sessions_refresh_inflight = False
-
-    # ======= UI helpers =======
     def set_loading(self, is_loading: bool):
         if is_loading:
             self.progress_bar.setRange(0, 0)
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def eventFilter(self, obj, event):
         if obj is self.input_editbox and event.type() == QEvent.KeyPress:
@@ -490,6 +438,50 @@ class ChatTab(BaseTab):
                 self.on_send_message()
                 return True
         return super().eventFilter(obj, event)
+
+    # === Сохранение layout вкладки ===
+
+    # Отслеживает изменения сплиттеров и сохраняет/восстанавливает геометрию панели чата между запусками приложения.
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
+    def on_splitter_moved(self):
+        self.splitter_move_timer.start(300)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def save_window_state(self):
+        try:
+            state = {
+                "log_splitter": self.log_splitter.saveState().toHex().data().decode(),
+                "vertical_splitter": self.vertical_splitter.saveState().toHex().data().decode(),
+            }
+            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.logger.error_handler(e, context="ChatTab -> save_window_state")
+
+    # Загружает данные из источника, нормализует формат и возвращает объект, пригодный для дальнейшей обработки.
+
+    def load_window_state(self):
+        if not os.path.exists(self.CONFIG_FILE):
+            return
+        try:
+            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            if "log_splitter" in state:
+                self.log_splitter.restoreState(QByteArray.fromHex(str(state["log_splitter"]).encode()))
+            if "vertical_splitter" in state:
+                self.vertical_splitter.restoreState(QByteArray.fromHex(str(state["vertical_splitter"]).encode()))
+        except Exception as e:
+            self.logger.error(f"Ошибка загрузки состояния окна для вкладки ChatTab: {e}")
+
+    # === Бутстрап соединения и профилей ===
+
+    # Проверяет доступность агента, поднимает начальные данные профилей и синхронизирует элементы профилей в интерфейсе.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def preload_agent_status(self):
         try:
@@ -509,6 +501,30 @@ class ChatTab(BaseTab):
             self.logger.warning(f"Не удалось подключиться к агенту: {e}")
             self._set_profile_none_ui()
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    async def bootstrap_profile_ui(self):
+        if not self.is_agent_connected:
+            self._set_profile_none_ui()
+            return
+        try:
+            # По ТЗ на старте UI профиль должен быть не выбран.
+            await self.agent.set_active_profile("")
+            state = await self.agent.get_profile_state()
+            profiles = state.get("profiles") if isinstance(state.get("profiles"), list) else []
+            self._populate_profile_selector(profiles=profiles, active_profile="")
+            self.profile_description_input.clear()
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+            self.active_profile_name = ""
+        except Exception as e:
+            self.logger.warning(f"Не удалось инициализировать профили: {e}")
+            self._set_profile_none_ui()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _set_profile_none_ui(self):
         self._profile_selector_changing = True
         try:
@@ -523,6 +539,8 @@ class ChatTab(BaseTab):
             self.active_profile_name = ""
         finally:
             self._profile_selector_changing = False
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _populate_profile_selector(self, profiles: list[str], active_profile: str = ""):
         clean_active = str(active_profile or "").strip()
@@ -546,36 +564,22 @@ class ChatTab(BaseTab):
         finally:
             self._profile_selector_changing = False
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def _selected_profile_name(self) -> str:
         text = str(self.profile_selector.currentText() or "").strip()
         if not text or text == self.profile_none_label:
             return ""
         return text
 
-    async def bootstrap_profile_ui(self):
-        if not self.is_agent_connected:
-            self._set_profile_none_ui()
-            return
-        try:
-            # По ТЗ на старте UI профиль должен быть не выбран.
-            await self.agent.set_active_profile("")
-            state = await self.agent.get_profile_state()
-            profiles = state.get("profiles") if isinstance(state.get("profiles"), list) else []
-            self._populate_profile_selector(profiles=profiles, active_profile="")
-            self.profile_description_input.clear()
-            self.profile_use_toggle.blockSignals(True)
-            self.profile_use_toggle.setChecked(False)
-            self.profile_use_toggle.blockSignals(False)
-            self.profile_use_toggle.setEnabled(False)
-            self.active_profile_name = ""
-        except Exception as e:
-            self.logger.warning(f"Не удалось инициализировать профили: {e}")
-            self._set_profile_none_ui()
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_profile_selected(self, _index=None):
         if self._profile_selector_changing:
             return
         asyncio.get_event_loop().create_task(self._on_profile_selected_async())
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_profile_text_changed(self, _text: str):
         if self._profile_selector_changing:
@@ -586,6 +590,8 @@ class ChatTab(BaseTab):
             self.profile_use_toggle.setChecked(False)
             self.profile_use_toggle.blockSignals(False)
             self.profile_use_toggle.setEnabled(False)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _on_profile_selected_async(self):
         selected = self._selected_profile_name()
@@ -620,8 +626,12 @@ class ChatTab(BaseTab):
         except Exception as e:
             self.logger.warning(f"Не удалось выбрать профиль: {e}")
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_save_profile_clicked(self, _checked=False):
         asyncio.get_event_loop().create_task(self._save_profile_async())
+
+    # Сохраняет или фиксирует данные в целевом хранилище с базовой валидацией входных параметров.
 
     async def _save_profile_async(self):
         if not self.is_agent_connected:
@@ -646,8 +656,12 @@ class ChatTab(BaseTab):
         except Exception as e:
             self.logger.warning(f"Не удалось сохранить профиль: {e}")
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_delete_profile_clicked(self, _checked=False):
         asyncio.get_event_loop().create_task(self._delete_profile_async())
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _delete_profile_async(self):
         if not self.is_agent_connected:
@@ -672,6 +686,8 @@ class ChatTab(BaseTab):
         except Exception as e:
             self.logger.warning(f"Не удалось удалить профиль: {e}")
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_profile_toggle_changed(self, checked: bool):
         if not checked:
             return
@@ -682,6 +698,49 @@ class ChatTab(BaseTab):
             self.profile_use_toggle.setEnabled(False)
             self.logger.warning("Нельзя включить персонализацию без выбранного профиля.")
 
+    # === Список сессий и загрузка состояния ===
+
+    # Показывает offline-список, периодически синхронизируется с сервером и загружает выбранную сессию вместе с ветками/checkpoints.
+
+    # Запрашивает актуальные данные и обновляет текущий экран/состояние, сохраняя консистентность активного контекста.
+
+    async def refresh_sessions_list_offline_first(self):
+        # сразу покажем текущую сессию (даже если агент оффлайн)
+        self.render_sessions_list_offline()
+        await asyncio.sleep(0.1)
+        if self.is_agent_connected:
+            await self.refresh_sessions_list()
+
+    # Периодический таймерный обработчик: запускает лёгкую синхронизацию и не блокирует основной поток интерфейса.
+
+    def _tick_refresh_sessions_list(self):
+        """
+        Таймер раз в N мс обновляет список сессий.
+        Метод НЕ async, поэтому создаём задачу через event loop.
+        Защита от параллельных запусков, чтобы не спамить запросами к агенту.
+        """
+        if not self.is_agent_connected:
+            return
+
+        if getattr(self, "_sessions_refresh_inflight", False):
+            return
+
+        self._sessions_refresh_inflight = True
+
+        async def _run():
+            try:
+                await self.refresh_sessions_list()
+            finally:
+                self._sessions_refresh_inflight = False
+
+        try:
+            asyncio.get_event_loop().create_task(_run())
+        except Exception:
+            # если по какой-то причине нет event loop — просто снимаем флаг
+            self._sessions_refresh_inflight = False
+
+    # Преобразует входные данные в представление для интерфейса и обновляет видимые панели без изменения бизнес-данных.
+
     def render_sessions_list_offline(self):
         self.sessions_list.blockSignals(True)
         self.sessions_list.clear()
@@ -689,6 +748,8 @@ class ChatTab(BaseTab):
         item.setData(Qt.UserRole, self.current_session_id)
         self.sessions_list.addItem(item)
         self.sessions_list.blockSignals(False)
+
+    # Запрашивает актуальные данные и обновляет текущий экран/состояние, сохраняя консистентность активного контекста.
 
     async def refresh_sessions_list(self):
         if not self.is_agent_connected:
@@ -725,6 +786,8 @@ class ChatTab(BaseTab):
 
         self.sessions_list.blockSignals(False)
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_session_clicked(self, item: QListWidgetItem):
         sid = item.data(Qt.UserRole)
         if not sid or self.is_generating:
@@ -732,6 +795,8 @@ class ChatTab(BaseTab):
         self.current_session_id = str(sid)
         self._clear_session_dependent_ui(clear_input=True)
         asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
+
+    # Загружает сессию из агента и синхронизирует состояние вкладки: вывод, активную ветку, checkpoints, facts и memory-панели.
 
     async def load_session_to_ui(self, session_id: str):
         if not self.is_agent_connected:
@@ -803,6 +868,8 @@ class ChatTab(BaseTab):
 
         self.logger.debug(f"Сессия загружена. session={session_id} branch={self.current_branch_id}")
 
+    # Запрашивает актуальные данные и обновляет текущий экран/состояние, сохраняя консистентность активного контекста.
+
     def refresh_checkpoints_ui(self, branch: dict):
         """
         Сервер хранит checkpoints как list[dict], но на всякий случай поддержим и старый формат dict.
@@ -838,12 +905,47 @@ class ChatTab(BaseTab):
                 label = cp_id
             self.checkpoint_selector.addItem(label, cp_id)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _clear_session_dependent_ui(self, clear_input: bool = False):
+        self.output_editbox.clear()
+        self.facts_box.clear()
+        self.metrics_memory_tab.clear_panels()
+        self.sent_len_label.setText("API context tokens(est): N/A")
+        self.branch_selector.blockSignals(True)
+        self.branch_selector.clear()
+        self.branch_selector.blockSignals(False)
+        self.checkpoint_selector.clear()
+        self.checkpoint_name.clear()
+        self.new_branch_name.clear()
+        if clear_input:
+            self.input_editbox.clear()
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
+    def _reset_branch_ui_to_main(self):
+        self.current_branch_id = "main"
+        self.branch_selector.blockSignals(True)
+        self.branch_selector.clear()
+        self.branch_selector.addItem("main (main)", "main")
+        self.branch_selector.setCurrentIndex(0)
+        self.branch_selector.blockSignals(False)
+        self.checkpoint_selector.clear()
+
+    # === Отрисовка контекста памяти ===
+
+    # Обновляет панели facts и memory layers по данным последнего ответа, чтобы пользователь видел текущий контекст агента.
+
+    # Преобразует входные данные в представление для интерфейса и обновляет видимые панели без изменения бизнес-данных.
+
     def render_facts(self, facts: dict):
         if not isinstance(facts, dict) or not facts:
             self.facts_box.setPlainText("")
             return
         lines = [f"{k}: {v}" for k, v in facts.items()]
         self.facts_box.setPlainText("\n".join(lines))
+
+    # Преобразует входные данные в представление для интерфейса и обновляет видимые панели без изменения бизнес-данных.
 
     def render_memory_layers(self, memory_layers: dict):
         if not isinstance(memory_layers, dict) or not memory_layers:
@@ -882,6 +984,12 @@ class ChatTab(BaseTab):
 
         self.memory_box.setPlainText("\n".join(lines))
 
+    # === Управление сессиями и стратегией ===
+
+    # Создаёт/чистит сессии, переключает модель/стратегию и запускает серверные операции branching (switch/checkpoint/create branch).
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_new_session_clicked(self):
         if self.is_generating:
             self.logger.warning("Нельзя сменить сессию во время генерации.")
@@ -893,6 +1001,8 @@ class ChatTab(BaseTab):
         if self.is_agent_connected:
             asyncio.get_event_loop().create_task(self.refresh_sessions_list())
         self.logger.success(f"Создана новая сессия: {self.current_session_id}")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_clear_session_clicked(self):
         if self.is_generating:
@@ -918,6 +1028,8 @@ class ChatTab(BaseTab):
 
         asyncio.get_event_loop().create_task(_do())
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_model_changed(self, model_text: str):
         model_text = (model_text or "").strip()
         is_gpt52_locked = (model_text == "gpt-5.2-chat-latest")
@@ -925,6 +1037,8 @@ class ChatTab(BaseTab):
         if is_gpt52_locked:
             self.temperature_input.setValue(1.0)
             self.logger.warning("Для gpt-5.2-chat-latest temperature заблокирована ProxyAPI. Установлено 1.0.")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_strategy_changed(self):
         strategy = self.strategy_selector.currentData()
@@ -958,6 +1072,8 @@ class ChatTab(BaseTab):
         if self.is_agent_connected and (not self.is_generating):
             asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_branch_changed(self):
         if self.strategy_selector.currentData() != "branching":
             return
@@ -968,6 +1084,8 @@ class ChatTab(BaseTab):
             return
         # переключение ветки происходит на сервере, чтобы сохранялось на диск
         asyncio.get_event_loop().create_task(self._switch_branch_async(str(bid)))
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _switch_branch_async(self, branch_id: str):
         if not self.is_agent_connected:
@@ -981,6 +1099,8 @@ class ChatTab(BaseTab):
         except Exception as e:
             self.logger.warning(f"Не удалось сменить ветку: {e}")
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_create_checkpoint_clicked(self):
         if self.strategy_selector.currentData() != "branching":
             self.logger.warning("Checkpoint доступен только в режиме Branching.")
@@ -988,6 +1108,8 @@ class ChatTab(BaseTab):
         if self.is_generating:
             return
         asyncio.get_event_loop().create_task(self._create_checkpoint_async())
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _create_checkpoint_async(self):
         if not self.is_agent_connected:
@@ -1002,6 +1124,8 @@ class ChatTab(BaseTab):
         except Exception as e:
             self.logger.warning(f"Не удалось создать checkpoint: {e}")
 
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_create_branch_clicked(self):
         if self.strategy_selector.currentData() != "branching":
             self.logger.warning("Создание ветки доступно только в режиме Branching.")
@@ -1009,6 +1133,8 @@ class ChatTab(BaseTab):
         if self.is_generating:
             return
         asyncio.get_event_loop().create_task(self._create_branch_async())
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _create_branch_async(self):
         if not self.is_agent_connected:
@@ -1026,6 +1152,12 @@ class ChatTab(BaseTab):
             await self.load_session_to_ui(self.current_session_id)
         except Exception as e:
             self.logger.warning(f"Не удалось создать ветку: {e}")
+
+    # === Отправка сообщений и стриминг ===
+
+    # Запускает запрос к агенту, стримит чанки ответа в UI, собирает метрики исполнения и корректно обрабатывает остановку генерации.
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_send_message(self):
         if self.is_generating:
@@ -1080,6 +1212,8 @@ class ChatTab(BaseTab):
             )
         )
         self.pending_memory_write = None
+
+    # Ведёт полный цикл стриминга: проверка соединения, чтение чанков, расчёт TTFT/токенов/стоимости и обновление UI/метрик по итогам ответа.
 
     async def ask_and_stream_answer(
         self,
@@ -1217,6 +1351,8 @@ class ChatTab(BaseTab):
             self.stop_button.setEnabled(False)
             self.set_loading(False)
 
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def stop_generation(self):
         if not self.is_generating:
             return
@@ -1226,6 +1362,21 @@ class ChatTab(BaseTab):
         self.stop_button.setEnabled(False)
         self.set_loading(False)
         self.logger.warning("Стрим остановлен пользователем.")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
+    def on_clear_output_clicked(self):
+        """
+        Очищает только окно вывода (без влияния на историю на сервере).
+        История в сессии не трогается.
+        """
+        self.output_editbox.clear()
+
+    # === Ручное сохранение в память ===
+
+    # Формирует отложенную запись memory_write и при доступном агенте сразу отправляет её в выбранный слой памяти ветки.
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
     def on_save_memory_clicked(self):
         layer = self.memory_layer_selector.currentData()
@@ -1272,31 +1423,3 @@ class ChatTab(BaseTab):
                 self.logger.warning(f"Не удалось сохранить память: {e}")
 
         asyncio.get_event_loop().create_task(_persist())
-
-    def on_splitter_moved(self):
-        self.splitter_move_timer.start(300)
-
-    def save_window_state(self):
-        try:
-            state = {
-                "log_splitter": self.log_splitter.saveState().toHex().data().decode(),
-                "vertical_splitter": self.vertical_splitter.saveState().toHex().data().decode(),
-            }
-            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.logger.error_handler(e, context="ChatTab -> save_window_state")
-
-    def load_window_state(self):
-        if not os.path.exists(self.CONFIG_FILE):
-            return
-        try:
-            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-
-            if "log_splitter" in state:
-                self.log_splitter.restoreState(QByteArray.fromHex(str(state["log_splitter"]).encode()))
-            if "vertical_splitter" in state:
-                self.vertical_splitter.restoreState(QByteArray.fromHex(str(state["vertical_splitter"]).encode()))
-        except Exception as e:
-            self.logger.error(f"Ошибка загрузки состояния окна для вкладки ChatTab: {e}")

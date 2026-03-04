@@ -17,6 +17,12 @@ class BaseTab(QWidget):
     file_name = f"{os.path.splitext(os.path.basename(__file__))[0]}.json"
     CONFIG_FILE = os.path.join(path, file_name)
 
+    # === Базовая инициализация вкладки ===
+
+    # Создаёт общий каркас вкладки и подключает сигнал логгера, чтобы все наследники автоматически получали поток логов.
+
+    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
+
     def __init__(self, logger: Logger):
         super().__init__()
         self.logger = logger
@@ -25,6 +31,8 @@ class BaseTab(QWidget):
 
         # ============= СЛУШАЕМ КРИКИ
         self.logger.log_signal.connect(self.append_log_message)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def init_ui(self):
         self.top_widget = QWidget()
@@ -54,12 +62,20 @@ class BaseTab(QWidget):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.addWidget(self.log_splitter)
 
+    # === Отображение логов ===
+
+    # Добавляет сообщения в текстовый лог с цветом уровня и опционально прокручивает ленту к последней записи.
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+
     def append_log_message(self, message, color="white"):
         self.log_widget.setTextColor(QColor(color))
         self.log_widget.append(message.strip())
 
         if hasattr(self, "auto_scroll_checkbox") and self.auto_scroll_checkbox.isChecked():
             QTimer.singleShot(0, self.scroll_log_to_bottom)
+
+    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def scroll_log_to_bottom(self):
         scrollbar = self.log_widget.verticalScrollBar()
