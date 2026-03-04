@@ -1,8 +1,10 @@
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QTextEdit, QGroupBox, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton
+    QWidget, QVBoxLayout, QTextEdit, QGroupBox, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton, QSplitter
 )
+from PySide6.QtCore import Qt
 
 from ui.tabs.base_tab import BaseTab
+from ui.custom_objects.toggle_switch import ToggleSwitch
 from core.logger.advanced_logger import Logger
 
 
@@ -69,9 +71,88 @@ class MetricsMemoryTab(BaseTab):
         ml.addWidget(memory_hint)
         ml.addWidget(self.memory_box)
 
-        layout.addWidget(metrics_group)
-        layout.addWidget(memory_group)
-        layout.addStretch(1)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+        left_layout.addWidget(metrics_group)
+        left_layout.addWidget(memory_group)
+        left_layout.addStretch(1)
+
+        self.profile_selector = QComboBox()
+        self.profile_selector.setEditable(True)
+        self.profile_selector.setInsertPolicy(QComboBox.NoInsert)
+        self.profile_selector.setMinimumWidth(220)
+        self.profile_selector.setToolTip("Выберите существующий профиль или введите имя нового.")
+
+        self.profile_description_input = QTextEdit()
+        self.profile_description_input.setMinimumHeight(180)
+        self.profile_description_input.setPlaceholderText(
+            "Опишите профиль пользователя в свободной форме.\n"
+            "Можно указать: стиль ответа, формат ответа, ограничения, предпочтения."
+        )
+
+        self.profile_use_toggle = ToggleSwitch()
+        self.profile_use_toggle.setEnabled(False)
+
+        self.save_profile_btn = QPushButton("Сохранить профиль")
+        self.delete_profile_btn = QPushButton("Удалить профиль")
+
+        profile_group = QGroupBox("Профиль пользователя:")
+        pg = QVBoxLayout(profile_group)
+        pg.setContentsMargins(8, 8, 8, 8)
+        pg.setSpacing(8)
+
+        profile_row1 = QWidget()
+        pr1 = QHBoxLayout(profile_row1)
+        pr1.setContentsMargins(0, 0, 0, 0)
+        pr1.setSpacing(8)
+        pr1.addWidget(QLabel("Имя профиля:"))
+        pr1.addStretch(1)
+        pr1.addWidget(self.profile_selector)
+
+        profile_row2 = QWidget()
+        pr2 = QHBoxLayout(profile_row2)
+        pr2.setContentsMargins(0, 0, 0, 0)
+        pr2.setSpacing(8)
+        pr2.addWidget(QLabel("Использовать профиль:"))
+        pr2.addStretch(1)
+        pr2.addWidget(self.profile_use_toggle, alignment=Qt.AlignRight)
+
+        profile_row3 = QWidget()
+        pr3 = QHBoxLayout(profile_row3)
+        pr3.setContentsMargins(0, 0, 0, 0)
+        pr3.setSpacing(8)
+        pr3.addWidget(self.save_profile_btn)
+        pr3.addWidget(self.delete_profile_btn)
+        pr3.addStretch(1)
+
+        profile_hint = QLabel(
+            "Подсказка: в одном описании профиля можно указывать стиль ответа, "
+            "формат ответа и ограничения."
+        )
+        profile_hint.setWordWrap(True)
+
+        pg.addWidget(profile_row1)
+        pg.addWidget(profile_row2)
+        pg.addWidget(self.profile_description_input)
+        pg.addWidget(profile_hint)
+        pg.addWidget(profile_row3)
+        pg.addStretch(1)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        right_layout.addWidget(profile_group)
+
+        self.metrics_splitter = QSplitter(Qt.Horizontal)
+        self.metrics_splitter.addWidget(left_widget)
+        self.metrics_splitter.addWidget(right_widget)
+        self.metrics_splitter.setStretchFactor(0, 3)
+        self.metrics_splitter.setStretchFactor(1, 2)
+
+        layout.addWidget(self.metrics_splitter)
 
     def clear_panels(self):
         self.metrics_box.clear()

@@ -47,6 +47,20 @@ class ChatTab(BaseTab):
         self.save_memory_btn = self.metrics_memory_tab.save_memory_btn
         self.memory_box = self.metrics_memory_tab.memory_box
         self.save_memory_btn.clicked.connect(self.on_save_memory_clicked)
+        self.profile_selector = self.metrics_memory_tab.profile_selector
+        self.profile_description_input = self.metrics_memory_tab.profile_description_input
+        self.profile_use_toggle = self.metrics_memory_tab.profile_use_toggle
+        self.save_profile_btn = self.metrics_memory_tab.save_profile_btn
+        self.delete_profile_btn = self.metrics_memory_tab.delete_profile_btn
+        self.profile_none_label = "Без профиля"
+        self.active_profile_name = ""
+        self._profile_selector_changing = False
+
+        self.profile_selector.currentIndexChanged.connect(self.on_profile_selected)
+        self.profile_selector.currentTextChanged.connect(self.on_profile_text_changed)
+        self.save_profile_btn.clicked.connect(self.on_save_profile_clicked)
+        self.delete_profile_btn.clicked.connect(self.on_delete_profile_clicked)
+        self.profile_use_toggle.toggled.connect(self.on_profile_toggle_changed)
 
         self.init_content()
         self.load_window_state()
@@ -427,11 +441,187 @@ class ChatTab(BaseTab):
                 self.logger.success("Агент найден: подключение успешно")
                 await self.refresh_sessions_list()
                 await self.load_session_to_ui(self.current_session_id)
+                await self.bootstrap_profile_ui()
             else:
                 self.logger.warning("Агент не отвечает. Запусти core/agent/agent_server.py перед UI.")
+                self._set_profile_none_ui()
         except Exception as e:
             self.is_agent_connected = False
             self.logger.warning(f"Не удалось подключиться к агенту: {e}")
+            self._set_profile_none_ui()
+
+    def _set_profile_none_ui(self):
+        self._profile_selector_changing = True
+        try:
+            self.profile_selector.clear()
+            self.profile_selector.addItem(self.profile_none_label, "")
+            self.profile_selector.setCurrentIndex(0)
+            self.profile_description_input.clear()
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+            self.active_profile_name = ""
+        finally:
+            self._profile_selector_changing = False
+
+    def _populate_profile_selector(self, profiles: list[str], active_profile: str = ""):
+        clean_active = str(active_profile or "").strip()
+        self._profile_selector_changing = True
+        try:
+            self.profile_selector.clear()
+            self.profile_selector.addItem(self.profile_none_label, "")
+            for name in profiles:
+                clean_name = str(name or "").strip()
+                if clean_name:
+                    self.profile_selector.addItem(clean_name, clean_name)
+            if clean_active:
+                idx = self.profile_selector.findData(clean_active)
+                if idx >= 0:
+                    self.profile_selector.setCurrentIndex(idx)
+                else:
+                    self.profile_selector.setCurrentIndex(0)
+                    self.profile_selector.setEditText(clean_active)
+            else:
+                self.profile_selector.setCurrentIndex(0)
+        finally:
+            self._profile_selector_changing = False
+
+    def _selected_profile_name(self) -> str:
+        text = str(self.profile_selector.currentText() or "").strip()
+        if not text or text == self.profile_none_label:
+            return ""
+        return text
+
+    async def bootstrap_profile_ui(self):
+        if not self.is_agent_connected:
+            self._set_profile_none_ui()
+            return
+        try:
+            # По ТЗ на старте UI профиль должен быть не выбран.
+            await self.agent.set_active_profile("")
+            state = await self.agent.get_profile_state()
+            profiles = state.get("profiles") if isinstance(state.get("profiles"), list) else []
+            self._populate_profile_selector(profiles=profiles, active_profile="")
+            self.profile_description_input.clear()
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+            self.active_profile_name = ""
+        except Exception as e:
+            self.logger.warning(f"Не удалось инициализировать профили: {e}")
+            self._set_profile_none_ui()
+
+    def on_profile_selected(self, _index=None):
+        if self._profile_selector_changing:
+            return
+        asyncio.get_event_loop().create_task(self._on_profile_selected_async())
+
+    def on_profile_text_changed(self, _text: str):
+        if self._profile_selector_changing:
+            return
+        selected = self._selected_profile_name()
+        if (not selected) or (selected != self.active_profile_name):
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+
+    async def _on_profile_selected_async(self):
+        selected = self._selected_profile_name()
+        if not self.is_agent_connected:
+            if not selected:
+                self.profile_use_toggle.blockSignals(True)
+                self.profile_use_toggle.setChecked(False)
+                self.profile_use_toggle.blockSignals(False)
+                self.profile_use_toggle.setEnabled(False)
+            return
+        try:
+            if not selected:
+                await self.agent.set_active_profile("")
+                self.profile_description_input.clear()
+                self.profile_use_toggle.blockSignals(True)
+                self.profile_use_toggle.setChecked(False)
+                self.profile_use_toggle.blockSignals(False)
+                self.profile_use_toggle.setEnabled(False)
+                self.active_profile_name = ""
+                self.logger.info("Активный профиль: Без профиля")
+                return
+
+            await self.agent.set_active_profile(selected)
+            profile = await self.agent.get_profile(selected)
+            description = ""
+            if isinstance(profile, dict):
+                description = str(profile.get("description") or "")
+            self.profile_description_input.setPlainText(description)
+            self.profile_use_toggle.setEnabled(True)
+            self.active_profile_name = selected
+            self.logger.success(f"Активный профиль: {selected}")
+        except Exception as e:
+            self.logger.warning(f"Не удалось выбрать профиль: {e}")
+
+    def on_save_profile_clicked(self, _checked=False):
+        asyncio.get_event_loop().create_task(self._save_profile_async())
+
+    async def _save_profile_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: сохранение профиля недоступно.")
+            return
+        profile_name = self._selected_profile_name()
+        if not profile_name:
+            self.logger.warning("Укажите имя профиля в выпадающем списке.")
+            return
+        description = self.profile_description_input.toPlainText().strip()
+        try:
+            payload = await self.agent.save_profile(profile_name, description)
+            profiles = payload.get("profiles") if isinstance(payload.get("profiles"), list) else []
+            active = str(payload.get("active_profile") or profile_name)
+            self._populate_profile_selector(profiles=profiles, active_profile=active)
+            idx = self.profile_selector.findData(active)
+            if idx >= 0:
+                self.profile_selector.setCurrentIndex(idx)
+            self.profile_use_toggle.setEnabled(True)
+            self.active_profile_name = active
+            self.logger.success(f"Профиль сохранен: {active}")
+        except Exception as e:
+            self.logger.warning(f"Не удалось сохранить профиль: {e}")
+
+    def on_delete_profile_clicked(self, _checked=False):
+        asyncio.get_event_loop().create_task(self._delete_profile_async())
+
+    async def _delete_profile_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: удаление профиля недоступно.")
+            return
+        profile_name = self._selected_profile_name()
+        if not profile_name:
+            self.logger.warning("Сначала выберите профиль для удаления.")
+            return
+        try:
+            payload = await self.agent.delete_profile(profile_name)
+            profiles = payload.get("profiles") if isinstance(payload.get("profiles"), list) else []
+            await self.agent.set_active_profile("")
+            self._populate_profile_selector(profiles=profiles, active_profile="")
+            self.profile_description_input.clear()
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+            self.active_profile_name = ""
+            self.logger.success(f"Профиль удален: {profile_name}")
+        except Exception as e:
+            self.logger.warning(f"Не удалось удалить профиль: {e}")
+
+    def on_profile_toggle_changed(self, checked: bool):
+        if not checked:
+            return
+        if not self._selected_profile_name():
+            self.profile_use_toggle.blockSignals(True)
+            self.profile_use_toggle.setChecked(False)
+            self.profile_use_toggle.blockSignals(False)
+            self.profile_use_toggle.setEnabled(False)
+            self.logger.warning("Нельзя включить персонализацию без выбранного профиля.")
 
     def render_sessions_list_offline(self):
         self.sessions_list.blockSignals(True)
@@ -768,6 +958,7 @@ class ChatTab(BaseTab):
         selected_temperature = float(self.temperature_input.value()) if self.temperature_input.isEnabled() else None
         keep_last_n = int(self.keep_last_n_input.value())
         strategy = self.strategy_selector.currentData()
+        use_profile = bool(self.profile_use_toggle.isEnabled() and self.profile_use_toggle.isChecked())
 
         self.current_task = asyncio.create_task(
             self.ask_and_stream_answer(
@@ -778,11 +969,12 @@ class ChatTab(BaseTab):
                 keep_last_n=keep_last_n,
                 strategy=strategy,
                 memory_write=self.pending_memory_write,
+                use_profile=use_profile,
             )
         )
         self.pending_memory_write = None
 
-    async def ask_and_stream_answer(self, user_text: str, model: str, endpoint: str, temperature, keep_last_n: int, strategy: str, memory_write=None):
+    async def ask_and_stream_answer(self, user_text: str, model: str, endpoint: str, temperature, keep_last_n: int, strategy: str, memory_write=None, use_profile: bool = False):
         t0 = time.perf_counter()
         ttft_sec = None
         got_first = False
@@ -808,6 +1000,7 @@ class ChatTab(BaseTab):
                 keep_last_n=keep_last_n,
                 context_strategy=strategy,
                 memory_write=memory_write,
+                use_profile=use_profile,
             )
 
             async for chunk in gen:
@@ -850,6 +1043,7 @@ class ChatTab(BaseTab):
 
             ms = getattr(self.agent, "last_message_stats", None) or {}
             token_stats = getattr(self.agent, "last_token_stats", None) or {}
+            profile_info = getattr(self.agent, "last_profile_info", None) or {}
             active_branch = getattr(self.agent, "last_active_branch", None) or self.current_branch_id
             self.current_branch_id = active_branch
 
@@ -860,13 +1054,17 @@ class ChatTab(BaseTab):
             dialog_tokens = token_stats.get("dialog_tokens_est")
             user_tokens = token_stats.get("user_text_tokens_est")
             may_exceed = token_stats.get("may_exceed_context")
+            use_profile_stat = bool(profile_info.get("use_profile", use_profile))
+            active_profile_stat = str(profile_info.get("active_profile") or "Без профиля")
+            desc_len_stat = int(profile_info.get("profile_description_len") or 0)
             self.sent_len_label.setText(f"API context tokens(est): {api_context_tokens if api_context_tokens is not None else 'N/A'}")
 
             line = (
                 f"Strategy={strategy_used} | Branch={active_branch} | sent_msgs={sent_messages} | keep_last_n={keep_last_n} | "
                 f"TTFT={ttft_str} | Total={total_sec:.3f}s | "
                 f"prompt={prompt_tokens} | completion={completion_tokens} | total={total_tokens_call} | Cost={cost_str} | "
-                f"Temp={temp_str} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed}"
+                f"Temp={temp_str} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
+                f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat}"
             )
             if facts_count is not None:
                 line += f" | facts={facts_count}"

@@ -25,6 +25,7 @@ class AgentClient:
         self.last_facts: Optional[dict] = None
         self.last_memory_layers: Optional[dict] = None
         self.last_token_stats: Dict[str, Any] = {}
+        self.last_profile_info: Dict[str, Any] = {}
 
     def _is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing() and self._reader is not None
@@ -226,6 +227,68 @@ class AgentClient:
             }
         return {"active_branch": branch_id or "main", "memory_layers": {}}
 
+    async def list_profiles(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "list_profiles"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "profiles":
+            return {
+                "profiles": msg.get("profiles") or [],
+                "active_profile": msg.get("active_profile") or "",
+            }
+        return {"profiles": [], "active_profile": ""}
+
+    async def get_profile(self, profile_name: str) -> Optional[Dict[str, Any]]:
+        msg = await self._rpc({"action": "get_profile", "profile_name": profile_name})
+        self._raise_if_error(msg)
+        if msg.get("type") == "profile":
+            profile = msg.get("profile")
+            if isinstance(profile, dict):
+                return profile
+        return None
+
+    async def save_profile(self, profile_name: str, description: str) -> Dict[str, Any]:
+        msg = await self._rpc(
+            {
+                "action": "save_profile",
+                "profile_name": profile_name,
+                "description": description,
+            }
+        )
+        self._raise_if_error(msg)
+        return {
+            "ok": msg.get("type") == "ok",
+            "profiles": msg.get("profiles") or [],
+            "active_profile": msg.get("active_profile") or "",
+        }
+
+    async def delete_profile(self, profile_name: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "delete_profile", "profile_name": profile_name})
+        self._raise_if_error(msg)
+        return {
+            "ok": msg.get("type") == "ok",
+            "profiles": msg.get("profiles") or [],
+            "active_profile": msg.get("active_profile") or "",
+        }
+
+    async def set_active_profile(self, profile_name: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "set_active_profile", "profile_name": profile_name})
+        self._raise_if_error(msg)
+        return {
+            "ok": msg.get("type") == "ok",
+            "profiles": msg.get("profiles") or [],
+            "active_profile": msg.get("active_profile") or "",
+        }
+
+    async def get_profile_state(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "get_profile_state"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "profile_state":
+            return {
+                "profiles": msg.get("profiles") or [],
+                "active_profile": msg.get("active_profile") or "",
+            }
+        return {"profiles": [], "active_profile": ""}
+
     async def save_memory(self, session_id: str, branch_id: str, layer: str, value: str, key: str = "") -> Dict[str, Any]:
         msg = await self._rpc(
             {
@@ -256,6 +319,7 @@ class AgentClient:
         keep_last_n: int,
         context_strategy: str,
         memory_write: Optional[Dict[str, str]] = None,
+        use_profile: bool = False,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -267,6 +331,7 @@ class AgentClient:
         self.last_facts = None
         self.last_memory_layers = None
         self.last_token_stats = {}
+        self.last_profile_info = {}
 
         request: Dict[str, Any] = {
             "action": "stream_chat",
@@ -279,6 +344,7 @@ class AgentClient:
             "temperature": temperature,
             "keep_last_n": int(keep_last_n),
             "context_strategy": str(context_strategy or "sliding"),
+            "use_profile": bool(use_profile),
         }
         if isinstance(memory_write, dict):
             request["memory_write"] = memory_write
@@ -316,6 +382,7 @@ class AgentClient:
                         self.last_facts = msg.get("facts") if isinstance(msg.get("facts"), dict) else None
                         self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
                         self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
+                        self.last_profile_info = msg.get("profile_info") if isinstance(msg.get("profile_info"), dict) else {}
                         break
 
                     if msg_type == "error":

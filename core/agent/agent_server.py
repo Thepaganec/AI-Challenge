@@ -15,6 +15,7 @@ load_dotenv(override=True)
 from core.api.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
 from core.agent.memory_store import AgentMemoryStore
+from core.agent.profile_store import AgentProfileStore
 from core.agent.strategies import (
     build_sliding_window,
     parse_facts_from_user_text,
@@ -51,6 +52,7 @@ class LLMAgentServer:
 
         self.memory_dir = os.path.join(self.base_dir, "memory")
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
+        self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
 
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
 
@@ -68,6 +70,12 @@ class LLMAgentServer:
             "create_branch": self._handle_create_branch,
             "get_memory": self._handle_get_memory,
             "save_memory": self._handle_save_memory,
+            "list_profiles": self._handle_list_profiles,
+            "get_profile": self._handle_get_profile,
+            "save_profile": self._handle_save_profile,
+            "delete_profile": self._handle_delete_profile,
+            "set_active_profile": self._handle_set_active_profile,
+            "get_profile_state": self._handle_get_profile_state,
             "stream_chat": self._handle_stream_chat,
         }
         self._model_context_limit: Dict[str, int] = {
@@ -350,6 +358,18 @@ class LLMAgentServer:
         if not parts:
             return None
         return "\n\n".join(parts)
+
+    def _build_profile_system_text(self, profile_name: str, profile_description: str) -> Optional[str]:
+        clean_name = str(profile_name or "").strip()
+        clean_desc = str(profile_description or "").strip()
+        if not clean_name or not clean_desc:
+            return None
+        return (
+            "USER PROFILE:\n"
+            f"- name: {clean_name}\n"
+            f"- description: {clean_desc}\n"
+            "Follow this profile automatically when generating the answer."
+        )
 
     def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
         layer_key = (layer or "").strip().lower()
@@ -645,6 +665,92 @@ class LLMAgentServer:
             },
         )
 
+    async def _handle_list_profiles(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        state = self.profile_store.get_state()
+        await self._send_json(
+            writer,
+            {
+                "type": "profiles",
+                "profiles": state.get("available_profiles") or [],
+                "active_profile": state.get("active_profile") or "",
+            },
+        )
+
+    async def _handle_get_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        profile_name = str(request.get("profile_name") or "").strip()
+        if not profile_name:
+            await self._send_error(writer, "profile_name is required")
+            return
+        profile = self.profile_store.get_profile(profile_name)
+        if not isinstance(profile, dict):
+            await self._send_error(writer, "profile not found")
+            return
+        await self._send_json(writer, {"type": "profile", "profile": profile})
+
+    async def _handle_save_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        profile_name = str(request.get("profile_name") or "").strip()
+        description = str(request.get("description") or "")
+        if not profile_name:
+            await self._send_error(writer, "profile_name is required")
+            return
+        try:
+            self.profile_store.save_profile(profile_name, description)
+            self.profile_store.set_active_profile(profile_name)
+            state = self.profile_store.get_state()
+            await self._send_json(
+                writer,
+                {
+                    "type": "ok",
+                    "ok": True,
+                    "active_profile": state.get("active_profile") or "",
+                    "profiles": state.get("available_profiles") or [],
+                },
+            )
+        except Exception as e:
+            await self._send_error(writer, str(e))
+
+    async def _handle_delete_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        profile_name = str(request.get("profile_name") or "").strip()
+        if not profile_name:
+            await self._send_error(writer, "profile_name is required")
+            return
+        self.profile_store.delete_profile(profile_name)
+        state = self.profile_store.get_state()
+        await self._send_json(
+            writer,
+            {
+                "type": "ok",
+                "ok": True,
+                "active_profile": state.get("active_profile") or "",
+                "profiles": state.get("available_profiles") or [],
+            },
+        )
+
+    async def _handle_set_active_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        profile_name = str(request.get("profile_name") or "").strip()
+        self.profile_store.set_active_profile(profile_name)
+        state = self.profile_store.get_state()
+        await self._send_json(
+            writer,
+            {
+                "type": "ok",
+                "ok": True,
+                "active_profile": state.get("active_profile") or "",
+                "profiles": state.get("available_profiles") or [],
+            },
+        )
+
+    async def _handle_get_profile_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        state = self.profile_store.get_state()
+        await self._send_json(
+            writer,
+            {
+                "type": "profile_state",
+                "active_profile": state.get("active_profile") or "",
+                "profiles": state.get("available_profiles") or [],
+            },
+        )
+
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         req_id = str(uuid.uuid4())[:8]
         user_text = (request.get("user_text") or "").strip()
@@ -675,6 +781,7 @@ class LLMAgentServer:
             keep_last_n = 10
 
         strategy = (request.get("context_strategy") or "sliding").strip().lower()
+        use_profile = bool(request.get("use_profile", False))
 
         session = self.memory_store.load_session(session_id)
         self._ensure_title(session, user_text)
@@ -720,6 +827,19 @@ class LLMAgentServer:
         memory_system_text = self._build_memory_system_text(memory_layers)
         system_text = self._merge_system_text(memory_system_text, system_text)
 
+        profile_state = self.profile_store.get_state()
+        active_profile = str(profile_state.get("active_profile") or "").strip()
+        profile_description = ""
+        profile_applied = False
+        if active_profile:
+            profile = self.profile_store.get_profile(active_profile)
+            if isinstance(profile, dict):
+                profile_description = str(profile.get("description") or "")
+        if use_profile and active_profile and profile_description.strip():
+            profile_system_text = self._build_profile_system_text(active_profile, profile_description)
+            system_text = self._merge_system_text(profile_system_text, system_text)
+            profile_applied = True
+
         explicit_memory = request.get("memory_write")
         if isinstance(explicit_memory, dict):
             layer = str(explicit_memory.get("layer") or "").strip()
@@ -749,6 +869,20 @@ class LLMAgentServer:
                 history_for_llm=history_for_llm,
                 system_text=system_text,
                 explicit_memory=explicit_memory,
+            )
+            self.logger.write(
+                "INFO",
+                "SERVER_PROFILE_CONTEXT",
+                extra=json.dumps(
+                    {
+                        "req_id": req_id,
+                        "use_profile": use_profile,
+                        "active_profile": active_profile,
+                        "profile_description_len": len(profile_description),
+                        "profile_applied": profile_applied,
+                    },
+                    ensure_ascii=False,
+                ),
             )
             gen = self.gpt.stream_chat(
                 user_text=user_text,
@@ -807,6 +941,10 @@ class LLMAgentServer:
             message_stats = {
                 "strategy": strategy_display,
                 "branch_id": bid,
+                "use_profile": use_profile,
+                "active_profile": active_profile or "Без профиля",
+                "profile_description_len": int(len(profile_description)),
+                "profile_applied": profile_applied,
                 "keep_last_n": int(keep_last_n),
                 "sent_messages": int(sent_messages),
                 "facts_count": int(len(facts) if isinstance(facts, dict) else 0),
@@ -833,6 +971,12 @@ class LLMAgentServer:
                     "facts": facts if isinstance(facts, dict) else {},
                     "memory_layers": memory_layers,
                     "token_stats": token_stats,
+                    "profile_info": {
+                        "use_profile": use_profile,
+                        "active_profile": active_profile,
+                        "profile_description_len": int(len(profile_description)),
+                        "profile_applied": profile_applied,
+                    },
                 },
             )
 
