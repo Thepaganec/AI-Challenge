@@ -371,6 +371,64 @@ class LLMAgentServer:
             "Follow this profile automatically when generating the answer."
         )
 
+    def _stringify_history_for_summary(self, messages: List[Dict[str, str]]) -> str:
+        lines: List[str] = []
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip().lower()
+            content = str(m.get("content") or "").strip()
+            if not role or not content:
+                continue
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines).strip()
+
+    async def _summarize_history_with_llm(
+        self,
+        *,
+        older_history: List[Dict[str, str]],
+        model: str,
+        endpoint: str,
+        temperature: Optional[float],
+        max_tokens: int,
+        trace_id: str,
+    ) -> str:
+        transcript = self._stringify_history_for_summary(older_history)
+        if not transcript:
+            return ""
+
+        summary_system = (
+            "You summarize dialogue history in Russian.\n"
+            "Keep only durable facts, constraints, decisions, and open tasks.\n"
+            "Do not include greetings, filler, or repeated details.\n"
+            "Output compact bullet points."
+        )
+
+        parts: List[str] = []
+        gen = None
+        try:
+            gen = self.gpt.stream_chat(
+                user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
+                system_text=summary_system,
+                history=[],
+                max_tokens=max_tokens,
+                model=model,
+                endpoint=endpoint,
+                temperature=temperature,
+                include_usage=False,
+                trace_id=f"{trace_id}-summary",
+            )
+            async for chunk in gen:
+                if chunk:
+                    parts.append(chunk)
+        finally:
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except Exception:
+                    pass
+        return "".join(parts).strip()
+
     def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
         layer_key = (layer or "").strip().lower()
         memory_layers = memory_layers if isinstance(memory_layers, dict) else {}
@@ -779,6 +837,19 @@ class LLMAgentServer:
             keep_last_n = int(request.get("keep_last_n") or 10)
         except Exception:
             keep_last_n = 10
+        keep_last_n = max(1, keep_last_n)
+
+        summary_cfg = request.get("summary_config") if isinstance(request.get("summary_config"), dict) else {}
+        summary_model = str(summary_cfg.get("model") or model).strip() or model
+        summary_endpoint = str(summary_cfg.get("endpoint") or endpoint).strip() or endpoint
+        summary_max_tokens = int(summary_cfg.get("max_tokens") or 600)
+        summary_max_tokens = max(32, summary_max_tokens)
+        summary_temperature = summary_cfg.get("temperature", temperature)
+        if summary_temperature is not None:
+            try:
+                summary_temperature = float(summary_temperature)
+            except Exception:
+                summary_temperature = None
 
         strategy = (request.get("context_strategy") or "sliding").strip().lower()
         use_profile = bool(request.get("use_profile", False))
@@ -821,13 +892,34 @@ class LLMAgentServer:
         if strategy_for_context == "facts":
             system_text, history_for_llm = build_facts_strategy(history, facts, keep_last_n)
         elif strategy_for_context == "summary":
-            previous_summary = str(branch.get("summary") or "")
-            system_text, history_for_llm, updated_summary = build_summary_strategy(
-                history=history,
-                keep_last_n=keep_last_n,
-                previous_summary=previous_summary,
-            )
-            branch["summary"] = updated_summary
+            older_history = history[:-keep_last_n] if len(history) > keep_last_n else []
+            tail_history = history[-keep_last_n:] if keep_last_n > 0 else []
+            summary_text = ""
+            if older_history:
+                try:
+                    summary_text = await self._summarize_history_with_llm(
+                        older_history=older_history,
+                        model=summary_model,
+                        endpoint=summary_endpoint,
+                        temperature=summary_temperature,
+                        max_tokens=summary_max_tokens,
+                        trace_id=req_id,
+                    )
+                except Exception as e:
+                    self.logger.write("WARN", "SUMMARY_LLM_FAILED", extra=str(e))
+                    previous_summary = str(branch.get("summary") or "")
+                    fallback_system, _, fallback_summary = build_summary_strategy(
+                        history=history,
+                        keep_last_n=keep_last_n,
+                        previous_summary=previous_summary,
+                    )
+                    summary_text = str(fallback_summary or "")
+                    if not summary_text and isinstance(fallback_system, str):
+                        summary_text = fallback_system.replace("SUMMARY OF PREVIOUS DIALOG:\n", "", 1).strip()
+
+            branch["summary"] = summary_text
+            system_text = f"SUMMARY OF PREVIOUS DIALOG:\n{summary_text}" if summary_text else None
+            history_for_llm = tail_history
         else:
             history_for_llm = build_sliding_window(history, keep_last_n)
 
@@ -856,7 +948,7 @@ class LLMAgentServer:
                 self._save_memory_item(memory_layers, layer, key, value)
                 branch["memory_layers"] = memory_layers
 
-        history.append({"role": "user", "content": user_text_for_api})
+        history.append({"role": "user", "content": user_text})
 
         gen = None
         assistant_answer = ""

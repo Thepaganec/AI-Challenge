@@ -320,6 +320,7 @@ class AgentClient:
         context_strategy: str,
         memory_write: Optional[Dict[str, str]] = None,
         use_profile: bool = False,
+        summary_config: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -350,6 +351,8 @@ class AgentClient:
             request["branch_id"] = str(branch_id)
         if isinstance(memory_write, dict):
             request["memory_write"] = memory_write
+        if request["context_strategy"] == "summary" and isinstance(summary_config, dict):
+            request["summary_config"] = summary_config
 
         async with self._conn_lock:
             try:

@@ -150,6 +150,26 @@ class ChatTab(BaseTab):
         self.strategy_selector.addItem("Summary + последние N", "summary")
         self.strategy_selector.addItem("Branching (ветки) + последние N", "branching")
         self.strategy_selector.currentIndexChanged.connect(self.on_strategy_changed)
+        self.summary_model_selector = QComboBox()
+        self.summary_model_selector.setFixedWidth(170)
+        self.summary_model_selector.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-5.2-chat-latest"])
+
+        self.summary_endpoint_selector = QComboBox()
+        self.summary_endpoint_selector.setFixedWidth(130)
+        self.summary_endpoint_selector.addItem("Chat", "chat")
+        self.summary_endpoint_selector.addItem("Responses", "responses")
+
+        self.summary_temperature_input = QDoubleSpinBox()
+        self.summary_temperature_input.setFixedWidth(90)
+        self.summary_temperature_input.setDecimals(1)
+        self.summary_temperature_input.setSingleStep(0.1)
+        self.summary_temperature_input.setRange(0.0, 2.0)
+        self.summary_temperature_input.setValue(1.0)
+
+        self.summary_max_tokens_input = QSpinBox()
+        self.summary_max_tokens_input.setFixedWidth(90)
+        self.summary_max_tokens_input.setRange(32, 8000)
+        self.summary_max_tokens_input.setValue(600)
 
         # branching controls
         self.branch_selector = QComboBox()
@@ -270,6 +290,22 @@ class ChatTab(BaseTab):
         p_l.addWidget(row4)
         p_l.addWidget(row5)
         p_l.addWidget(row6)
+
+        self.summary_params_row = QWidget()
+        spr = QHBoxLayout(self.summary_params_row)
+        spr.setContentsMargins(0, 0, 0, 0)
+        spr.setSpacing(8)
+        spr.addWidget(QLabel("Summary model:"))
+        spr.addWidget(self.summary_model_selector)
+        spr.addWidget(QLabel("Endpoint:"))
+        spr.addWidget(self.summary_endpoint_selector)
+        spr.addWidget(QLabel("Temp:"))
+        spr.addWidget(self.summary_temperature_input)
+        spr.addWidget(QLabel("Tokens:"))
+        spr.addWidget(self.summary_max_tokens_input)
+        spr.addStretch(1)
+        p_l.addWidget(self.summary_params_row)
+        self.summary_params_row.setVisible(False)
 
         branch_box = QGroupBox("Branching (ветки диалога)")
         b_l = QVBoxLayout(branch_box)
@@ -894,6 +930,7 @@ class ChatTab(BaseTab):
         strategy = self.strategy_selector.currentData()
         is_branching = (strategy == "branching")
         is_facts = (strategy == "facts")
+        is_summary = (strategy == "summary")
         self.branch_selector.setEnabled(is_branching)
         self.checkpoint_name.setEnabled(is_branching)
         self.create_checkpoint_btn.setEnabled(is_branching)
@@ -902,6 +939,7 @@ class ChatTab(BaseTab):
         self.create_branch_btn.setEnabled(is_branching)
         self.facts_group.setEnabled(is_facts)
         self.facts_box.setEnabled(is_facts)
+        self.summary_params_row.setVisible(is_summary)
         if not is_facts:
             self.facts_box.clear()
 
@@ -1018,6 +1056,14 @@ class ChatTab(BaseTab):
         keep_last_n = int(self.keep_last_n_input.value())
         strategy = self.strategy_selector.currentData()
         use_profile = bool(self.profile_use_toggle.isEnabled() and self.profile_use_toggle.isChecked())
+        summary_config = None
+        if strategy == "summary":
+            summary_config = {
+                "model": self.summary_model_selector.currentText().strip(),
+                "endpoint": self.summary_endpoint_selector.currentData(),
+                "temperature": float(self.summary_temperature_input.value()),
+                "max_tokens": int(self.summary_max_tokens_input.value()),
+            }
 
         self.current_task = asyncio.create_task(
             self.ask_and_stream_answer(
@@ -1030,6 +1076,7 @@ class ChatTab(BaseTab):
                 strategy=strategy,
                 memory_write=self.pending_memory_write,
                 use_profile=use_profile,
+                summary_config=summary_config,
             )
         )
         self.pending_memory_write = None
@@ -1045,6 +1092,7 @@ class ChatTab(BaseTab):
         strategy: str,
         memory_write=None,
         use_profile: bool = False,
+        summary_config: dict | None = None,
     ):
         t0 = time.perf_counter()
         ttft_sec = None
@@ -1072,6 +1120,7 @@ class ChatTab(BaseTab):
                 context_strategy=strategy,
                 memory_write=memory_write,
                 use_profile=use_profile,
+                summary_config=summary_config,
             )
 
             async for chunk in gen:
