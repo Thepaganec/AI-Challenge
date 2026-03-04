@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def build_sliding_window(history: List[dict], keep_last_n: int) -> List[dict]:
@@ -59,39 +59,32 @@ def build_sliding_window(history: List[dict], keep_last_n: int) -> List[dict]:
     return flattened
 
 def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """
-    Эвристика обновления facts из текста пользователя.
+    facts, _ = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=prev_facts)
+    return facts
 
-    Обновляем facts после КАЖДОГО сообщения пользователя:
-    - Поддерживаем явный формат:
-        fact: key = value
-        факт: key = value
-        key: value  (если key выглядит как "цель/ограничения/предпочтения/решение/договорённости")
-    - Ловим распространённые фразы:
-        "моя цель ..." / "цель: ..."
-        "ограничение ..." / "ограничения: ..."
-        "предпочитаю ..." / "предпочтения: ..."
-    - ВАЖНО: даже если пользователь не дал явных facts,
-      сохраняем:
-        * "Последний запрос" — всегда
-        * "Цель" — если ещё не задана (берём из первого нормального запроса)
+
+def parse_facts_and_strip_user_text(user_text: str, prev_facts: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, str], str]:
+    """
+    Извлекает факты и возвращает (updated_facts, cleaned_user_text).
+    В cleaned_user_text удаляются строки, которые распознаны как facts.
+
+    Факты обновляются только по явным паттернам:
+    - fact: key = value
+    - факт: key = value
+    - key: value, где key выглядит как одно из важных ключевых слов
+    - отдельные фразы (моя цель/предпочитаю/ограничения/требование)
     """
     facts: Dict[str, str] = dict(prev_facts or {})
 
     text = (user_text or "").strip()
     if not text:
-        return facts
-
-    # всегда фиксируем последний запрос (чтобы было видно, что блок живой)
-    # ограничим длину, чтобы не раздувать
-    first_line = text.splitlines()[0].strip()
-    if first_line:
-        facts["Последний запрос"] = (first_line[:220] + "...") if len(first_line) > 220 else first_line
+        return facts, ""
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    consumed_idx: Set[int] = set()
 
     # 1) явные fact/факт команды
-    for ln in lines:
+    for i, ln in enumerate(lines):
         m = re.match(r"^(?:fact|факт)\s*:\s*(.+)$", ln, flags=re.I)
         if m:
             rest = m.group(1).strip()
@@ -101,6 +94,7 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
                 v = m2.group(2).strip()
                 if k:
                     facts[k] = v
+                    consumed_idx.add(i)
             continue
 
     # 2) key: value для ключей из "важных"
@@ -110,8 +104,9 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
         "предпочтение", "предпочтения",
         "решение", "решения",
         "договоренность", "договоренности", "договорённость", "договорённости",
+        "требование", "требования",
     ]
-    for ln in lines:
+    for i, ln in enumerate(lines):
         m = re.match(r"^([^:]{2,40})\s*:\s*(.+)$", ln)
         if not m:
             continue
@@ -122,6 +117,7 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
         kl = k.lower()
         if any(ik in kl for ik in important_keys):
             facts[k] = v
+            consumed_idx.add(i)
 
     # 3) фразы
     m = re.search(r"\bмоя\s+цель\s*[:\-]?\s*(.+)$", text, flags=re.I)
@@ -136,18 +132,34 @@ def parse_facts_from_user_text(user_text: str, prev_facts: Optional[Dict[str, st
     if m:
         facts["Ограничения"] = m.group(1).strip()
 
-    # 4) если цель ещё не определена — ставим её из первого запроса
-    # (это ровно то, что ожидается на демо Day 10: facts появляются и обновляются)
-    if "Цель" not in facts and first_line:
-        facts["Цель"] = (first_line[:220] + "...") if len(first_line) > 220 else first_line
+    m = re.search(r"\bтребовани[ея]\s*[:\-]?\s*(.+)$", text, flags=re.I)
+    if m:
+        facts["Требование"] = m.group(1).strip()
 
-    # чистим пустые
+    # 4) помечаем строковые facts-фразы, чтобы не дублировать их в user-сообщении для API
+    for i, ln in enumerate(lines):
+        if re.search(r"\bмоя\s+цель\b", ln, flags=re.I):
+            consumed_idx.add(i)
+            continue
+        if re.search(r"\bпредпочитаю\b", ln, flags=re.I):
+            consumed_idx.add(i)
+            continue
+        if re.search(r"\bограничени[ея]\b", ln, flags=re.I):
+            consumed_idx.add(i)
+            continue
+        if re.search(r"\bтребовани[ея]\b", ln, flags=re.I):
+            consumed_idx.add(i)
+            continue
+
+    # 5) чистим пустые facts
     for k in list(facts.keys()):
         v = facts.get(k)
         if not k or v is None or str(v).strip() == "":
             facts.pop(k, None)
 
-    return facts
+    cleaned_lines = [ln for idx, ln in enumerate(lines) if idx not in consumed_idx]
+    cleaned_text = "\n".join(cleaned_lines).strip()
+    return facts, cleaned_text
 
 
 def facts_to_system_text(facts: Dict[str, str]) -> Optional[str]:

@@ -18,7 +18,7 @@ from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
 from core.agent.strategies import (
     build_sliding_window,
-    parse_facts_from_user_text,
+    parse_facts_and_strip_user_text,
     build_facts_strategy,
     build_summary_strategy,
 )
@@ -808,10 +808,12 @@ class LLMAgentServer:
         history = self._branch_history(branch)
         memory_layers = self._ensure_branch_memory_model(branch)
 
+        user_text_for_api = user_text
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
         if strategy_for_context == "facts":
-            facts = parse_facts_from_user_text(user_text, facts)
+            facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=facts)
             branch["facts"] = facts
+            user_text_for_api = cleaned_user_text or "Учти обновленные факты и продолжай."
 
         system_text = None
         history_for_llm: List[Dict[str, str]] = []
@@ -854,7 +856,7 @@ class LLMAgentServer:
                 self._save_memory_item(memory_layers, layer, key, value)
                 branch["memory_layers"] = memory_layers
 
-        history.append({"role": "user", "content": user_text})
+        history.append({"role": "user", "content": user_text_for_api})
 
         gen = None
         assistant_answer = ""
@@ -870,7 +872,7 @@ class LLMAgentServer:
                 temperature=temperature,
                 keep_last_n=keep_last_n,
                 strategy=strategy_for_context,
-                user_text=user_text,
+                user_text=user_text_for_api,
                 history_for_llm=history_for_llm,
                 system_text=system_text,
                 explicit_memory=explicit_memory,
@@ -890,7 +892,7 @@ class LLMAgentServer:
                 ),
             )
             gen = self.gpt.stream_chat(
-                user_text=user_text,
+                user_text=user_text_for_api,
                 system_text=system_text,
                 history=history_for_llm,
                 max_tokens=max_tokens,
@@ -928,7 +930,7 @@ class LLMAgentServer:
 
             full_history_tokens_est = self._estimate_tokens_messages(history)
             context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
-            user_tokens_est = self._estimate_tokens_text(user_text)
+            user_tokens_est = self._estimate_tokens_text(user_text_for_api)
             assistant_tokens_est = completion_tokens if completion_tokens > 0 else self._estimate_tokens_text(assistant_answer)
             model_context_limit = self._resolve_context_limit(model)
             may_exceed_context = bool((context_tokens_est + user_tokens_est) > model_context_limit)
