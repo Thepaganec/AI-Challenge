@@ -783,14 +783,21 @@ class LLMAgentServer:
         strategy = (request.get("context_strategy") or "sliding").strip().lower()
         use_profile = bool(request.get("use_profile", False))
 
+        strategy_for_context = strategy if strategy in ("sliding", "facts", "summary", "branching") else "sliding"
+        strategy_display = strategy_for_context
+
         session = self.memory_store.load_session(session_id)
         self._ensure_title(session, user_text)
 
         branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
         session["branches"] = branches
 
-        active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-        bid = (branch_id or active).strip() or "main"
+        if strategy_for_context == "branching":
+            active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
+            bid = (branch_id or active).strip() or "main"
+        else:
+            bid = "main"
+
         if bid not in branches:
             bid, branch = self._get_branch(session, bid)
             branches[bid] = branch
@@ -804,9 +811,6 @@ class LLMAgentServer:
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
         facts = parse_facts_from_user_text(user_text, facts)
         branch["facts"] = facts
-
-        strategy_for_context = strategy if strategy in ("sliding", "facts", "summary", "branching") else "sliding"
-        strategy_display = "sliding" if strategy_for_context == "branching" else strategy_for_context
 
         system_text = None
         history_for_llm: List[Dict[str, str]] = []

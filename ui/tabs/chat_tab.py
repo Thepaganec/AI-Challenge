@@ -133,6 +133,11 @@ class ChatTab(BaseTab):
         self.temperature_input.setRange(0.0, 2.0)
         self.temperature_input.setValue(1.0)
 
+        self.max_tokens_input = QSpinBox()
+        self.max_tokens_input.setRange(1, 32000)
+        self.max_tokens_input.setValue(800)
+        self.max_tokens_input.setFixedWidth(120)
+
         self.keep_last_n_input = QSpinBox()
         self.keep_last_n_input.setRange(1, 100)
         self.keep_last_n_input.setValue(10)
@@ -239,23 +244,32 @@ class ChatTab(BaseTab):
         r4 = QHBoxLayout(row4)
         r4.setContentsMargins(0, 0, 0, 0)
         r4.setSpacing(8)
-        r4.addWidget(QLabel("N сообщений (user+assistant):"))
+        r4.addWidget(QLabel("max_tokens:"))
         r4.addStretch(1)
-        r4.addWidget(self.keep_last_n_input)
+        r4.addWidget(self.max_tokens_input)
 
         row5 = QWidget()
         r5 = QHBoxLayout(row5)
         r5.setContentsMargins(0, 0, 0, 0)
         r5.setSpacing(8)
-        r5.addWidget(QLabel("Стратегия контекста:"))
+        r5.addWidget(QLabel("N сообщений (user+assistant):"))
         r5.addStretch(1)
-        r5.addWidget(self.strategy_selector)
+        r5.addWidget(self.keep_last_n_input)
+
+        row6 = QWidget()
+        r6 = QHBoxLayout(row6)
+        r6.setContentsMargins(0, 0, 0, 0)
+        r6.setSpacing(8)
+        r6.addWidget(QLabel("Стратегия контекста:"))
+        r6.addStretch(1)
+        r6.addWidget(self.strategy_selector)
 
         p_l.addWidget(row1)
         p_l.addWidget(row2)
         p_l.addWidget(row3)
         p_l.addWidget(row4)
         p_l.addWidget(row5)
+        p_l.addWidget(row6)
 
         branch_box = QGroupBox("Branching (ветки диалога)")
         b_l = QVBoxLayout(branch_box)
@@ -700,20 +714,27 @@ class ChatTab(BaseTab):
 
         self._clear_session_dependent_ui()
 
-        # restore active branch
-        active_branch = (session.get("active_branch") or "main").strip() or "main"
-        self.current_branch_id = active_branch
-
         branches = session.get("branches") or {}
         if not isinstance(branches, dict):
             branches = {}
 
+        strategy = self.strategy_selector.currentData()
+        is_branching = (strategy == "branching")
+        active_branch = (session.get("active_branch") or "main").strip() or "main"
+        if is_branching:
+            self.current_branch_id = active_branch
+        else:
+            self.current_branch_id = "main"
+
         # fill branch selector
         self.branch_selector.blockSignals(True)
         self.branch_selector.clear()
-        for bid, b in branches.items():
-            name = (b.get("name") or bid).strip()
-            self.branch_selector.addItem(f"{name} ({bid})", bid)
+        if is_branching:
+            for bid, b in branches.items():
+                name = (b.get("name") or b.get("title") or bid).strip()
+                self.branch_selector.addItem(f"{name} ({bid})", bid)
+        else:
+            self.branch_selector.addItem("main (main)", "main")
         idx = self.branch_selector.findData(self.current_branch_id)
         if idx >= 0:
             self.branch_selector.setCurrentIndex(idx)
@@ -869,7 +890,13 @@ class ChatTab(BaseTab):
     def on_strategy_changed(self):
         strategy = self.strategy_selector.currentData()
         is_branching = (strategy == "branching")
-        # блок веток доступен всегда, но подсвечивать можно логами
+        self.branch_selector.setEnabled(is_branching)
+        self.checkpoint_name.setEnabled(is_branching)
+        self.create_checkpoint_btn.setEnabled(is_branching)
+        self.checkpoint_selector.setEnabled(is_branching)
+        self.new_branch_name.setEnabled(is_branching)
+        self.create_branch_btn.setEnabled(is_branching)
+
         if is_branching:
             self.logger.info("Стратегия: Branching. История ведётся по выбранной ветке.")
         elif strategy == "facts":
@@ -879,7 +906,15 @@ class ChatTab(BaseTab):
         else:
             self.logger.info("Стратегия: Sliding Window. В модель отправляются только последние N сообщений.")
 
+        if (not is_branching) and (self.current_branch_id != "main"):
+            self.current_branch_id = "main"
+
+        if self.is_agent_connected and (not self.is_generating):
+            asyncio.get_event_loop().create_task(self.load_session_to_ui(self.current_session_id))
+
     def on_branch_changed(self):
+        if self.strategy_selector.currentData() != "branching":
+            return
         if self.is_generating:
             return
         bid = self.branch_selector.currentData()
@@ -901,6 +936,9 @@ class ChatTab(BaseTab):
             self.logger.warning(f"Не удалось сменить ветку: {e}")
 
     def on_create_checkpoint_clicked(self):
+        if self.strategy_selector.currentData() != "branching":
+            self.logger.warning("Checkpoint доступен только в режиме Branching.")
+            return
         if self.is_generating:
             return
         asyncio.get_event_loop().create_task(self._create_checkpoint_async())
@@ -919,6 +957,9 @@ class ChatTab(BaseTab):
             self.logger.warning(f"Не удалось создать checkpoint: {e}")
 
     def on_create_branch_clicked(self):
+        if self.strategy_selector.currentData() != "branching":
+            self.logger.warning("Создание ветки доступно только в режиме Branching.")
+            return
         if self.is_generating:
             return
         asyncio.get_event_loop().create_task(self._create_branch_async())
@@ -965,6 +1006,7 @@ class ChatTab(BaseTab):
         selected_model = self.model_selector.currentText().strip()
         selected_endpoint = self.endpoint_selector.currentData()
         selected_temperature = float(self.temperature_input.value()) if self.temperature_input.isEnabled() else None
+        selected_max_tokens = int(self.max_tokens_input.value())
         keep_last_n = int(self.keep_last_n_input.value())
         strategy = self.strategy_selector.currentData()
         use_profile = bool(self.profile_use_toggle.isEnabled() and self.profile_use_toggle.isChecked())
@@ -975,6 +1017,7 @@ class ChatTab(BaseTab):
                 model=selected_model,
                 endpoint=selected_endpoint,
                 temperature=selected_temperature,
+                max_tokens=selected_max_tokens,
                 keep_last_n=keep_last_n,
                 strategy=strategy,
                 memory_write=self.pending_memory_write,
@@ -983,7 +1026,18 @@ class ChatTab(BaseTab):
         )
         self.pending_memory_write = None
 
-    async def ask_and_stream_answer(self, user_text: str, model: str, endpoint: str, temperature, keep_last_n: int, strategy: str, memory_write=None, use_profile: bool = False):
+    async def ask_and_stream_answer(
+        self,
+        user_text: str,
+        model: str,
+        endpoint: str,
+        temperature,
+        max_tokens: int,
+        keep_last_n: int,
+        strategy: str,
+        memory_write=None,
+        use_profile: bool = False,
+    ):
         t0 = time.perf_counter()
         ttft_sec = None
         got_first = False
@@ -1002,10 +1056,10 @@ class ChatTab(BaseTab):
                 user_text=user_text,
                 model=model,
                 endpoint=endpoint,
-                max_tokens=800,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 session_id=self.current_session_id,
-                branch_id=self.current_branch_id,
+                branch_id=self.current_branch_id if strategy == "branching" else None,
                 keep_last_n=keep_last_n,
                 context_strategy=strategy,
                 memory_write=memory_write,
@@ -1072,7 +1126,7 @@ class ChatTab(BaseTab):
                 f"Strategy={strategy_used} | Branch={active_branch} | sent_msgs={sent_messages} | keep_last_n={keep_last_n} | "
                 f"TTFT={ttft_str} | Total={total_sec:.3f}s | "
                 f"prompt={prompt_tokens} | completion={completion_tokens} | total={total_tokens_call} | Cost={cost_str} | "
-                f"Temp={temp_str} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
+                f"Temp={temp_str} | max_tokens={max_tokens} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
                 f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat}"
             )
             if facts_count is not None:

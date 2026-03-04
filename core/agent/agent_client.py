@@ -315,7 +315,7 @@ class AgentClient:
         max_tokens: int,
         temperature: Optional[float],
         session_id: str,
-        branch_id: str,
+        branch_id: Optional[str],
         keep_last_n: int,
         context_strategy: str,
         memory_write: Optional[Dict[str, str]] = None,
@@ -336,16 +336,18 @@ class AgentClient:
         request: Dict[str, Any] = {
             "action": "stream_chat",
             "session_id": session_id,
-            "branch_id": branch_id,
             "user_text": user_text,
             "model": model,
             "endpoint": endpoint,
             "max_tokens": int(max_tokens),
-            "temperature": temperature,
             "keep_last_n": int(keep_last_n),
             "context_strategy": str(context_strategy or "sliding"),
             "use_profile": bool(use_profile),
         }
+        if temperature is not None:
+            request["temperature"] = temperature
+        if request["context_strategy"] == "branching" and branch_id:
+            request["branch_id"] = str(branch_id)
         if isinstance(memory_write, dict):
             request["memory_write"] = memory_write
 
