@@ -58,9 +58,15 @@ class ChatTab(BaseTab):
         self.profile_use_toggle = self.metrics_memory_tab.profile_use_toggle
         self.save_profile_btn = self.metrics_memory_tab.save_profile_btn
         self.delete_profile_btn = self.metrics_memory_tab.delete_profile_btn
+        self.invariant_key_selector = self.metrics_memory_tab.invariant_key_selector
+        self.invariant_policy_selector = self.metrics_memory_tab.invariant_policy_selector
+        self.invariant_value_input = self.metrics_memory_tab.invariant_value_input
+        self.save_invariant_btn = self.metrics_memory_tab.save_invariant_btn
+        self.invariants_box = self.metrics_memory_tab.invariants_box
         self.profile_none_label = "Без профиля"
         self.active_profile_name = ""
         self._profile_selector_changing = False
+        self._invariants_cache: dict = {"invariants": {}, "invariant_policy": {}}
         self.task_state_cache: dict = {}
         self._task_state_signature: str = ""
         self._task_state_refresh_inflight: bool = False
@@ -70,6 +76,8 @@ class ChatTab(BaseTab):
         self.save_profile_btn.clicked.connect(self.on_save_profile_clicked)
         self.delete_profile_btn.clicked.connect(self.on_delete_profile_clicked)
         self.profile_use_toggle.toggled.connect(self.on_profile_toggle_changed)
+        self.invariant_key_selector.currentIndexChanged.connect(self.on_invariant_key_changed)
+        self.save_invariant_btn.clicked.connect(self.on_save_invariant_clicked)
 
         self.init_content()
         self.load_window_state()
@@ -550,15 +558,18 @@ class ChatTab(BaseTab):
                 await self.refresh_sessions_list()
                 await self.load_session_to_ui(self.current_session_id)
                 await self.bootstrap_profile_ui()
+                await self.refresh_invariants_ui()
                 await self.refresh_task_state()
             else:
                 self.logger.warning("Агент не отвечает. Запусти core/agent/agent_server.py перед UI.")
                 self._set_profile_none_ui()
+                self._render_invariants({})
                 self.render_task_state({})
         except Exception as e:
             self.is_agent_connected = False
             self.logger.warning(f"Не удалось подключиться к агенту: {e}")
             self._set_profile_none_ui()
+            self._render_invariants({})
             self.render_task_state({})
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
@@ -757,6 +768,84 @@ class ChatTab(BaseTab):
             self.profile_use_toggle.blockSignals(False)
             self.profile_use_toggle.setEnabled(False)
             self.logger.warning("Нельзя включить персонализацию без выбранного профиля.")
+
+    async def refresh_invariants_ui(self):
+        if not self.is_agent_connected:
+            self._render_invariants({})
+            return
+        try:
+            state = await self.agent.get_invariants_state()
+            self._render_invariants(state)
+        except Exception as e:
+            self.logger.warning(f"Не удалось получить инварианты: {e}")
+            self._render_invariants({})
+
+    def _render_invariants(self, state: dict):
+        invariants = state.get("invariants") if isinstance(state, dict) and isinstance(state.get("invariants"), dict) else {}
+        policy = state.get("invariant_policy") if isinstance(state, dict) and isinstance(state.get("invariant_policy"), dict) else {}
+        self._invariants_cache = {"invariants": dict(invariants), "invariant_policy": dict(policy)}
+
+        key = str(self.invariant_key_selector.currentData() or "")
+        value = str(invariants.get(key) or "") if key else ""
+        mode = str(policy.get(key) or "strict").strip().lower()
+        if mode not in ("strict", "warn"):
+            mode = "strict"
+        idx = self.invariant_policy_selector.findData(mode)
+        if idx >= 0:
+            self.invariant_policy_selector.setCurrentIndex(idx)
+        self.invariant_value_input.setPlainText(value)
+
+        lines = []
+        keys = [
+            "architecture",
+            "technical_decisions",
+            "stack_constraints",
+            "business_rules",
+            "safety_restrictions",
+            "response_style",
+        ]
+        for item_key in keys:
+            item_policy = str(policy.get(item_key) or "strict")
+            item_val = str(invariants.get(item_key) or "")
+            lines.append(f"{item_key} ({item_policy}): {item_val or '-'}")
+        self.invariants_box.setPlainText("\n".join(lines))
+
+    def on_invariant_key_changed(self, _index=None):
+        key = str(self.invariant_key_selector.currentData() or "")
+        state = self._invariants_cache
+        invariants = state.get("invariants") if isinstance(state.get("invariants"), dict) else {}
+        policy = state.get("invariant_policy") if isinstance(state.get("invariant_policy"), dict) else {}
+        value = str(invariants.get(key) or "") if key else ""
+        mode = str(policy.get(key) or "strict").strip().lower()
+        if mode not in ("strict", "warn"):
+            mode = "strict"
+        idx = self.invariant_policy_selector.findData(mode)
+        if idx >= 0:
+            self.invariant_policy_selector.setCurrentIndex(idx)
+        self.invariant_value_input.setPlainText(value)
+
+    def on_save_invariant_clicked(self, _checked=False):
+        asyncio.get_event_loop().create_task(self._save_invariant_async())
+
+    async def _save_invariant_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: сохранение инварианта недоступно.")
+            return
+        key = str(self.invariant_key_selector.currentData() or "").strip()
+        if not key:
+            self.logger.warning("Не выбран ключ инварианта.")
+            return
+        policy = str(self.invariant_policy_selector.currentData() or "strict").strip().lower()
+        if policy not in ("strict", "warn"):
+            policy = "strict"
+        value = self.invariant_value_input.toPlainText().strip()
+        try:
+            await self.agent.save_invariant(key, value)
+            state = await self.agent.set_invariant_policy(key, policy)
+            self._render_invariants(state)
+            self.logger.success(f"Инвариант сохранен: {key} ({policy})")
+        except Exception as e:
+            self.logger.warning(f"Не удалось сохранить инвариант: {e}")
 
     # === Task state ===
 

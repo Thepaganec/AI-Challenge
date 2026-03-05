@@ -33,6 +33,7 @@ class AgentClient:
         self.last_memory_layers: Optional[dict] = None
         self.last_token_stats: Dict[str, Any] = {}
         self.last_profile_info: Dict[str, Any] = {}
+        self.last_invariants_state: Dict[str, Any] = {}
         self.last_task_state: Dict[str, Any] = {}
         self.last_task_signal: Dict[str, Any] = {}
         self.on_task_signal = None
@@ -299,6 +300,38 @@ class AgentClient:
             }
         return {"profiles": [], "active_profile": ""}
 
+    async def get_invariants_state(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "get_invariants_state"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "invariants_state":
+            state = {
+                "invariants": msg.get("invariants") if isinstance(msg.get("invariants"), dict) else {},
+                "invariant_policy": msg.get("invariant_policy") if isinstance(msg.get("invariant_policy"), dict) else {},
+            }
+            self.last_invariants_state = state
+            return state
+        return {"invariants": {}, "invariant_policy": {}}
+
+    async def save_invariant(self, key: str, value: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "save_invariant", "key": key, "value": value})
+        self._raise_if_error(msg)
+        state = {
+            "invariants": msg.get("invariants") if isinstance(msg.get("invariants"), dict) else {},
+            "invariant_policy": msg.get("invariant_policy") if isinstance(msg.get("invariant_policy"), dict) else {},
+        }
+        self.last_invariants_state = state
+        return state
+
+    async def set_invariant_policy(self, key: str, policy: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "set_invariant_policy", "key": key, "policy": policy})
+        self._raise_if_error(msg)
+        state = {
+            "invariants": msg.get("invariants") if isinstance(msg.get("invariants"), dict) else {},
+            "invariant_policy": msg.get("invariant_policy") if isinstance(msg.get("invariant_policy"), dict) else {},
+        }
+        self.last_invariants_state = state
+        return state
+
     async def get_task_state(self) -> Dict[str, Any]:
         msg = await self._rpc({"action": "get_task_state"})
         self._raise_if_error(msg)
@@ -439,6 +472,7 @@ class AgentClient:
         self.last_memory_layers = None
         self.last_token_stats = {}
         self.last_profile_info = {}
+        self.last_invariants_state = {}
         self.last_task_state = {}
         self.last_task_signal = {}
 

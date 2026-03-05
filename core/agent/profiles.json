@@ -12,5 +12,21 @@
       "updated_at": "2026-03-04 11:00:02"
     }
   },
-  "updated_at": "2026-03-05 15:38:03"
+  "invariants": {
+    "architecture": "microsoft",
+    "technical_decisions": "",
+    "stack_constraints": "sql",
+    "business_rules": "",
+    "safety_restrictions": "нельзя использовать drop",
+    "response_style": ""
+  },
+  "invariant_policy": {
+    "architecture": "strict",
+    "technical_decisions": "strict",
+    "stack_constraints": "strict",
+    "business_rules": "strict",
+    "safety_restrictions": "strict",
+    "response_style": "strict"
+  },
+  "updated_at": "2026-03-05 17:16:35"
 }

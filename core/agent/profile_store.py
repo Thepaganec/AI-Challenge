@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
+from core.agent.invariants import INVARIANT_KEYS, INVARIANT_POLICIES
 
 
 def _now_str() -> str:
@@ -25,9 +26,13 @@ class AgentProfileStore:
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     def _default_data(self) -> Dict[str, Any]:
+        invariants = {k: "" for k in INVARIANT_KEYS}
+        invariant_policy = {k: "strict" for k in INVARIANT_KEYS}
         return {
             "active_profile": "",
             "profiles": {},
+            "invariants": invariants,
+            "invariant_policy": invariant_policy,
             "updated_at": _now_str(),
         }
 
@@ -63,9 +68,25 @@ class AgentProfileStore:
         if active_profile not in profiles:
             active_profile = ""
 
+        raw_invariants = data.get("invariants")
+        invariants: Dict[str, str] = {k: "" for k in INVARIANT_KEYS}
+        if isinstance(raw_invariants, dict):
+            for key in INVARIANT_KEYS:
+                invariants[key] = str(raw_invariants.get(key) or "").strip()
+
+        raw_policy = data.get("invariant_policy")
+        invariant_policy: Dict[str, str] = {k: "strict" for k in INVARIANT_KEYS}
+        if isinstance(raw_policy, dict):
+            for key in INVARIANT_KEYS:
+                val = str(raw_policy.get(key) or "strict").strip().lower()
+                if val in INVARIANT_POLICIES:
+                    invariant_policy[key] = val
+
         return {
             "active_profile": active_profile,
             "profiles": profiles,
+            "invariants": invariants,
+            "invariant_policy": invariant_policy,
             "updated_at": str(data.get("updated_at") or _now_str()),
         }
 
@@ -166,4 +187,49 @@ class AgentProfileStore:
         return {
             "active_profile": str(data.get("active_profile") or ""),
             "available_profiles": names,
+        }
+
+    def get_invariants_state(self) -> Dict[str, Any]:
+        data = self.load()
+        invariants = data.get("invariants") if isinstance(data.get("invariants"), dict) else {}
+        policy = data.get("invariant_policy") if isinstance(data.get("invariant_policy"), dict) else {}
+        return {
+            "invariants": {k: str(invariants.get(k) or "") for k in INVARIANT_KEYS},
+            "invariant_policy": {
+                k: str(policy.get(k) or "strict").strip().lower()
+                if str(policy.get(k) or "strict").strip().lower() in INVARIANT_POLICIES
+                else "strict"
+                for k in INVARIANT_KEYS
+            },
+        }
+
+    def save_invariant_value(self, key: str, value: str) -> Dict[str, Any]:
+        clean_key = str(key or "").strip()
+        if clean_key not in INVARIANT_KEYS:
+            raise ValueError("invalid invariant key")
+        data = self.load()
+        invariants = data.get("invariants") if isinstance(data.get("invariants"), dict) else {}
+        invariants[clean_key] = str(value or "").strip()
+        data["invariants"] = invariants
+        saved = self.save(data)
+        return {
+            "invariants": saved.get("invariants") if isinstance(saved.get("invariants"), dict) else {},
+            "invariant_policy": saved.get("invariant_policy") if isinstance(saved.get("invariant_policy"), dict) else {},
+        }
+
+    def set_invariant_policy(self, key: str, policy: str) -> Dict[str, Any]:
+        clean_key = str(key or "").strip()
+        if clean_key not in INVARIANT_KEYS:
+            raise ValueError("invalid invariant key")
+        clean_policy = str(policy or "").strip().lower()
+        if clean_policy not in INVARIANT_POLICIES:
+            raise ValueError("invalid invariant policy")
+        data = self.load()
+        mapping = data.get("invariant_policy") if isinstance(data.get("invariant_policy"), dict) else {}
+        mapping[clean_key] = clean_policy
+        data["invariant_policy"] = mapping
+        saved = self.save(data)
+        return {
+            "invariants": saved.get("invariants") if isinstance(saved.get("invariants"), dict) else {},
+            "invariant_policy": saved.get("invariant_policy") if isinstance(saved.get("invariant_policy"), dict) else {},
         }

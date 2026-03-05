@@ -18,6 +18,13 @@ from core.agent.agent_logger import AgentFileLogger
 from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
 from core.agent.task_state_store import TaskStateStore
+from core.agent.invariants import (
+    INVARIANT_KEYS,
+    build_runtime_context_text,
+    build_invariants_system_text,
+    normalize_invariants_state,
+    validate_text_with_invariants,
+)
 from core.agent.strategies import (
     build_sliding_window,
     parse_facts_and_strip_user_text,
@@ -87,6 +94,9 @@ class LLMAgentServer:
             "delete_profile": self._handle_delete_profile,
             "set_active_profile": self._handle_set_active_profile,
             "get_profile_state": self._handle_get_profile_state,
+            "get_invariants_state": self._handle_get_invariants_state,
+            "save_invariant": self._handle_save_invariant,
+            "set_invariant_policy": self._handle_set_invariant_policy,
             "get_task_state": self._handle_get_task_state,
             "generate_task_plan": self._handle_generate_task_plan,
             "confirm_task_plan": self._handle_confirm_task_plan,
@@ -432,6 +442,132 @@ class LLMAgentServer:
             "- Never claim a state transition unless server task action was executed."
         )
 
+    def _get_invariants_state(self) -> Dict[str, Dict[str, str]]:
+        raw = self.profile_store.get_invariants_state()
+        return normalize_invariants_state(raw)
+
+    def _build_prompt_system_text(
+        self,
+        *,
+        base_system: Optional[str],
+        runtime_system: Optional[str],
+        profile_system: Optional[str],
+        task_system: Optional[str],
+        memory_system: Optional[str],
+        invariants_system: Optional[str],
+    ) -> Optional[str]:
+        return self._merge_system_text(base_system, runtime_system, profile_system, task_system, memory_system, invariants_system)
+
+    def _validate_output_by_invariants(self, text: str) -> Dict[str, Any]:
+        inv_state = self._get_invariants_state()
+        return validate_text_with_invariants(
+            text=text,
+            invariants=inv_state.get("invariants", {}),
+            policy=inv_state.get("invariant_policy", {}),
+        )
+
+    async def _llm_self_validate_invariants(
+        self,
+        *,
+        stage: str,
+        model: str,
+        endpoint: str,
+        trace_id: str,
+        candidate_text: str,
+    ) -> Dict[str, Any]:
+        inv_state = self._get_invariants_state()
+        invariants = inv_state.get("invariants", {}) if isinstance(inv_state.get("invariants"), dict) else {}
+        policy = inv_state.get("invariant_policy", {}) if isinstance(inv_state.get("invariant_policy"), dict) else {}
+        payload = {
+            "stage": str(stage or "chat"),
+            "candidate_text": str(candidate_text or ""),
+            "invariants": invariants,
+            "invariant_policy": policy,
+        }
+        system_prompt = (
+            "Ты валидатор инвариантов. Оцени candidate_text относительно invariants.\n"
+            "Верни строго JSON без markdown:\n"
+            "{"
+            "\"decision\":\"pass|warn|fail\","
+            "\"conflict_key\":\"\","
+            "\"reason\":\"\","
+            "\"warnings\":[\"...\"],"
+            "\"items\":[{\"key\":\"...\",\"status\":\"pass|warn|fail\",\"note\":\"...\"}]"
+            "}\n"
+            "Правила:\n"
+            "- strict + нарушение => fail.\n"
+            "- warn + нарушение => warn.\n"
+            "- Если нарушений нет => pass."
+        )
+
+        text = ""
+        gen = None
+        try:
+            gen = self.gpt.stream_chat(
+                user_text=json.dumps(payload, ensure_ascii=False),
+                system_text=system_prompt,
+                history=[],
+                max_tokens=700,
+                model=model,
+                endpoint=endpoint,
+                temperature=0.0,
+                include_usage=False,
+                trace_id=f"{trace_id}-compliance",
+            )
+            async for chunk in gen:
+                text += chunk
+        finally:
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except Exception:
+                    pass
+
+        obj = self._extract_json_block(text)
+        if not isinstance(obj, dict):
+            return {
+                "decision": "pass",
+                "conflict_key": "",
+                "reason": "",
+                "warnings": [],
+                "items": [],
+                "raw": str(text or "")[:2000],
+            }
+        decision = str(obj.get("decision") or "pass").strip().lower()
+        if decision not in ("pass", "warn", "fail"):
+            decision = "pass"
+        warnings = obj.get("warnings") if isinstance(obj.get("warnings"), list) else []
+        items = obj.get("items") if isinstance(obj.get("items"), list) else []
+        return {
+            "decision": decision,
+            "conflict_key": str(obj.get("conflict_key") or ""),
+            "reason": str(obj.get("reason") or ""),
+            "warnings": [str(x) for x in warnings if str(x).strip()],
+            "items": items,
+            "raw": str(text or "")[:2000],
+        }
+
+    def _merge_invariant_validations(self, hard: Dict[str, Any], llm: Dict[str, Any]) -> Dict[str, Any]:
+        hard_decision = str(hard.get("decision") or "pass")
+        llm_decision = str(llm.get("decision") or "pass")
+        if hard_decision == "fail" or llm_decision == "fail":
+            return {
+                "decision": "fail",
+                "conflict_key": str(hard.get("conflict_key") or llm.get("conflict_key") or ""),
+                "reason": str(hard.get("reason") or llm.get("reason") or "Invariant validation failed"),
+                "warnings": (hard.get("warnings") if isinstance(hard.get("warnings"), list) else [])
+                + (llm.get("warnings") if isinstance(llm.get("warnings"), list) else []),
+            }
+        if hard_decision == "warn" or llm_decision == "warn":
+            return {
+                "decision": "warn",
+                "conflict_key": str(hard.get("conflict_key") or llm.get("conflict_key") or ""),
+                "reason": str(hard.get("reason") or llm.get("reason") or ""),
+                "warnings": (hard.get("warnings") if isinstance(hard.get("warnings"), list) else [])
+                + (llm.get("warnings") if isinstance(llm.get("warnings"), list) else []),
+            }
+        return {"decision": "pass", "conflict_key": "", "reason": "", "warnings": []}
+
     def _make_auto_plan(self, task_text: str) -> List[str]:
         clean_task = " ".join(str(task_text or "").strip().split())
         if not clean_task:
@@ -539,51 +675,145 @@ class LLMAgentServer:
         *,
         user_text: str,
         system_text: Optional[str],
+        history: Optional[List[Dict[str, str]]] = None,
         model: str,
         endpoint: str,
         temperature: Optional[float],
         max_tokens: int,
         trace_id: str,
+        stage: str = "chat",
+        max_retries: int = 2,
+        validate_invariants: bool = True,
     ) -> Tuple[str, Dict[str, Any]]:
-        text = ""
-        gen = None
-        try:
-            gen = self.gpt.stream_chat(
-                user_text=user_text,
-                system_text=system_text,
-                history=[],
-                max_tokens=max_tokens,
-                model=model,
-                endpoint=endpoint,
-                temperature=temperature,
-                include_usage=True,
-                trace_id=trace_id,
-            )
-            async for chunk in gen:
-                text += chunk
-        finally:
-            if gen is not None:
+        hist = history if isinstance(history, list) else []
+        inv_state = self._get_invariants_state()
+        runtime_system = build_runtime_context_text(stage=stage)
+        inv_system = build_invariants_system_text(
+            inv_state.get("invariants", {}),
+            inv_state.get("invariant_policy", {}),
+        )
+        base_system = self._build_prompt_system_text(
+            base_system=system_text,
+            runtime_system=runtime_system,
+            profile_system=None,
+            task_system=None,
+            memory_system=None,
+            invariants_system=inv_system,
+        )
+        last_text = ""
+        last_usage: Dict[str, Any] = {}
+        retries = max(0, int(max_retries))
+        retry_reason = ""
+        for attempt in range(retries + 1):
+            text = ""
+            gen = None
+            effective_system = base_system
+            if attempt > 0:
+                retry_hint = (
+                    "PREVIOUS OUTPUT FAILED VALIDATION.\n"
+                    f"Reason: {retry_reason or 'Invariant violation'}\n"
+                    "Regenerate answer and strictly respect invariants."
+                )
+                effective_system = self._merge_system_text(base_system, retry_hint)
+            try:
+                gen = self.gpt.stream_chat(
+                    user_text=user_text,
+                    system_text=effective_system,
+                    history=hist,
+                    max_tokens=max_tokens,
+                    model=model,
+                    endpoint=endpoint,
+                    temperature=temperature,
+                    include_usage=True,
+                    trace_id=f"{trace_id}-try{attempt + 1}",
+                )
+                async for chunk in gen:
+                    text += chunk
+            finally:
+                if gen is not None:
+                    try:
+                        await gen.aclose()
+                    except Exception:
+                        pass
+
+            usage = getattr(self.gpt, "last_usage", None) or {}
+            last_text = text.strip()
+            last_usage = usage if isinstance(usage, dict) else {}
+
+            hard_validation = {"decision": "pass", "conflict_key": "", "reason": "", "warnings": []}
+            if validate_invariants:
+                hard_validation = self._validate_output_by_invariants(last_text)
+            llm_validation: Dict[str, Any] = {"decision": "pass", "conflict_key": "", "reason": "", "warnings": [], "items": []}
+            if validate_invariants:
                 try:
-                    await gen.aclose()
-                except Exception:
-                    pass
-        usage = getattr(self.gpt, "last_usage", None) or {}
+                    llm_validation = await self._llm_self_validate_invariants(
+                        stage=stage,
+                        model=model,
+                        endpoint=endpoint,
+                        trace_id=f"{trace_id}-v{attempt + 1}",
+                        candidate_text=last_text,
+                    )
+                except Exception as e:
+                    llm_validation = {
+                        "decision": "pass",
+                        "conflict_key": "",
+                        "reason": "",
+                        "warnings": [],
+                        "items": [],
+                        "error": str(e),
+                    }
+            validation = self._merge_invariant_validations(hard_validation, llm_validation)
+            decision = str(validation.get("decision") or "pass")
+            retry_reason = str(validation.get("reason") or "")
+            try:
+                self.logger.write(
+                    "INFO" if decision != "fail" else "WARN",
+                    "TASK_LLM_RESPONSE_ATTEMPT",
+                    extra=json.dumps(
+                        {
+                            "req_id": trace_id,
+                            "attempt": attempt + 1,
+                            "stage": stage,
+                            "validation_decision": decision,
+                            "validation": validation,
+                            "hard_validation": hard_validation,
+                            "llm_validation": llm_validation,
+                            "text": str(last_text or "")[:8000],
+                            "usage": last_usage,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
+            if decision != "fail":
+                if decision == "warn":
+                    warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else []
+                    if warnings:
+                        last_text = f"[INVARIANT_WARNING] {'; '.join(str(x) for x in warnings[:2])}\n{last_text}"
+                return last_text, last_usage
+
         try:
             self.logger.write(
-                "INFO",
-                "TASK_LLM_RESPONSE",
+                "ERROR",
+                "TASK_LLM_RESPONSE_REJECTED",
                 extra=json.dumps(
                     {
                         "req_id": trace_id,
-                        "text": str(text or "")[:8000],
-                        "usage": usage if isinstance(usage, dict) else {},
+                        "stage": stage,
+                        "attempts": retries + 1,
+                        "reason": "strict_invariants_violation",
+                        "last_text": str(last_text or "")[:8000],
+                        "last_usage": last_usage,
                     },
                     ensure_ascii=False,
                 ),
             )
         except Exception:
             pass
-        return text.strip(), usage
+        raise RuntimeError(
+            "Ответ отклонен: нарушены strict-инварианты."
+        )
 
     def _extract_json_block(self, text: str) -> Optional[Dict[str, Any]]:
         raw = str(text or "").strip()
@@ -733,6 +963,10 @@ class LLMAgentServer:
             "./",
         )
         return any(cmd.startswith(p) for p in mutating_prefixes)
+
+    def _validate_commands_with_invariants(self, commands: List[str]) -> Dict[str, Any]:
+        blob = "\n".join(str(c or "") for c in commands if str(c or "").strip())
+        return self._validate_output_by_invariants(blob)
 
     def _extract_step_artifact_tokens(self, step_text: str) -> List[str]:
         raw = str(step_text or "").strip()
@@ -1110,30 +1344,20 @@ class LLMAgentServer:
             "Output compact bullet points."
         )
 
-        parts: List[str] = []
-        gen = None
-        try:
-            gen = self.gpt.stream_chat(
-                user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
-                system_text=summary_system,
-                history=[],
-                max_tokens=max_tokens,
-                model=model,
-                endpoint=endpoint,
-                temperature=temperature,
-                include_usage=False,
-                trace_id=f"{trace_id}-summary",
-            )
-            async for chunk in gen:
-                if chunk:
-                    parts.append(chunk)
-        finally:
-            if gen is not None:
-                try:
-                    await gen.aclose()
-                except Exception:
-                    pass
-        return "".join(parts).strip()
+        summary_text, _ = await self._llm_generate_text(
+            user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
+            system_text=summary_system,
+            history=[],
+            max_tokens=max_tokens,
+            model=model,
+            endpoint=endpoint,
+            temperature=temperature,
+            trace_id=f"{trace_id}-summary",
+            stage="summary",
+            max_retries=1,
+            validate_invariants=True,
+        )
+        return str(summary_text or "").strip()
 
     # Сохраняет или фиксирует данные в целевом хранилище с базовой валидацией входных параметров.
 
@@ -1619,6 +1843,66 @@ class LLMAgentServer:
             },
         )
 
+    async def _handle_get_invariants_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        state = self.profile_store.get_invariants_state()
+        await self._send_json(
+            writer,
+            {
+                "type": "invariants_state",
+                "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
+                "invariant_policy": state.get("invariant_policy")
+                if isinstance(state.get("invariant_policy"), dict)
+                else {},
+            },
+        )
+
+    async def _handle_save_invariant(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        key = str(request.get("key") or "").strip()
+        value = str(request.get("value") or "").strip()
+        if key not in INVARIANT_KEYS:
+            await self._send_error(writer, "invalid invariant key")
+            return
+        try:
+            state = self.profile_store.save_invariant_value(key=key, value=value)
+            await self._send_json(
+                writer,
+                {
+                    "type": "ok",
+                    "ok": True,
+                    "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
+                    "invariant_policy": state.get("invariant_policy")
+                    if isinstance(state.get("invariant_policy"), dict)
+                    else {},
+                },
+            )
+        except Exception as e:
+            await self._send_error(writer, str(e))
+
+    async def _handle_set_invariant_policy(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        key = str(request.get("key") or "").strip()
+        policy = str(request.get("policy") or "").strip().lower()
+        if key not in INVARIANT_KEYS:
+            await self._send_error(writer, "invalid invariant key")
+            return
+        if policy not in ("strict", "warn"):
+            await self._send_error(writer, "invalid invariant policy")
+            return
+        try:
+            state = self.profile_store.set_invariant_policy(key=key, policy=policy)
+            await self._send_json(
+                writer,
+                {
+                    "type": "ok",
+                    "ok": True,
+                    "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
+                    "invariant_policy": state.get("invariant_policy")
+                    if isinstance(state.get("invariant_policy"), dict)
+                    else {},
+                },
+            )
+        except Exception as e:
+            await self._send_error(writer, str(e))
+
     async def _handle_get_task_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         task_state = self.task_store.get_state()
         try:
@@ -1823,6 +2107,10 @@ class LLMAgentServer:
                 "task_paused": bool(task_state_now.get("is_paused", False)),
                 "task_injected": True,
                 "token_stats": token_stats,
+                "invariants_applied": True,
+                "invariants_conflict_key": "",
+                "invariants_decision": "pass",
+                "validation_retries": 0,
             }
             if error_text:
                 message_stats["error"] = error_text
@@ -1890,6 +2178,7 @@ class LLMAgentServer:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 trace_id=f"{req_id}-plan",
+                stage="planning",
             )
             plan = self._extract_plan_items(plan_raw)
             self._log_task_payload(name="TASK_PLAN_PARSED", req_id=f"{req_id}-plan", payload=plan)
@@ -1940,6 +2229,7 @@ class LLMAgentServer:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     trace_id=f"{req_id}-replan",
+                    stage="planning",
                 )
                 new_plan = self._extract_plan_items(replan_raw)
                 self._log_task_payload(name="TASK_REPLAN_PARSED", req_id=f"{req_id}-replan", payload=new_plan)
@@ -2038,6 +2328,7 @@ class LLMAgentServer:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         trace_id=f"{req_id}-exec-plan",
+                        stage="execution",
                     )
                     _acc_usage(usage_exec)
                     commands = self._extract_commands(exec_raw)
@@ -2110,6 +2401,7 @@ class LLMAgentServer:
                             temperature=temperature,
                             max_tokens=max_tokens,
                             trace_id=f"{req_id}-exec-repair-mismatch",
+                            stage="execution",
                         )
                         _acc_usage(usage_repair)
                         repair_commands = self._extract_commands(repair_raw)
@@ -2130,6 +2422,24 @@ class LLMAgentServer:
                                 error_text="empty_or_mismatch_execution_commands",
                             )
                             return
+
+                    commands_validation = self._validate_commands_with_invariants(commands)
+                    if str(commands_validation.get("decision") or "pass") == "fail":
+                        fail_state = self.task_store.update_progress(
+                            expected_action="Команды выполнения отклонены strict-инвариантами."
+                        )
+                        await _send_orchestrator_done(
+                            answer_text=str(commands_validation.get("reason") or "Команды отклонены инвариантами."),
+                            usage_data=usage_agg,
+                            final_task_state=fail_state,
+                            strategy_name="task_execution_failed",
+                            error_text="invariants_block_execution_commands",
+                        )
+                        return
+                    if str(commands_validation.get("decision") or "pass") == "warn":
+                        warnings = commands_validation.get("warnings") if isinstance(commands_validation.get("warnings"), list) else []
+                        if warnings:
+                            await _signal("execution", f"Предупреждение инвариантов: {warnings[0]}")
 
                     await _signal("execution", f"Выполняю шаг: {current_step}", step=task_state.get("step"), total=task_state.get("total"))
 
@@ -2184,6 +2494,7 @@ class LLMAgentServer:
                             temperature=temperature,
                             max_tokens=max_tokens,
                             trace_id=f"{req_id}-exec-repair",
+                            stage="execution",
                         )
                         _acc_usage(usage_repair)
                         repair_commands = self._extract_commands(repair_raw)
@@ -2247,6 +2558,7 @@ class LLMAgentServer:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         trace_id=f"{req_id}-validate-plan",
+                        stage="validation",
                     )
                     _acc_usage(usage_val)
                     validation_commands = self._extract_commands(val_raw)
@@ -2262,6 +2574,19 @@ class LLMAgentServer:
                             final_task_state=fail_state,
                             strategy_name="task_validation_failed",
                             error_text="empty_validation_commands",
+                        )
+                        return
+                    validation_commands_check = self._validate_commands_with_invariants(validation_commands)
+                    if str(validation_commands_check.get("decision") or "pass") == "fail":
+                        fail_state = self.task_store.update_progress(
+                            expected_action="Команды проверки отклонены strict-инвариантами."
+                        )
+                        await _send_orchestrator_done(
+                            answer_text=str(validation_commands_check.get("reason") or "Команды проверки отклонены инвариантами."),
+                            usage_data=usage_agg,
+                            final_task_state=fail_state,
+                            strategy_name="task_validation_failed",
+                            error_text="invariants_block_validation_commands",
                         )
                         return
 
@@ -2451,213 +2776,212 @@ class LLMAgentServer:
 
         history.append({"role": "user", "content": user_text})
 
-        gen = None
         assistant_answer = ""
+        invariants_decision = "pass"
+        invariants_conflict_key = ""
 
-        try:
-            self._log_api_request(
-                req_id=req_id,
-                session_id=session_id,
-                branch_id=bid,
-                model=model,
-                endpoint=endpoint,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                keep_last_n=keep_last_n,
-                strategy=strategy_for_context,
-                user_text=user_text_for_api,
-                history_for_llm=history_for_llm,
-                system_text=system_text,
-                explicit_memory=explicit_memory,
-            )
-            self.logger.write(
-                "INFO",
-                "SERVER_PROFILE_CONTEXT",
-                extra=json.dumps(
-                    {
-                        "req_id": req_id,
-                        "use_profile": use_profile,
-                        "active_profile": active_profile,
-                        "profile_description_len": len(profile_description),
-                        "profile_applied": profile_applied,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            self.logger.write(
-                "INFO",
-                "SERVER_TASK_CONTEXT",
-                extra=json.dumps(
-                    {
-                        "req_id": req_id,
-                        "task_state": str(task_state.get("state") or "planning"),
-                        "task_step": int(task_state.get("step") or 0),
-                        "task_total": int(task_state.get("total") or 0),
-                        "task_paused": bool(task_state.get("is_paused", False)),
-                        "task_injected": task_injected,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            gen = self.gpt.stream_chat(
-                user_text=user_text_for_api,
-                system_text=system_text,
-                history=history_for_llm,
-                max_tokens=max_tokens,
-                model=model,
-                endpoint=endpoint,
-                temperature=temperature,
-                include_usage=True,
-                trace_id=req_id,
-            )
-
-            async for chunk in gen:
-                assistant_answer += chunk
-                await self._send_json(writer, {"type": "chunk", "chunk": chunk})
-
-            usage = getattr(self.gpt, "last_usage", None) or {}
-            cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
-
-            history.append({"role": "assistant", "content": assistant_answer})
-            self._sync_short_term_from_history(memory_layers, history)
-            branch["memory_layers"] = memory_layers
-
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            branch["history"] = history
-            branch["updated_at"] = now
-            branches[bid] = branch
-            session["branches"] = branches
-            session["updated_at"] = now
-            session["active_branch"] = bid
-            self.memory_store.save_session(session)
-
-            task_before_auto_step = self.task_store.get_state()
-            current_task_state = task_before_auto_step
-            try:
-                cur_state = str(task_before_auto_step.get("state") or "planning")
-                if (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "execution":
-                    if self._has_step_done_marker(assistant_answer):
-                        current_task_state = self.task_store.next_step()
-                        self._log_task_action(
-                            action="auto_advance_execution_after_response",
-                            before=task_before_auto_step,
-                            after=current_task_state,
-                        )
-                    else:
-                        self._log_task_action(
-                            action="auto_hold_execution_wait_step_done",
-                            before=task_before_auto_step,
-                            after=task_before_auto_step,
-                        )
-                elif (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "validation":
-                    if self._has_validation_fail_marker(assistant_answer) or self._is_validation_failed_signal(assistant_answer):
-                        current_task_state = self.task_store.transition("execution")
-                        self._log_task_action(
-                            action="auto_validation_to_execution",
-                            before=task_before_auto_step,
-                            after=current_task_state,
-                        )
-                    elif self._has_validation_pass_marker(assistant_answer):
-                        current_task_state = self.task_store.transition("done")
-                        self._log_task_action(
-                            action="auto_validation_to_done",
-                            before=task_before_auto_step,
-                            after=current_task_state,
-                        )
-                    else:
-                        self._log_task_action(
-                            action="auto_hold_validation_wait_marker",
-                            before=task_before_auto_step,
-                            after=task_before_auto_step,
-                        )
-            except Exception as e:
-                self._log_task_action(
-                    action="auto_advance_after_response",
-                    before=task_before_auto_step,
-                    error=str(e),
-                )
-                current_task_state = self.task_store.get_state()
-
-            assistant_answer = self._strip_control_markers(assistant_answer)
-            if history and isinstance(history[-1], dict) and str(history[-1].get("role") or "") == "assistant":
-                history[-1]["content"] = assistant_answer
-
-            sent_messages = int(len(history_for_llm) + (1 if system_text else 0) + 1)
-            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-            completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-            total_tokens_call = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-
-            full_history_tokens_est = self._estimate_tokens_messages(history)
-            context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
-            user_tokens_est = self._estimate_tokens_text(user_text_for_api)
-            assistant_tokens_est = completion_tokens if completion_tokens > 0 else self._estimate_tokens_text(assistant_answer)
-            model_context_limit = self._resolve_context_limit(model)
-            may_exceed_context = bool((context_tokens_est + user_tokens_est) > model_context_limit)
-
-            token_stats = {
-                "user_text_tokens_est": int(user_tokens_est),
-                "context_tokens_est": int(context_tokens_est),
-                "assistant_tokens": int(assistant_tokens_est),
-                "total_tokens_call": int(total_tokens_call),
-                "dialog_tokens_est": int(full_history_tokens_est),
-                "model_context_limit": int(model_context_limit),
-                "may_exceed_context": may_exceed_context,
-            }
-            facts_count = int(len(facts) if isinstance(facts, dict) else 0) if strategy_for_context == "facts" else None
-            message_stats = {
-                "strategy": strategy_display,
-                "branch_id": bid,
-                "use_profile": use_profile,
-                "active_profile": active_profile or "Без профиля",
-                "profile_description_len": int(len(profile_description)),
-                "profile_applied": profile_applied,
-                "keep_last_n": int(keep_last_n),
-                "sent_messages": int(sent_messages),
-                "facts_count": facts_count,
-                "memory_layers_counts": {
-                    "short_term": int(len(memory_layers.get("short_term") or [])) if isinstance(memory_layers.get("short_term"), list) else 0,
-                    "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
-                    "long_term": int(len(memory_layers.get("long_term") or {})) if isinstance(memory_layers.get("long_term"), dict) else 0,
-                },
-                "task_state": str(current_task_state.get("state") or "planning"),
-                "task_step": int(current_task_state.get("step") or 0),
-                "task_total": int(current_task_state.get("total") or 0),
-                "task_paused": bool(current_task_state.get("is_paused", False)),
-                "task_injected": task_injected,
-                "token_stats": token_stats,
-            }
-
-            await self._send_json(
-                writer,
+        self._log_api_request(
+            req_id=req_id,
+            session_id=session_id,
+            branch_id=bid,
+            model=model,
+            endpoint=endpoint,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            keep_last_n=keep_last_n,
+            strategy=strategy_for_context,
+            user_text=user_text_for_api,
+            history_for_llm=history_for_llm,
+            system_text=system_text,
+            explicit_memory=explicit_memory,
+        )
+        self.logger.write(
+            "INFO",
+            "SERVER_PROFILE_CONTEXT",
+            extra=json.dumps(
                 {
-                    "type": "done",
-                    "model": model,
-                    "endpoint": endpoint,
-                    "usage": usage,
-                    "cost_rub": cost_rub,
-                    "session_id": session_id,
-                    "title": session.get("title") or "",
-                    "active_branch": bid,
-                    "message_stats": message_stats,
-                    "facts": (facts if strategy_for_context == "facts" and isinstance(facts, dict) else {}),
-                    "memory_layers": memory_layers,
-                    "token_stats": token_stats,
-                    "task_state": current_task_state,
-                    "profile_info": {
-                        "use_profile": use_profile,
-                        "active_profile": active_profile,
-                        "profile_description_len": int(len(profile_description)),
-                        "profile_applied": profile_applied,
-                    },
+                    "req_id": req_id,
+                    "use_profile": use_profile,
+                    "active_profile": active_profile,
+                    "profile_description_len": len(profile_description),
+                    "profile_applied": profile_applied,
                 },
-            )
+                ensure_ascii=False,
+            ),
+        )
+        self.logger.write(
+            "INFO",
+            "SERVER_TASK_CONTEXT",
+            extra=json.dumps(
+                {
+                    "req_id": req_id,
+                    "task_state": str(task_state.get("state") or "planning"),
+                    "task_step": int(task_state.get("step") or 0),
+                    "task_total": int(task_state.get("total") or 0),
+                    "task_paused": bool(task_state.get("is_paused", False)),
+                    "task_injected": task_injected,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        assistant_answer, usage = await self._llm_generate_text(
+            user_text=user_text_for_api,
+            system_text=system_text,
+            history=history_for_llm,
+            max_tokens=max_tokens,
+            model=model,
+            endpoint=endpoint,
+            temperature=temperature,
+            trace_id=req_id,
+            stage="chat",
+            max_retries=2,
+            validate_invariants=True,
+        )
+        usage = usage if isinstance(usage, dict) else {}
+        cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
+        validation_snapshot = self._validate_output_by_invariants(assistant_answer)
+        invariants_decision = str(validation_snapshot.get("decision") or "pass")
+        invariants_conflict_key = str(validation_snapshot.get("conflict_key") or "")
+        if assistant_answer:
+            await self._send_json(writer, {"type": "chunk", "chunk": assistant_answer})
 
-        finally:
-            if gen is not None:
-                try:
-                    await gen.aclose()
-                except Exception:
-                    pass
+        history.append({"role": "assistant", "content": assistant_answer})
+        self._sync_short_term_from_history(memory_layers, history)
+        branch["memory_layers"] = memory_layers
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        branch["history"] = history
+        branch["updated_at"] = now
+        branches[bid] = branch
+        session["branches"] = branches
+        session["updated_at"] = now
+        session["active_branch"] = bid
+        self.memory_store.save_session(session)
+
+        task_before_auto_step = self.task_store.get_state()
+        current_task_state = task_before_auto_step
+        try:
+            cur_state = str(task_before_auto_step.get("state") or "planning")
+            if (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "execution":
+                if self._has_step_done_marker(assistant_answer):
+                    current_task_state = self.task_store.next_step()
+                    self._log_task_action(
+                        action="auto_advance_execution_after_response",
+                        before=task_before_auto_step,
+                        after=current_task_state,
+                    )
+                else:
+                    self._log_task_action(
+                        action="auto_hold_execution_wait_step_done",
+                        before=task_before_auto_step,
+                        after=task_before_auto_step,
+                    )
+            elif (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "validation":
+                if self._has_validation_fail_marker(assistant_answer) or self._is_validation_failed_signal(assistant_answer):
+                    current_task_state = self.task_store.transition("execution")
+                    self._log_task_action(
+                        action="auto_validation_to_execution",
+                        before=task_before_auto_step,
+                        after=current_task_state,
+                    )
+                elif self._has_validation_pass_marker(assistant_answer):
+                    current_task_state = self.task_store.transition("done")
+                    self._log_task_action(
+                        action="auto_validation_to_done",
+                        before=task_before_auto_step,
+                        after=current_task_state,
+                    )
+                else:
+                    self._log_task_action(
+                        action="auto_hold_validation_wait_marker",
+                        before=task_before_auto_step,
+                        after=task_before_auto_step,
+                    )
+        except Exception as e:
+            self._log_task_action(
+                action="auto_advance_after_response",
+                before=task_before_auto_step,
+                error=str(e),
+            )
+            current_task_state = self.task_store.get_state()
+
+        assistant_answer = self._strip_control_markers(assistant_answer)
+        if history and isinstance(history[-1], dict) and str(history[-1].get("role") or "") == "assistant":
+            history[-1]["content"] = assistant_answer
+
+        sent_messages = int(len(history_for_llm) + (1 if system_text else 0) + 1)
+        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        total_tokens_call = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+
+        full_history_tokens_est = self._estimate_tokens_messages(history)
+        context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
+        user_tokens_est = self._estimate_tokens_text(user_text_for_api)
+        assistant_tokens_est = completion_tokens if completion_tokens > 0 else self._estimate_tokens_text(assistant_answer)
+        model_context_limit = self._resolve_context_limit(model)
+        may_exceed_context = bool((context_tokens_est + user_tokens_est) > model_context_limit)
+
+        token_stats = {
+            "user_text_tokens_est": int(user_tokens_est),
+            "context_tokens_est": int(context_tokens_est),
+            "assistant_tokens": int(assistant_tokens_est),
+            "total_tokens_call": int(total_tokens_call),
+            "dialog_tokens_est": int(full_history_tokens_est),
+            "model_context_limit": int(model_context_limit),
+            "may_exceed_context": may_exceed_context,
+        }
+        facts_count = int(len(facts) if isinstance(facts, dict) else 0) if strategy_for_context == "facts" else None
+        message_stats = {
+            "strategy": strategy_display,
+            "branch_id": bid,
+            "use_profile": use_profile,
+            "active_profile": active_profile or "Без профиля",
+            "profile_description_len": int(len(profile_description)),
+            "profile_applied": profile_applied,
+            "keep_last_n": int(keep_last_n),
+            "sent_messages": int(sent_messages),
+            "facts_count": facts_count,
+            "memory_layers_counts": {
+                "short_term": int(len(memory_layers.get("short_term") or [])) if isinstance(memory_layers.get("short_term"), list) else 0,
+                "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
+                "long_term": int(len(memory_layers.get("long_term") or {})) if isinstance(memory_layers.get("long_term"), dict) else 0,
+            },
+            "task_state": str(current_task_state.get("state") or "planning"),
+            "task_step": int(current_task_state.get("step") or 0),
+            "task_total": int(current_task_state.get("total") or 0),
+            "task_paused": bool(current_task_state.get("is_paused", False)),
+            "task_injected": task_injected,
+            "token_stats": token_stats,
+            "invariants_applied": True,
+            "invariants_conflict_key": invariants_conflict_key,
+            "invariants_decision": invariants_decision,
+            "validation_retries": 2,
+        }
+
+        await self._send_json(
+            writer,
+            {
+                "type": "done",
+                "model": model,
+                "endpoint": endpoint,
+                "usage": usage,
+                "cost_rub": cost_rub,
+                "session_id": session_id,
+                "title": session.get("title") or "",
+                "active_branch": bid,
+                "message_stats": message_stats,
+                "facts": (facts if strategy_for_context == "facts" and isinstance(facts, dict) else {}),
+                "memory_layers": memory_layers,
+                "token_stats": token_stats,
+                "task_state": current_task_state,
+                "profile_info": {
+                    "use_profile": use_profile,
+                    "active_profile": active_profile,
+                    "profile_description_len": int(len(profile_description)),
+                    "profile_applied": profile_applied,
+                },
+            },
+        )
 
     # === Цикл обслуживания сокета ===
 

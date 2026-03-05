@@ -227,6 +227,7 @@ class GPTModel:
             t0 = time.perf_counter()
             chunks = 0
             chars_out = 0
+            response_preview_parts: List[str] = []
             self._log_struct(
                 "INFO",
                 "GPTMODEL_API_REQUEST",
@@ -301,6 +302,8 @@ class GPTModel:
                                     if content:
                                         chunks += 1
                                         chars_out += len(content)
+                                        if len("".join(response_preview_parts)) < 4000:
+                                            response_preview_parts.append(content)
                                         yield content
                         except Exception:
                             continue
@@ -315,6 +318,7 @@ class GPTModel:
                     "chunks": int(chunks),
                     "chars_out": int(chars_out),
                     "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
+                    "response_preview": "".join(response_preview_parts)[:4000],
                 },
             )
 
@@ -377,6 +381,7 @@ class GPTModel:
             t0 = time.perf_counter()
             chunks = 0
             chars_out = 0
+            response_preview_parts: List[str] = []
             self._log_struct(
                 "INFO",
                 "GPTMODEL_API_REQUEST",
@@ -453,6 +458,8 @@ class GPTModel:
                                 if delta_text:
                                     chunks += 1
                                     chars_out += len(delta_text)
+                                    if len("".join(response_preview_parts)) < 4000:
+                                        response_preview_parts.append(delta_text)
                                     yield delta_text
                         except Exception:
                             continue
@@ -467,5 +474,6 @@ class GPTModel:
                     "chunks": int(chunks),
                     "chars_out": int(chars_out),
                     "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
+                    "response_preview": "".join(response_preview_parts)[:4000],
                 },
             )

@@ -152,8 +152,58 @@ class MetricsMemoryTab(BaseTab):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
+        right_layout.setSpacing(8)
         right_layout.addWidget(profile_group)
+        self.invariant_key_selector = QComboBox()
+        self.invariant_key_selector.setMinimumWidth(220)
+        self.invariant_key_selector.addItem("architecture", "architecture")
+        self.invariant_key_selector.addItem("technical_decisions", "technical_decisions")
+        self.invariant_key_selector.addItem("stack_constraints", "stack_constraints")
+        self.invariant_key_selector.addItem("business_rules", "business_rules")
+        self.invariant_key_selector.addItem("safety_restrictions", "safety_restrictions")
+        self.invariant_key_selector.addItem("response_style", "response_style")
+
+        self.invariant_policy_selector = QComboBox()
+        self.invariant_policy_selector.setMinimumWidth(140)
+        self.invariant_policy_selector.addItem("strict", "strict")
+        self.invariant_policy_selector.addItem("warn", "warn")
+
+        self.invariant_value_input = QTextEdit()
+        self.invariant_value_input.setMinimumHeight(90)
+        self.invariant_value_input.setPlaceholderText("Значение инварианта для выбранного ключа.")
+
+        self.save_invariant_btn = QPushButton("Сохранить инвариант")
+
+        self.invariants_box = QTextEdit()
+        self.invariants_box.setReadOnly(True)
+        self.invariants_box.setMinimumHeight(160)
+        self.invariants_box.setPlaceholderText("Сводка key: value (policy).")
+
+        invariants_group = QGroupBox("Инварианты:")
+        ig = QVBoxLayout(invariants_group)
+        ig.setContentsMargins(8, 8, 8, 8)
+        ig.setSpacing(8)
+
+        invariant_row = QWidget()
+        ir = QHBoxLayout(invariant_row)
+        ir.setContentsMargins(0, 0, 0, 0)
+        ir.setSpacing(8)
+        ir.addWidget(self.invariant_key_selector)
+        ir.addWidget(self.invariant_policy_selector)
+
+        invariants_hint = QLabel(
+            "strict: нарушение запрещено (отказ). warn: нарушение допускается с предупреждением."
+        )
+        invariants_hint.setWordWrap(True)
+
+        ig.addWidget(invariant_row)
+        ig.addWidget(self.invariant_value_input)
+        ig.addWidget(self.save_invariant_btn)
+        ig.addWidget(invariants_hint)
+        ig.addWidget(self.invariants_box)
+
+        right_layout.addWidget(invariants_group)
+        right_layout.addStretch(1)
 
         self.metrics_splitter = QSplitter(Qt.Horizontal)
         self.metrics_splitter.addWidget(left_widget)
@@ -172,3 +222,4 @@ class MetricsMemoryTab(BaseTab):
     def clear_panels(self):
         self.metrics_box.clear()
         self.memory_box.clear()
+        self.invariants_box.clear()
