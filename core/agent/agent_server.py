@@ -94,6 +94,7 @@ class LLMAgentServer:
             "resume_task": self._handle_resume_task,
             "next_task_step": self._handle_next_task_step,
             "update_task_progress": self._handle_update_task_progress,
+            "delete_task": self._handle_delete_task,
             "stream_chat": self._handle_stream_chat,
         }
         self._model_context_limit: Dict[str, int] = {
@@ -156,6 +157,23 @@ class LLMAgentServer:
 
     async def _send_error(self, writer: asyncio.StreamWriter, message: str) -> None:
         await self._send_json(writer, {"type": "error", "message": message})
+
+    async def _send_task_signal(
+        self,
+        writer: asyncio.StreamWriter,
+        *,
+        message: str,
+        stage: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "type": "task_signal",
+            "message": str(message or "").strip(),
+            "stage": str(stage or "").strip(),
+        }
+        if isinstance(extra, dict) and extra:
+            payload["extra"] = extra
+        await self._send_json(writer, payload)
 
     # === Работа с ветками и чекпоинтами ===
 
@@ -531,6 +549,21 @@ class LLMAgentServer:
                 except Exception:
                     pass
         usage = getattr(self.gpt, "last_usage", None) or {}
+        try:
+            self.logger.write(
+                "INFO",
+                "TASK_LLM_RESPONSE",
+                extra=json.dumps(
+                    {
+                        "req_id": trace_id,
+                        "text": str(text or "")[:8000],
+                        "usage": usage if isinstance(usage, dict) else {},
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception:
+            pass
         return text.strip(), usage
 
     def _extract_json_block(self, text: str) -> Optional[Dict[str, Any]]:
@@ -727,13 +760,24 @@ class LLMAgentServer:
             and "||" not in cmd
         )
 
-    async def _run_powershell_commands(self, commands: List[str], *, timeout_sec: int = 120) -> Dict[str, Any]:
+    async def _run_powershell_commands(
+        self,
+        commands: List[str],
+        *,
+        timeout_sec: int = 120,
+        on_signal: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
         runs: List[Dict[str, Any]] = []
         all_ok = True
         for idx, command in enumerate(commands, start=1):
             cmd = self._normalize_powershell_command(command)
             if not cmd:
                 continue
+            if on_signal is not None:
+                try:
+                    await on_signal({"event": "command_start", "index": idx, "command": cmd})
+                except Exception:
+                    pass
             if self._is_navigation_only_command(cmd):
                 runs.append(
                     {
@@ -746,6 +790,11 @@ class LLMAgentServer:
                         "ok": True,
                     }
                 )
+                if on_signal is not None:
+                    try:
+                        await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": 0})
+                    except Exception:
+                        pass
                 continue
             started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             proc = await asyncio.create_subprocess_exec(
@@ -791,6 +840,11 @@ class LLMAgentServer:
                     "ok": code == 0,
                 }
             )
+            if on_signal is not None:
+                try:
+                    await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": code})
+                except Exception:
+                    pass
         return {"ok": all_ok and bool(runs), "runs": runs}
 
     def _task_log_snapshot(self, task_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -825,6 +879,16 @@ class LLMAgentServer:
         if error:
             payload["error"] = error
         self.logger.write("INFO" if not error else "WARN", "TASK_FSM_ACTION", extra=json.dumps(payload, ensure_ascii=False))
+
+    def _log_task_payload(self, *, name: str, req_id: str, payload: Any) -> None:
+        try:
+            self.logger.write(
+                "INFO",
+                name,
+                extra=json.dumps({"req_id": req_id, "payload": payload}, ensure_ascii=False),
+            )
+        except Exception:
+            pass
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
@@ -1477,6 +1541,17 @@ class LLMAgentServer:
             self._log_task_action(action="update_task_progress", before=before, error=str(e))
             await self._send_error(writer, str(e))
 
+    async def _handle_delete_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.clear_task()
+            self._log_task_action(action="delete_task", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_DELETE_FAILED", extra=str(e))
+            self._log_task_action(action="delete_task", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
     # Основной сценарий запроса: читает параметры стратегии, готовит контекст, запускает стрим к модели, обновляет ветку/память и возвращает done с полной телеметрией.
 
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
@@ -1600,6 +1675,14 @@ class LLMAgentServer:
                     },
                 },
             )
+            try:
+                await self._send_task_signal(writer, message="Ожидание следующего действия", stage="idle")
+            except Exception:
+                pass
+
+        async def _signal(stage: str, message: str, **extra: Any) -> None:
+            payload = {k: v for k, v in extra.items() if v is not None}
+            await self._send_task_signal(writer, message=message, stage=stage, extra=payload if payload else None)
 
         task_state = self.task_store.get_state()
         if bool(task_state.get("is_paused", False)):
@@ -1616,6 +1699,7 @@ class LLMAgentServer:
 
         # Шаг 1-3: новая задача -> LLM планирование -> показать план на подтверждение.
         if (not has_task) or state_now == "done":
+            await _signal("planning", "Формирую план задачи через LLM")
             plan_prompt_system = (
                 "Ты task-orchestrator. Составь короткий, исполнимый план в 3-6 шагов.\n"
                 "Не добавляй отдельные шаги навигации по директориям (например, 'перейти в папку').\n"
@@ -1632,9 +1716,11 @@ class LLMAgentServer:
                 trace_id=f"{req_id}-plan",
             )
             plan = self._extract_plan_items(plan_raw)
+            self._log_task_payload(name="TASK_PLAN_PARSED", req_id=f"{req_id}-plan", payload=plan)
             before_generate = self.task_store.get_state()
             task_state = self.task_store.generate_plan(task=user_text, plan=plan)
             self._log_task_action(action="auto_generate_task_plan_llm", before=before_generate, after=task_state)
+            await _signal("planning", "План сформирован, ожидается подтверждение пользователя", steps=len(plan))
             plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(plan, start=1))
             answer = (
                 "План сформирован. Подтверди план сообщением (например: \"да\"), "
@@ -1650,8 +1736,10 @@ class LLMAgentServer:
                 before_confirm = task_state
                 task_state = self.task_store.confirm_plan()
                 self._log_task_action(action="auto_confirm_plan_on_message", before=before_confirm, after=task_state)
+                await _signal("execution", "План подтвержден, начинаю выполнение")
                 state_now = "execution"
             else:
+                await _signal("planning", "Обновляю план по комментарию пользователя")
                 task_text = str(task_state.get("task") or "").strip() or user_text
                 replan_system = (
                     "Ты task-orchestrator. Перепланируй задачу с учетом комментария пользователя.\n"
@@ -1672,10 +1760,12 @@ class LLMAgentServer:
                     trace_id=f"{req_id}-replan",
                 )
                 new_plan = self._extract_plan_items(replan_raw)
+                self._log_task_payload(name="TASK_REPLAN_PARSED", req_id=f"{req_id}-replan", payload=new_plan)
                 before_replan = task_state
                 task_state = self.task_store.generate_plan(task=task_text, plan=new_plan)
                 log_action = "auto_replan_reject_signal" if self._is_plan_reject_signal(user_text) else "auto_replan_feedback"
                 self._log_task_action(action=log_action, before=before_replan, after=task_state)
+                await _signal("planning", "План обновлен, ожидается подтверждение", steps=len(new_plan))
                 plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(new_plan, start=1))
                 answer = (
                     "План обновлен по твоему комментарию. Подтверди его или снова отклони.\n\n"
@@ -1720,6 +1810,7 @@ class LLMAgentServer:
                 "Сформируй команды, которые агент должен выполнить автоматически для ТЕКУЩЕГО шага.\n"
                 "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
                 "Команды должны быть идемпотентными: повторный запуск не должен падать (используй `-Force`, `Test-Path`, `if (...) { ... }`).\n"
+                "В execution НЕ делай финальную проверку результата задачи и не проверяй артефакты будущих шагов.\n"
                 "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"note\": \"...\"}\n"
                 "Только безопасные и конкретные команды без поясняющего текста вне JSON."
             )
@@ -1756,6 +1847,7 @@ class LLMAgentServer:
                     )
                     _acc_usage(usage_exec)
                     commands = self._extract_commands(exec_raw)
+                    self._log_task_payload(name="TASK_EXEC_COMMANDS_PARSED", req_id=f"{req_id}-exec-plan", payload=commands)
                     if not commands:
                         step_lc = current_step.lower()
                         if (
@@ -1785,20 +1877,67 @@ class LLMAgentServer:
                         )
                         return
 
-                    run_result = await self._run_powershell_commands(commands)
+                    await _signal("execution", f"Выполняю шаг: {current_step}", step=task_state.get("step"), total=task_state.get("total"))
+
+                    async def _on_exec_signal(payload: Dict[str, Any]) -> None:
+                        event = str(payload.get("event") or "")
+                        idx = payload.get("index")
+                        cmd = str(payload.get("command") or "")
+                        exit_code = payload.get("exit_code")
+                        if event == "command_start":
+                            await _signal("execution", f"Команда {idx}: {cmd}", command_index=idx)
+                        elif event == "command_done":
+                            await _signal("execution", f"Команда {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
+
+                    run_result = await self._run_powershell_commands(commands, on_signal=_on_exec_signal)
                     last_run_result = run_result
                     if not bool(run_result.get("ok", False)):
-                        fail_state = self.task_store.update_progress(
-                            expected_action="Выполнение шага завершилось ошибкой. Нужна корректировка команды/плана."
+                        await _signal("execution", "Шаг завершился ошибкой, запрашиваю корректировку команд")
+                        repair_system = (
+                            "Ты исправляешь неудачный execution-шаг.\n"
+                            "На входе: текущий шаг, команды и ошибка выполнения.\n"
+                            "Верни только исправленные команды для ЭТОГО шага.\n"
+                            "Формат строго JSON: {\"commands\": [\"...\"]}"
                         )
-                        await _send_orchestrator_done(
-                            answer_text=_format_runs_error("Ошибка выполнения шага. Логи:", run_result),
-                            usage_data=usage_agg,
-                            final_task_state=fail_state,
-                            strategy_name="task_execution_failed",
-                            error_text="command_execution_failed",
+                        repair_user = (
+                            f"Задача: {task_text}\n"
+                            f"Текущий шаг: {current_step}\n"
+                            f"Команды: {json.dumps(commands, ensure_ascii=False)}\n"
+                            f"Результат ошибки: {json.dumps(run_result, ensure_ascii=False)}\n"
+                            f"Рабочая директория: {self.project_root}"
                         )
-                        return
+                        repair_raw, usage_repair = await self._llm_generate_text(
+                            user_text=repair_user,
+                            system_text=repair_system,
+                            model=model,
+                            endpoint=endpoint,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            trace_id=f"{req_id}-exec-repair",
+                        )
+                        _acc_usage(usage_repair)
+                        repair_commands = self._extract_commands(repair_raw)
+                        self._log_task_payload(name="TASK_EXEC_REPAIR_COMMANDS_PARSED", req_id=f"{req_id}-exec-repair", payload=repair_commands)
+                        if repair_commands:
+                            await _signal("execution", "Выполняю исправленные команды шага")
+                            repair_result = await self._run_powershell_commands(repair_commands, on_signal=_on_exec_signal)
+                            last_run_result = repair_result
+                            if bool(repair_result.get("ok", False)):
+                                run_result = repair_result
+                            else:
+                                run_result = repair_result
+                        if not bool(run_result.get("ok", False)):
+                            fail_state = self.task_store.update_progress(
+                                expected_action="Выполнение шага завершилось ошибкой. Нужна корректировка команды/плана."
+                            )
+                            await _send_orchestrator_done(
+                                answer_text=_format_runs_error("Ошибка выполнения шага. Логи:", run_result),
+                                usage_data=usage_agg,
+                                final_task_state=fail_state,
+                                strategy_name="task_execution_failed",
+                                error_text="command_execution_failed",
+                            )
+                            return
 
                     progress_lines.append(f"Шаг выполнен: {current_step}")
                     before_next = self.task_store.get_state()
@@ -1807,6 +1946,7 @@ class LLMAgentServer:
                     continue
 
                 if cur_state == "validation":
+                    await _signal("validation", "Запрашиваю команды проверки результата")
                     plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
                     validation_user = (
                         f"Задача: {task_text}\n"
@@ -1825,9 +1965,31 @@ class LLMAgentServer:
                     )
                     _acc_usage(usage_val)
                     validation_commands = self._extract_commands(val_raw)
+                    self._log_task_payload(name="TASK_VALIDATION_COMMANDS_PARSED", req_id=f"{req_id}-validate-plan", payload=validation_commands)
                     if not validation_commands:
-                        validation_commands = ["Test-Path ."]
-                    validation_result = await self._run_powershell_commands(validation_commands)
+                        fail_state = self.task_store.update_progress(
+                            expected_action="Ошибка: LLM не вернул команды проверки. Требуется повтор валидации."
+                        )
+                        await _send_orchestrator_done(
+                            answer_text="Ошибка валидации: LLM не вернул команды проверки результата.",
+                            usage_data=usage_agg,
+                            final_task_state=fail_state,
+                            strategy_name="task_validation_failed",
+                            error_text="empty_validation_commands",
+                        )
+                        return
+
+                    async def _on_val_signal(payload: Dict[str, Any]) -> None:
+                        event = str(payload.get("event") or "")
+                        idx = payload.get("index")
+                        cmd = str(payload.get("command") or "")
+                        exit_code = payload.get("exit_code")
+                        if event == "command_start":
+                            await _signal("validation", f"Проверка {idx}: {cmd}", command_index=idx)
+                        elif event == "command_done":
+                            await _signal("validation", f"Проверка {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
+
+                    validation_result = await self._run_powershell_commands(validation_commands, on_signal=_on_val_signal)
                     if bool(validation_result.get("ok", False)):
                         before_done = task_state
                         task_state = self.task_store.transition("done")

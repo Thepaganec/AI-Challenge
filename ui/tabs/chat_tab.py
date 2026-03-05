@@ -134,6 +134,9 @@ class ChatTab(BaseTab):
         self.task_resume_btn = QPushButton("Resume")
         self.task_resume_btn.clicked.connect(self.on_task_resume_clicked)
 
+        self.task_delete_btn = QPushButton("Delete Task")
+        self.task_delete_btn.clicked.connect(self.on_task_delete_clicked)
+
         self.task_next_btn = QPushButton("Next Step")
         self.task_next_btn.clicked.connect(self.on_task_next_clicked)
         self.task_next_btn.setToolTip("Переходы этапов выполняются серверным оркестратором автоматически.")
@@ -146,6 +149,7 @@ class ChatTab(BaseTab):
         tb_l.addWidget(self.task_confirm_btn)
         tb_l.addWidget(self.task_pause_btn)
         tb_l.addWidget(self.task_resume_btn)
+        tb_l.addWidget(self.task_delete_btn)
         tb_l.addWidget(self.task_next_btn)
 
         task_box = QGroupBox("Task State")
@@ -246,6 +250,7 @@ class ChatTab(BaseTab):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
         self.sent_len_label = QLabel("API context tokens(est): N/A")
+        self.task_signal_label = QLabel("Task signal: idle")
 
         self.output_editbox = QTextEdit()
         self.output_editbox.setFont(font)
@@ -437,6 +442,7 @@ class ChatTab(BaseTab):
         lp.addWidget(QLabel("Ввод:"))
         lp.addWidget(self.input_editbox)
         lp.addWidget(self.sent_len_label)
+        lp.addWidget(self.task_signal_label)
         lp.addWidget(self.progress_bar)
         lp.addWidget(QLabel("Вывод:"))
         lp.addWidget(self.output_editbox)
@@ -471,6 +477,8 @@ class ChatTab(BaseTab):
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
+            if not self.is_generating:
+                self.task_signal_label.setText("Task signal: idle")
         self.render_task_state(self.task_state_cache)
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
@@ -821,6 +829,7 @@ class ChatTab(BaseTab):
         self.task_confirm_btn.setEnabled(False)
         self.task_pause_btn.setEnabled(can_pause and not self.is_generating)
         self.task_resume_btn.setEnabled(can_resume and not self.is_generating)
+        self.task_delete_btn.setEnabled((has_task or bool(task) or bool(plan)) and not self.is_generating)
         self.task_next_btn.setEnabled(False)
 
     async def refresh_task_state(self):
@@ -888,6 +897,35 @@ class ChatTab(BaseTab):
             self.logger.success("Переход к следующему шагу выполнен.")
         except Exception as e:
             self.logger.warning(f"Не удалось перейти к следующему шагу: {e}")
+
+    def on_task_delete_clicked(self):
+        asyncio.get_event_loop().create_task(self._delete_task_async())
+
+    async def _delete_task_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: delete task недоступен.")
+            return
+        try:
+            task_state = await self.agent.delete_task()
+            self.render_task_state(task_state)
+            self.task_signal_label.setText("Task signal: task deleted")
+            self.logger.success("Активная задача удалена.")
+        except Exception as e:
+            self.logger.warning(f"Не удалось удалить задачу: {e}")
+
+    def _on_task_signal(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        stage = str(payload.get("stage") or "").strip()
+        message = str(payload.get("message") or "").strip()
+        if not message and not stage:
+            return
+        if stage and message:
+            self.task_signal_label.setText(f"Task signal [{stage}]: {message}")
+        elif message:
+            self.task_signal_label.setText(f"Task signal: {message}")
+        else:
+            self.task_signal_label.setText(f"Task signal [{stage}]")
 
     # === Список сессий и загрузка состояния ===
 
@@ -1434,6 +1472,8 @@ class ChatTab(BaseTab):
                     self.output_editbox.append("\n[Ошибка] Агент не запущен или недоступен.\n")
                     return
 
+            self.agent.on_task_signal = self._on_task_signal
+            self.task_signal_label.setText("Task signal: запрос отправлен")
             gen = self.agent.stream_chat(
                 user_text=user_text,
                 model=model,
@@ -1471,6 +1511,7 @@ class ChatTab(BaseTab):
             self.output_editbox.append(f"\n[Ошибка] {e}\n")
 
         finally:
+            self.agent.on_task_signal = None
             if gen is not None:
                 try:
                     await gen.aclose()
@@ -1572,6 +1613,7 @@ class ChatTab(BaseTab):
         asyncio.get_event_loop().create_task(_pause_task_after_stop())
         self.stop_button.setEnabled(False)
         self.set_loading(False)
+        self.task_signal_label.setText("Task signal: остановлено пользователем")
         self.logger.warning("Стрим остановлен пользователем.")
 
     # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.

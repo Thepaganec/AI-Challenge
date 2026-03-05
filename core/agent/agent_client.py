@@ -34,6 +34,8 @@ class AgentClient:
         self.last_token_stats: Dict[str, Any] = {}
         self.last_profile_info: Dict[str, Any] = {}
         self.last_task_state: Dict[str, Any] = {}
+        self.last_task_signal: Dict[str, Any] = {}
+        self.on_task_signal = None
 
     # === Управление TCP-соединением ===
 
@@ -372,6 +374,15 @@ class AgentClient:
             return state
         return {}
 
+    async def delete_task(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "delete_task"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
     # === Стриминг ответов модели ===
 
     # Запускает stream_chat на сервере, отдаёт чанки в UI и сохраняет итоговые usage/token/profile метрики в полях клиента.
@@ -425,6 +436,7 @@ class AgentClient:
         self.last_token_stats = {}
         self.last_profile_info = {}
         self.last_task_state = {}
+        self.last_task_signal = {}
 
         request: Dict[str, Any] = {
             "action": "stream_chat",
@@ -466,6 +478,21 @@ class AgentClient:
                         chunk = msg.get("chunk") or ""
                         if chunk:
                             yield chunk
+                        continue
+
+                    if msg_type == "task_signal":
+                        signal_payload = {
+                            "stage": msg.get("stage") or "",
+                            "message": msg.get("message") or "",
+                            "extra": msg.get("extra") if isinstance(msg.get("extra"), dict) else {},
+                        }
+                        self.last_task_signal = signal_payload
+                        cb = self.on_task_signal
+                        if callable(cb):
+                            try:
+                                cb(signal_payload)
+                            except Exception:
+                                pass
                         continue
 
                     if msg_type == "done":

@@ -235,3 +235,6 @@ class TaskStateStore:
             if total > 0:
                 data["step"] = min(max(int(step), 1), total)
         return self.save(data)
+
+    def clear_task(self) -> Dict[str, Any]:
+        return self.save(self._default_data())
