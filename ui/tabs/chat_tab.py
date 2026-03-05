@@ -63,6 +63,7 @@ class ChatTab(BaseTab):
         self._profile_selector_changing = False
         self.task_state_cache: dict = {}
         self._task_state_signature: str = ""
+        self._task_state_refresh_inflight: bool = False
 
         self.profile_selector.currentIndexChanged.connect(self.on_profile_selected)
         self.profile_selector.currentTextChanged.connect(self.on_profile_text_changed)
@@ -976,7 +977,6 @@ class ChatTab(BaseTab):
         try:
             asyncio.get_event_loop().create_task(_run())
         except Exception:
-            # если по какой-то причине нет event loop — просто снимаем флаг
             self._sessions_refresh_inflight = False
 
     # Преобразует входные данные в представление для интерфейса и обновляет видимые панели без изменения бизнес-данных.
@@ -1544,6 +1544,16 @@ class ChatTab(BaseTab):
             task_state = getattr(self.agent, "last_task_state", None) or {}
             active_branch = getattr(self.agent, "last_active_branch", None) or self.current_branch_id
             self.current_branch_id = active_branch
+
+            # Берем каноничное состояние задачи отдельным RPC после любого стрима.
+            # Это убирает рассинхрон, когда done/task_state в потоке устарел или пустой.
+            if self.is_agent_connected:
+                try:
+                    rpc_task_state = await self.agent.get_task_state()
+                    if isinstance(rpc_task_state, dict):
+                        task_state = rpc_task_state
+                except Exception as e:
+                    self.logger.warning(f"Не удалось синхронизировать task_state после ответа: {e}")
 
             strategy_used = ms.get("strategy") or strategy
             facts_count = ms.get("facts_count")

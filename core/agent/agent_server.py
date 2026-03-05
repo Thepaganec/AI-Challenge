@@ -360,12 +360,12 @@ class LLMAgentServer:
         long_term = memory_layers.get("long_term")
         lines: List[str] = []
         if isinstance(working, dict) and working:
-            lines.append("WORKING MEMORY:")
+            lines.append("[MEMORY_WORKING]")
             for k, v in working.items():
                 if k and v is not None:
                     lines.append(f"- {k}: {v}")
         if isinstance(long_term, dict) and long_term:
-            lines.append("LONG-TERM MEMORY:")
+            lines.append("[MEMORY_LONG_TERM]")
             for k, v in long_term.items():
                 if k and v is not None:
                     lines.append(f"- {k}: {v}")
@@ -381,7 +381,7 @@ class LLMAgentServer:
         if not clean_name or not clean_desc:
             return None
         return (
-            "USER PROFILE:\n"
+            "[PROFILE]\n"
             f"- name: {clean_name}\n"
             f"- description: {clean_desc}\n"
             "Follow this profile automatically when generating the answer."
@@ -406,19 +406,26 @@ class LLMAgentServer:
         if not task or total <= 0 or not plan:
             return None
 
-        plan_text = "; ".join(str(x).strip() for x in plan if str(x).strip()) or "-"
-        done_text = "; ".join(str(x).strip() for x in done if str(x).strip()) or "-"
+        plan_lines = [f"- {str(x).strip()}" for x in plan if str(x).strip()]
+        done_lines = [f"- {str(x).strip()}" for x in done if str(x).strip()]
+        if not plan_lines:
+            plan_lines = ["- -"]
+        if not done_lines:
+            done_lines = ["- -"]
 
         return (
-            "[TASK]\n"
-            f"task: {task}\n"
-            f"state: {state}\n"
-            f"step: {step}/{total}\n"
-            f"current: {current or '-'}\n"
-            f"expected_action: {expected_action or '-'}\n"
-            f"plan: {plan_text}\n"
-            f"done: {done_text}\n\n"
-            "Rules:\n"
+            "[TASK_CONTEXT]\n"
+            f"TASK: {task}\n"
+            f"TASK_STATE: {state}\n"
+            f"TASK_STEP: {step}\n"
+            f"TASK_TOTAL: {total}\n"
+            f"TASK_CURRENT: {current or '-'}\n"
+            f"TASK_EXPECTED_ACTION: {expected_action or '-'}\n"
+            "TASK_PLAN:\n"
+            f"{chr(10).join(plan_lines)}\n"
+            "TASK_DONE:\n"
+            f"{chr(10).join(done_lines)}\n\n"
+            "TASK_RULES:\n"
             "- Work only inside the current step.\n"
             "- Do not skip FSM stages.\n"
             "- If step is complete, proceed via next_step.\n"
@@ -691,10 +698,97 @@ class LLMAgentServer:
             return out
         return []
 
+    def _extract_set_location_target(self, command: str) -> Optional[str]:
+        cmd = str(command or "").strip()
+        m = re.match(r"(?i)^set-location\s+-literalpath\s+(.+)$", cmd)
+        if not m:
+            return None
+        raw = str(m.group(1) or "").strip()
+        if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
+            raw = raw[1:-1]
+        return raw.strip() or None
+
+    def _resolve_cwd(self, base_dir: str, target: str) -> str:
+        target_clean = str(target or "").strip()
+        if not target_clean:
+            return base_dir
+        if os.path.isabs(target_clean):
+            return os.path.abspath(target_clean)
+        return os.path.abspath(os.path.join(base_dir, target_clean))
+
+    def _is_mutating_command(self, command: str) -> bool:
+        cmd = str(command or "").strip().lower()
+        if not cmd:
+            return False
+        mutating_prefixes = (
+            "new-item",
+            "set-content",
+            "add-content",
+            "remove-item",
+            "move-item",
+            "copy-item",
+            "clear-content",
+            "invoke-item",
+            ".\\",
+            "./",
+        )
+        return any(cmd.startswith(p) for p in mutating_prefixes)
+
+    def _extract_step_artifact_tokens(self, step_text: str) -> List[str]:
+        raw = str(step_text or "").strip()
+        if not raw:
+            return []
+        tokens = re.findall(r"[A-Za-z0-9_.\\/-]+", raw)
+        stop = {
+            "new-item",
+            "set-content",
+            "add-content",
+            "test-path",
+            "get-childitem",
+            "path",
+            "itemtype",
+            "file",
+            "directory",
+        }
+        out: List[str] = []
+        for t in tokens:
+            tok = str(t).strip()
+            if len(tok) < 2:
+                continue
+            if tok.lower() in stop:
+                continue
+            if tok not in out:
+                out.append(tok)
+        return out
+
+    def _commands_cover_current_step(self, current_step: str, commands: List[str]) -> Tuple[bool, List[str]]:
+        step_tokens = self._extract_step_artifact_tokens(current_step)
+        if not step_tokens:
+            return True, []
+        cmd_blob = " ".join(str(c or "") for c in commands).lower()
+        missing: List[str] = []
+        for tok in step_tokens:
+            if tok.lower() not in cmd_blob:
+                missing.append(tok)
+        return len(missing) == 0, missing
+
     def _normalize_powershell_command(self, command: str) -> str:
         cmd = str(command or "").strip()
         if not cmd:
             return ""
+
+        # Исправляем частый сломанный формат от LLM:
+        # Test-Path '-Path "AI\BW"' -> Test-Path -Path "AI\BW"
+        cmd = re.sub(
+            r"(?i)\b(Test-Path|Get-ChildItem|New-Item|Set-Content|Add-Content)\s+'-(Path|LiteralPath)\s+\"([^\"]+)\"'",
+            r'\1 -\2 "\3"',
+            cmd,
+        )
+        cmd = re.sub(
+            r"(?i)\b(Test-Path|Get-ChildItem|New-Item|Set-Content|Add-Content)\s+\"-(Path|LiteralPath)\s+'([^']+)'\"",
+            r"\1 -\2 '\3'",
+            cmd,
+        )
 
         def _quote_path_value(v: str) -> str:
             value = str(v or "").strip()
@@ -781,9 +875,12 @@ class LLMAgentServer:
         on_signal: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         trace_id: str = "",
         stage: str = "",
+        cwd: str = "",
     ) -> Dict[str, Any]:
         runs: List[Dict[str, Any]] = []
         all_ok = True
+        run_cwd = str(cwd or "").strip() or self.project_root
+        effective_cwd = run_cwd
         for idx, command in enumerate(commands, start=1):
             cmd = self._normalize_powershell_command(command)
             if not cmd:
@@ -798,6 +895,7 @@ class LLMAgentServer:
                             "stage": stage,
                             "index": idx,
                             "command": cmd,
+                            "cwd": effective_cwd,
                         },
                         ensure_ascii=False,
                     ),
@@ -810,6 +908,9 @@ class LLMAgentServer:
                 except Exception:
                     pass
             if self._is_navigation_only_command(cmd):
+                nav_target = self._extract_set_location_target(cmd)
+                if nav_target:
+                    effective_cwd = self._resolve_cwd(effective_cwd, nav_target)
                 runs.append(
                     {
                         "index": idx,
@@ -819,6 +920,7 @@ class LLMAgentServer:
                         "stdout": "",
                         "stderr": "",
                         "ok": True,
+                        "cwd_after": effective_cwd,
                     }
                 )
                 try:
@@ -835,6 +937,7 @@ class LLMAgentServer:
                                 "stdout": "",
                                 "stderr": "",
                                 "navigation_noop": True,
+                                "cwd_after": effective_cwd,
                             },
                             ensure_ascii=False,
                         ),
@@ -853,7 +956,7 @@ class LLMAgentServer:
                 "-NoProfile",
                 "-Command",
                 cmd,
-                cwd=self.project_root,
+                cwd=effective_cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -889,6 +992,7 @@ class LLMAgentServer:
                     "stdout": stdout[-4000:],
                     "stderr": stderr[-4000:],
                     "ok": code == 0,
+                    "cwd_after": effective_cwd,
                 }
             )
             try:
@@ -900,14 +1004,15 @@ class LLMAgentServer:
                             "req_id": trace_id,
                             "stage": stage,
                             "index": idx,
-                            "command": cmd,
-                            "exit_code": code,
-                            "stdout": stdout[-1200:],
-                            "stderr": stderr[-1200:],
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
+                                "command": cmd,
+                                "exit_code": code,
+                                "stdout": stdout[-1200:],
+                                "stderr": stderr[-1200:],
+                                "cwd_after": effective_cwd,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
             except Exception:
                 pass
             if on_signal is not None:
@@ -915,7 +1020,7 @@ class LLMAgentServer:
                     await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": code})
                 except Exception:
                     pass
-        return {"ok": all_ok and bool(runs), "runs": runs}
+        return {"ok": all_ok and bool(runs), "runs": runs, "final_cwd": effective_cwd}
 
     def _task_log_snapshot(self, task_state: Dict[str, Any]) -> Dict[str, Any]:
         state = str(task_state.get("state") or "planning")
@@ -1745,10 +1850,6 @@ class LLMAgentServer:
                     },
                 },
             )
-            try:
-                await self._send_task_signal(writer, message="Ожидание следующего действия", stage="idle")
-            except Exception:
-                pass
 
         async def _signal(stage: str, message: str, **extra: Any) -> None:
             payload = {k: v for k, v in extra.items() if v is not None}
@@ -1777,7 +1878,12 @@ class LLMAgentServer:
                 "Без markdown и пояснений."
             )
             plan_raw, usage = await self._llm_generate_text(
-                user_text=f"Задача пользователя: {user_text}",
+                user_text=(
+                    "TASK_REQUEST:\n"
+                    f"{user_text}\n\n"
+                    "OUTPUT_SCHEMA:\n"
+                    "{\"plan\": [\"step 1\", \"step 2\"]}"
+                ),
                 system_text=plan_prompt_system,
                 model=model,
                 endpoint=endpoint,
@@ -1819,8 +1925,14 @@ class LLMAgentServer:
                 )
                 replan_raw, usage = await self._llm_generate_text(
                     user_text=(
-                        f"Исходная задача: {task_text}\n"
-                        f"Комментарий пользователя к плану: {user_text}"
+                        "ORIGINAL_TASK:\n"
+                        f"{task_text}\n\n"
+                        "CURRENT_PLAN:\n"
+                        f"{json.dumps(task_state.get('plan') if isinstance(task_state.get('plan'), list) else [], ensure_ascii=False)}\n\n"
+                        "USER_FEEDBACK:\n"
+                        f"{user_text}\n\n"
+                        "OUTPUT_SCHEMA:\n"
+                        "{\"plan\": [\"step 1\", \"step 2\"]}"
                     ),
                     system_text=replan_system,
                     model=model,
@@ -1850,6 +1962,7 @@ class LLMAgentServer:
             usage_agg: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             progress_lines: List[str] = []
             last_run_result: Dict[str, Any] = {}
+            execution_cwd = self.project_root
 
             def _acc_usage(usage_piece: Dict[str, Any]) -> None:
                 usage_agg["prompt_tokens"] += int(usage_piece.get("prompt_tokens") or usage_piece.get("input_tokens") or 0)
@@ -1887,6 +2000,8 @@ class LLMAgentServer:
             validation_system = (
                 "Ты проверяющий агент. По результатам выполнения дай команды проверки.\n"
                 "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
+                "Команды проверки должны быть только read-only: `Test-Path`, `Get-ChildItem`, `Get-Content`, `if (...) { throw ... }`.\n"
+                "Запрещены мутационные команды (`New-Item`, `Set-Content`, `Add-Content`, `Remove-Item`, `Move-Item`, `Copy-Item`).\n"
                 "Команды проверки должны быть идемпотентными и явно проверять целевой результат задачи.\n"
                 "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"success_criteria\": \"...\"}\n"
                 "Без markdown и пояснений вне JSON."
@@ -1900,11 +2015,20 @@ class LLMAgentServer:
                     done_steps = task_state.get("done") if isinstance(task_state.get("done"), list) else []
                     current_step = str(task_state.get("current") or "").strip()
                     exec_user = (
-                        f"Задача: {task_text}\n"
-                        f"План: {json.dumps(plan, ensure_ascii=False)}\n"
-                        f"Выполнено: {json.dumps(done_steps, ensure_ascii=False)}\n"
-                        f"Текущий шаг: {current_step}\n"
-                        f"Рабочая директория: {self.project_root}"
+                        "TASK:\n"
+                        f"{task_text}\n\n"
+                        "PLAN:\n"
+                        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
+                        "DONE:\n"
+                        f"{json.dumps(done_steps, ensure_ascii=False)}\n\n"
+                        "CURRENT_STEP:\n"
+                        f"{current_step}\n\n"
+                        "WORKDIR_ROOT:\n"
+                        f"{self.project_root}\n\n"
+                        "WORKDIR_CURRENT:\n"
+                        f"{execution_cwd}\n\n"
+                        "OUTPUT_SCHEMA:\n"
+                        "{\"commands\": [\"powershell command 1\", \"powershell command 2\"], \"note\": \"...\"}"
                     )
                     exec_raw, usage_exec = await self._llm_generate_text(
                         user_text=exec_user,
@@ -1934,18 +2058,78 @@ class LLMAgentServer:
                                 "TASK_EXEC_EMPTY_COMMANDS_RAW",
                                 extra=exec_raw[:800],
                             )
+                    else:
+                        covers_step, missing_tokens = self._commands_cover_current_step(current_step, commands)
+                        if not covers_step:
+                            self.logger.write(
+                                "WARN",
+                                "TASK_EXEC_COMMANDS_MISMATCH_STEP",
+                                extra=json.dumps(
+                                    {
+                                        "req_id": f"{req_id}-exec-plan",
+                                        "current_step": current_step,
+                                        "missing_tokens": missing_tokens,
+                                        "commands": commands,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            )
+                            commands = []
                     if not commands:
                         err_state = self.task_store.update_progress(
                             expected_action="Ошибка: LLM не вернул исполняемые команды. Ожидается уточнение пользователя."
                         )
-                        await _send_orchestrator_done(
-                            answer_text="Ошибка оркестратора: не удалось получить команды выполнения от LLM.",
-                            usage_data=usage_agg,
-                            final_task_state=err_state,
-                            strategy_name="task_execution_failed",
-                            error_text="empty_execution_commands",
+                        await _signal("execution", "Получены нерелевантные команды, запрашиваю корректировку")
+                        repair_system = (
+                            "Ты исправляешь неудачный execution-шаг.\n"
+                            "На входе: текущий шаг, команды и причина отклонения.\n"
+                            "Верни только исправленные команды для ЭТОГО шага.\n"
+                            "Формат строго JSON: {\"commands\": [\"...\"]}"
                         )
-                        return
+                        repair_user = (
+                            "TASK:\n"
+                            f"{task_text}\n\n"
+                            "CURRENT_STEP:\n"
+                            f"{current_step}\n\n"
+                            "PREVIOUS_COMMANDS:\n"
+                            f"{json.dumps(self._extract_commands(exec_raw), ensure_ascii=False)}\n\n"
+                            "REJECTION_REASON:\n"
+                            "Команды не покрывают текущий шаг или не содержат целевые артефакты шага.\n\n"
+                            "WORKDIR_ROOT:\n"
+                            f"{self.project_root}\n\n"
+                            "WORKDIR_CURRENT:\n"
+                            f"{execution_cwd}\n\n"
+                            "OUTPUT_SCHEMA:\n"
+                            "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
+                        )
+                        repair_raw, usage_repair = await self._llm_generate_text(
+                            user_text=repair_user,
+                            system_text=repair_system,
+                            model=model,
+                            endpoint=endpoint,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            trace_id=f"{req_id}-exec-repair-mismatch",
+                        )
+                        _acc_usage(usage_repair)
+                        repair_commands = self._extract_commands(repair_raw)
+                        covers_step, _ = self._commands_cover_current_step(current_step, repair_commands)
+                        if repair_commands and covers_step:
+                            commands = repair_commands
+                            self._log_task_payload(
+                                name="TASK_EXEC_REPAIR_COMMANDS_PARSED",
+                                req_id=f"{req_id}-exec-repair-mismatch",
+                                payload=repair_commands,
+                            )
+                        else:
+                            await _send_orchestrator_done(
+                                answer_text="Ошибка оркестратора: не удалось получить корректные команды выполнения для текущего шага.",
+                                usage_data=usage_agg,
+                                final_task_state=err_state,
+                                strategy_name="task_execution_failed",
+                                error_text="empty_or_mismatch_execution_commands",
+                            )
+                            return
 
                     await _signal("execution", f"Выполняю шаг: {current_step}", step=task_state.get("step"), total=task_state.get("total"))
 
@@ -1964,7 +2148,9 @@ class LLMAgentServer:
                         on_signal=_on_exec_signal,
                         trace_id=f"{req_id}-exec-run",
                         stage="execution",
+                        cwd=execution_cwd,
                     )
+                    execution_cwd = str(run_result.get("final_cwd") or execution_cwd)
                     last_run_result = run_result
                     if not bool(run_result.get("ok", False)):
                         await _signal("execution", "Шаг завершился ошибкой, запрашиваю корректировку команд")
@@ -1975,11 +2161,20 @@ class LLMAgentServer:
                             "Формат строго JSON: {\"commands\": [\"...\"]}"
                         )
                         repair_user = (
-                            f"Задача: {task_text}\n"
-                            f"Текущий шаг: {current_step}\n"
-                            f"Команды: {json.dumps(commands, ensure_ascii=False)}\n"
-                            f"Результат ошибки: {json.dumps(run_result, ensure_ascii=False)}\n"
-                            f"Рабочая директория: {self.project_root}"
+                            "TASK:\n"
+                            f"{task_text}\n\n"
+                            "CURRENT_STEP:\n"
+                            f"{current_step}\n\n"
+                            "FAILED_COMMANDS:\n"
+                            f"{json.dumps(commands, ensure_ascii=False)}\n\n"
+                            "FAILED_RESULT:\n"
+                            f"{json.dumps(run_result, ensure_ascii=False)}\n\n"
+                            "WORKDIR_ROOT:\n"
+                            f"{self.project_root}\n\n"
+                            "WORKDIR_CURRENT:\n"
+                            f"{execution_cwd}\n\n"
+                            "OUTPUT_SCHEMA:\n"
+                            "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
                         )
                         repair_raw, usage_repair = await self._llm_generate_text(
                             user_text=repair_user,
@@ -2000,7 +2195,9 @@ class LLMAgentServer:
                                 on_signal=_on_exec_signal,
                                 trace_id=f"{req_id}-exec-repair-run",
                                 stage="execution_repair",
+                                cwd=execution_cwd,
                             )
+                            execution_cwd = str(repair_result.get("final_cwd") or execution_cwd)
                             last_run_result = repair_result
                             if bool(repair_result.get("ok", False)):
                                 run_result = repair_result
@@ -2029,10 +2226,18 @@ class LLMAgentServer:
                     await _signal("validation", "Запрашиваю команды проверки результата")
                     plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
                     validation_user = (
-                        f"Задача: {task_text}\n"
-                        f"План: {json.dumps(plan, ensure_ascii=False)}\n"
-                        f"Результаты выполнения: {json.dumps(last_run_result, ensure_ascii=False)}\n"
-                        f"Рабочая директория: {self.project_root}"
+                        "TASK:\n"
+                        f"{task_text}\n\n"
+                        "PLAN:\n"
+                        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
+                        "EXECUTION_RESULT:\n"
+                        f"{json.dumps(last_run_result, ensure_ascii=False)}\n\n"
+                        "WORKDIR_ROOT:\n"
+                        f"{self.project_root}\n\n"
+                        "WORKDIR_CURRENT:\n"
+                        f"{execution_cwd}\n\n"
+                        "OUTPUT_SCHEMA:\n"
+                        "{\"commands\": [\"powershell check 1\", \"powershell check 2\"], \"success_criteria\": \"...\"}"
                     )
                     val_raw, usage_val = await self._llm_generate_text(
                         user_text=validation_user,
@@ -2045,6 +2250,7 @@ class LLMAgentServer:
                     )
                     _acc_usage(usage_val)
                     validation_commands = self._extract_commands(val_raw)
+                    validation_commands = [c for c in validation_commands if not self._is_mutating_command(c)]
                     self._log_task_payload(name="TASK_VALIDATION_COMMANDS_PARSED", req_id=f"{req_id}-validate-plan", payload=validation_commands)
                     if not validation_commands:
                         fail_state = self.task_store.update_progress(
@@ -2074,7 +2280,9 @@ class LLMAgentServer:
                         on_signal=_on_val_signal,
                         trace_id=f"{req_id}-validation-run",
                         stage="validation",
+                        cwd=execution_cwd,
                     )
+                    execution_cwd = str(validation_result.get("final_cwd") or execution_cwd)
                     if bool(validation_result.get("ok", False)):
                         before_done = task_state
                         task_state = self.task_store.transition("done")

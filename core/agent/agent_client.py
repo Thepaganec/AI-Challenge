@@ -89,11 +89,15 @@ class AgentClient:
                     self._writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
                     await self._writer.drain()
 
-                    line = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout_sec)
-                    if not line:
-                        raise ConnectionError("Connection closed by server")
-
-                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                    while True:
+                        line = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout_sec)
+                        if not line:
+                            raise ConnectionError("Connection closed by server")
+                        msg = json.loads(line.decode("utf-8", errors="replace"))
+                        # Защита от "хвостов" stream-сигналов в обычном RPC канале.
+                        if msg.get("type") == "task_signal":
+                            continue
+                        break
 
                     if msg.get("type") == "chunked_start":
                         orig = msg.get("orig_type")
