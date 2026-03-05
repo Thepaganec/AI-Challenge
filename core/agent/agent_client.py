@@ -33,6 +33,7 @@ class AgentClient:
         self.last_memory_layers: Optional[dict] = None
         self.last_token_stats: Dict[str, Any] = {}
         self.last_profile_info: Dict[str, Any] = {}
+        self.last_task_state: Dict[str, Any] = {}
 
     # === Управление TCP-соединением ===
 
@@ -292,6 +293,85 @@ class AgentClient:
             }
         return {"profiles": [], "active_profile": ""}
 
+    async def get_task_state(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "get_task_state"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def generate_task_plan(self, task: str) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "generate_task_plan", "task": task})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def confirm_task_plan(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "confirm_task_plan"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def pause_task(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "pause_task"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def resume_task(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "resume_task"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def next_task_step(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "next_task_step"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
+    async def update_task_progress(
+        self,
+        *,
+        current: str = "",
+        expected_action: str = "",
+        done_item: str = "",
+        step: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"action": "update_task_progress"}
+        if current:
+            payload["current"] = current
+        if expected_action:
+            payload["expected_action"] = expected_action
+        if done_item:
+            payload["done_item"] = done_item
+        if step is not None:
+            payload["step"] = int(step)
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        if msg.get("type") == "task_state":
+            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+            self.last_task_state = state
+            return state
+        return {}
+
     # === Стриминг ответов модели ===
 
     # Запускает stream_chat на сервере, отдаёт чанки в UI и сохраняет итоговые usage/token/profile метрики в полях клиента.
@@ -344,6 +424,7 @@ class AgentClient:
         self.last_memory_layers = None
         self.last_token_stats = {}
         self.last_profile_info = {}
+        self.last_task_state = {}
 
         request: Dict[str, Any] = {
             "action": "stream_chat",
@@ -399,6 +480,7 @@ class AgentClient:
                         self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
                         self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
                         self.last_profile_info = msg.get("profile_info") if isinstance(msg.get("profile_info"), dict) else {}
+                        self.last_task_state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
                         break
 
                     if msg_type == "error":

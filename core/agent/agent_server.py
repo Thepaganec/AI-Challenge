@@ -4,6 +4,7 @@ sys.dont_write_bytecode = True
 import asyncio
 import json
 import os
+import re
 import traceback
 import uuid
 from datetime import datetime
@@ -16,6 +17,7 @@ from core.api.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
 from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
+from core.agent.task_state_store import TaskStateStore
 from core.agent.strategies import (
     build_sliding_window,
     parse_facts_and_strip_user_text,
@@ -53,12 +55,15 @@ class LLMAgentServer:
         self.port = port
 
         self.base_dir = os.path.dirname(__file__)
+        self.project_root = os.path.abspath(os.path.join(self.base_dir, "..", ".."))
         self.logger = AgentFileLogger(logs_dir=self.base_dir, prefix="agentlogs")
         self.logger.cleanup_old_logs(keep_days=3)
 
         self.memory_dir = os.path.join(self.base_dir, "memory")
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
         self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
+        self.task_store = TaskStateStore(file_path=os.path.join(self.base_dir, "task_state.json"))
+        self._last_task_state_log_sig: str = ""
 
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
 
@@ -82,6 +87,13 @@ class LLMAgentServer:
             "delete_profile": self._handle_delete_profile,
             "set_active_profile": self._handle_set_active_profile,
             "get_profile_state": self._handle_get_profile_state,
+            "get_task_state": self._handle_get_task_state,
+            "generate_task_plan": self._handle_generate_task_plan,
+            "confirm_task_plan": self._handle_confirm_task_plan,
+            "pause_task": self._handle_pause_task,
+            "resume_task": self._handle_resume_task,
+            "next_task_step": self._handle_next_task_step,
+            "update_task_progress": self._handle_update_task_progress,
             "stream_chat": self._handle_stream_chat,
         }
         self._model_context_limit: Dict[str, int] = {
@@ -356,6 +368,463 @@ class LLMAgentServer:
             f"- description: {clean_desc}\n"
             "Follow this profile automatically when generating the answer."
         )
+
+    def _build_task_system_text(self, task_state: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(task_state, dict):
+            return None
+        if bool(task_state.get("is_paused")):
+            return None
+        task = str(task_state.get("task") or "").strip()
+        plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
+        done = task_state.get("done") if isinstance(task_state.get("done"), list) else []
+        state = str(task_state.get("state") or "planning").strip().lower()
+        step = int(task_state.get("step") or 0)
+        total = int(task_state.get("total") or len(plan))
+        current = str(task_state.get("current") or "").strip()
+        expected_action = str(task_state.get("expected_action") or "").strip()
+
+        if state == "done":
+            return None
+        if not task or total <= 0 or not plan:
+            return None
+
+        plan_text = "; ".join(str(x).strip() for x in plan if str(x).strip()) or "-"
+        done_text = "; ".join(str(x).strip() for x in done if str(x).strip()) or "-"
+
+        return (
+            "[TASK]\n"
+            f"task: {task}\n"
+            f"state: {state}\n"
+            f"step: {step}/{total}\n"
+            f"current: {current or '-'}\n"
+            f"expected_action: {expected_action or '-'}\n"
+            f"plan: {plan_text}\n"
+            f"done: {done_text}\n\n"
+            "Rules:\n"
+            "- Work only inside the current step.\n"
+            "- Do not skip FSM stages.\n"
+            "- If step is complete, proceed via next_step.\n"
+            "- Never claim a state transition unless server task action was executed."
+        )
+
+    def _make_auto_plan(self, task_text: str) -> List[str]:
+        clean_task = " ".join(str(task_text or "").strip().split())
+        if not clean_task:
+            clean_task = "Текущая задача"
+        return [
+            f"Уточнить требования и критерии приемки: {clean_task}",
+            "Реализовать решение и подготовить артефакты.",
+            "Провести проверку результата и исправить замечания.",
+            "Зафиксировать итог и подготовить завершение задачи.",
+        ]
+
+    def _is_plan_confirmation_signal(self, user_text: str) -> bool:
+        txt = " ".join(str(user_text or "").strip().lower().split())
+        if not txt:
+            return False
+        txt = txt.replace("ё", "е")
+        patterns = (
+            r"^да$",
+            r"^ок$",
+            r"^окей$",
+            r"^все ок$",
+            r"^все окей$",
+            r"^все хорошо$",
+            r"^все верно$",
+            r"^все правильно$",
+            r"^подтверждаю$",
+            r"^подтверждаю план$",
+            r"^согласен$",
+            r"^согласна$",
+            r"^согласен с планом$",
+            r"^согласна с планом$",
+            r"^да, подтверждаю$",
+            r"^ок, подтверждаю$",
+            r"^можно$",
+            r"^начина(й|ем)",
+            r"^можно начинать",
+            r"^старт",
+            r"^поехали",
+        )
+        return any(re.search(p, txt) for p in patterns)
+
+    def _is_validation_failed_signal(self, assistant_text: str) -> bool:
+        txt = " ".join(str(assistant_text or "").strip().lower().split())
+        if not txt:
+            return False
+        bad_markers = (
+            "не прошло",
+            "есть замечания",
+            "есть проблемы",
+            "нужно доработ",
+            "требуется доработ",
+            "ошибк",
+            "несоответств",
+        )
+        return any(m in txt for m in bad_markers)
+
+    def _is_plan_reject_signal(self, user_text: str) -> bool:
+        txt = " ".join(str(user_text or "").strip().lower().split())
+        if not txt:
+            return False
+        txt = txt.replace("ё", "е")
+        patterns = (
+            r"^нет$",
+            r"^не соглас",
+            r"^не подходит",
+            r"^отклон",
+            r"^переделай",
+            r"^измени план",
+            r"^план не",
+        )
+        return any(re.search(p, txt) for p in patterns)
+
+    def _has_step_done_marker(self, assistant_text: str) -> bool:
+        txt = str(assistant_text or "")
+        return "[STEP_DONE]" in txt
+
+    def _has_validation_pass_marker(self, assistant_text: str) -> bool:
+        txt = str(assistant_text or "")
+        return "[VALIDATION_OK]" in txt
+
+    def _has_validation_fail_marker(self, assistant_text: str) -> bool:
+        txt = str(assistant_text or "")
+        return "[VALIDATION_NEEDS_WORK]" in txt
+
+    def _strip_control_markers(self, assistant_text: str) -> str:
+        txt = str(assistant_text or "")
+        for marker in ("[STEP_DONE]", "[VALIDATION_OK]", "[VALIDATION_NEEDS_WORK]"):
+            txt = txt.replace(marker, "")
+        return txt.strip()
+
+    async def _llm_generate_text(
+        self,
+        *,
+        user_text: str,
+        system_text: Optional[str],
+        model: str,
+        endpoint: str,
+        temperature: Optional[float],
+        max_tokens: int,
+        trace_id: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        text = ""
+        gen = None
+        try:
+            gen = self.gpt.stream_chat(
+                user_text=user_text,
+                system_text=system_text,
+                history=[],
+                max_tokens=max_tokens,
+                model=model,
+                endpoint=endpoint,
+                temperature=temperature,
+                include_usage=True,
+                trace_id=trace_id,
+            )
+            async for chunk in gen:
+                text += chunk
+        finally:
+            if gen is not None:
+                try:
+                    await gen.aclose()
+                except Exception:
+                    pass
+        usage = getattr(self.gpt, "last_usage", None) or {}
+        return text.strip(), usage
+
+    def _extract_json_block(self, text: str) -> Optional[Dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        candidates: List[str] = [raw]
+        fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, flags=re.IGNORECASE)
+        if fence_match:
+            candidates.append(fence_match.group(1).strip())
+        brace_match = re.search(r"(\{[\s\S]*\})", raw)
+        if brace_match:
+            candidates.append(brace_match.group(1).strip())
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+        return None
+
+    def _extract_plan_items(self, plan_text: str) -> List[str]:
+        obj = self._extract_json_block(plan_text)
+        if isinstance(obj, dict) and isinstance(obj.get("plan"), list):
+            plan = [str(x).strip() for x in obj.get("plan") if str(x).strip()]
+            if plan:
+                return plan
+        lines = [x.strip() for x in str(plan_text or "").splitlines() if x.strip()]
+        plan: List[str] = []
+        for line in lines:
+            clean = re.sub(r"^\d+[\).\-\s]+", "", line).strip("- ").strip()
+            if len(clean) >= 3:
+                plan.append(clean)
+        unique: List[str] = []
+        for item in plan:
+            if item not in unique:
+                unique.append(item)
+        if unique:
+            return unique[:8]
+        return self._make_auto_plan(plan_text)
+
+    def _extract_commands(self, text: str) -> List[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+
+        obj = self._extract_json_block(raw)
+        if isinstance(obj, dict):
+            commands_raw = obj.get("commands")
+            if isinstance(commands_raw, list):
+                out = [str(x).strip() for x in commands_raw if str(x).strip()]
+                if out:
+                    return out
+            command_raw = str(obj.get("command") or "").strip()
+            if command_raw:
+                return [command_raw]
+            script_raw = str(obj.get("script") or "").strip()
+            if script_raw:
+                return [script_raw]
+
+        # Иногда модель возвращает JSON-массив без обертки объекта.
+        array_match = re.search(r"(\[[\s\S]*\])", raw)
+        if array_match:
+            candidate = array_match.group(1).strip()
+            try:
+                arr = json.loads(candidate)
+                if isinstance(arr, list):
+                    out = [str(x).strip() for x in arr if str(x).strip()]
+                    if out:
+                        return out
+            except Exception:
+                pass
+
+        # Попытка вытащить commands: [ ... ] даже если остальной JSON сломан.
+        commands_field = re.search(r'(?is)"commands"\s*:\s*\[(.*?)\]', raw)
+        if commands_field:
+            payload = commands_field.group(1)
+            cmd_strings = re.findall(r'"([^"]+)"|\'([^\']+)\'', payload)
+            out: List[str] = []
+            for a, b in cmd_strings:
+                c = (a or b or "").strip()
+                if c:
+                    out.append(c)
+            if out:
+                return out
+
+        block_match = re.search(r"```(?:powershell|cmd|bat|shell|sh|json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
+        if block_match:
+            block = block_match.group(1).strip()
+            if block:
+                lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+                cleaned = [re.sub(r"^[-*]\s+", "", ln).strip() for ln in lines]
+                out = [ln for ln in cleaned if ln]
+                if out:
+                    return out
+
+        # Fallback: извлекаем "похожие на команды" строки из обычного текста.
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        out: List[str] = []
+        cmd_prefix = re.compile(
+            r"^(?i)(new-item|set-content|add-content|test-path|get-childitem|mkdir|md|ni|copy-item|move-item|remove-item|write-output|echo|set-location|cd|if\s*\()"
+        )
+        for ln in lines:
+            ln = re.sub(r"^\d+[\).\s-]+", "", ln).strip()
+            ln = re.sub(r"^[-*]\s+", "", ln).strip()
+            if not ln:
+                continue
+            if cmd_prefix.match(ln):
+                out.append(ln)
+        if out:
+            return out
+        return []
+
+    def _normalize_powershell_command(self, command: str) -> str:
+        cmd = str(command or "").strip()
+        if not cmd:
+            return ""
+
+        def _quote_path_value(v: str) -> str:
+            value = str(v or "").strip()
+            if not value:
+                return value
+            if (
+                (value.startswith('"') and value.endswith('"'))
+                or (value.startswith("'") and value.endswith("'"))
+            ):
+                return value
+            # Не оборачиваем явные выражения PowerShell.
+            if value.startswith("$") or value.startswith("("):
+                return value
+            if " " in value:
+                return "'" + value.replace("'", "''") + "'"
+            return value
+
+        # Нормализация значений для -Path/-LiteralPath (особенно для путей с пробелами).
+        def _normalize_path_flags(src: str) -> str:
+            # Берем значение флага до следующего именованного параметра или конца строки.
+            # Это предотвращает кейс, когда `-Force` ошибочно попадал в путь.
+            pattern = r"(?i)(-(?:Path|LiteralPath)\s+)([^\s'\"].*?)(?=\s+-[A-Za-z]\w*\b|$)"
+
+            def _repl(m: re.Match) -> str:
+                prefix = m.group(1)
+                raw_val = m.group(2)
+                return f"{prefix}{_quote_path_value(raw_val)}"
+
+            return re.sub(pattern, _repl, src)
+
+        cmd = _normalize_path_flags(cmd)
+
+        # `cd <path>` -> Set-Location -LiteralPath '<path>'
+        m_cd = re.match(r"^cd\s+(.+)$", cmd, flags=re.IGNORECASE)
+        if m_cd:
+            raw_path = str(m_cd.group(1) or "").strip()
+            if raw_path:
+                if (
+                    (raw_path.startswith('"') and raw_path.endswith('"'))
+                    or (raw_path.startswith("'") and raw_path.endswith("'"))
+                ):
+                    return f"Set-Location -LiteralPath {raw_path}"
+                esc = raw_path.replace("'", "''")
+                return f"Set-Location -LiteralPath '{esc}'"
+
+        # `Set-Location -Path <path>` / `Set-Location -LiteralPath <path>` / `Set-Location <path>`
+        m_set = re.match(
+            r"^set-location(?:\s+-(?:path|literalpath))?\s+(.+)$",
+            cmd,
+            flags=re.IGNORECASE,
+        )
+        if m_set:
+            raw_path = str(m_set.group(1) or "").strip()
+            if raw_path:
+                if (
+                    (raw_path.startswith('"') and raw_path.endswith('"'))
+                    or (raw_path.startswith("'") and raw_path.endswith("'"))
+                ):
+                    return f"Set-Location -LiteralPath {raw_path}"
+                esc = raw_path.replace("'", "''")
+                return f"Set-Location -LiteralPath '{esc}'"
+        # Делаем New-Item более идемпотентным.
+        if re.match(r"^\s*new-item\b", cmd, flags=re.IGNORECASE) and (" -Force" not in cmd and " -force" not in cmd):
+            cmd = f"{cmd} -Force"
+        return cmd
+
+    def _is_navigation_only_command(self, command: str) -> bool:
+        cmd = str(command or "").strip().lower()
+        if not cmd:
+            return False
+        return bool(
+            re.match(r"^(cd|set-location)\b", cmd)
+            and "|" not in cmd
+            and ";" not in cmd
+            and "&&" not in cmd
+            and "||" not in cmd
+        )
+
+    async def _run_powershell_commands(self, commands: List[str], *, timeout_sec: int = 120) -> Dict[str, Any]:
+        runs: List[Dict[str, Any]] = []
+        all_ok = True
+        for idx, command in enumerate(commands, start=1):
+            cmd = self._normalize_powershell_command(command)
+            if not cmd:
+                continue
+            if self._is_navigation_only_command(cmd):
+                runs.append(
+                    {
+                        "index": idx,
+                        "command": cmd,
+                        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "ok": True,
+                    }
+                )
+                continue
+            started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            proc = await asyncio.create_subprocess_exec(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                cmd,
+                cwd=self.project_root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timed_out = False
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                timed_out = True
+                proc.kill()
+                await proc.communicate()
+                stdout_b, stderr_b = b"", b"Command timed out"
+            code = int(proc.returncode or 0)
+            if timed_out:
+                code = -1
+            stdout = stdout_b.decode("utf-8", errors="replace").strip()
+            stderr = stderr_b.decode("utf-8", errors="replace").strip()
+            combined_error = f"{stdout}\n{stderr}".lower()
+            benign_already_exists = (
+                "already exists" in combined_error
+                or "уже существует" in combined_error
+            )
+            if code != 0 and benign_already_exists:
+                code = 0
+                stderr = ""
+            if code != 0:
+                all_ok = False
+            runs.append(
+                {
+                    "index": idx,
+                    "command": cmd,
+                    "started_at": started,
+                    "exit_code": code,
+                    "stdout": stdout[-4000:],
+                    "stderr": stderr[-4000:],
+                    "ok": code == 0,
+                }
+            )
+        return {"ok": all_ok and bool(runs), "runs": runs}
+
+    def _task_log_snapshot(self, task_state: Dict[str, Any]) -> Dict[str, Any]:
+        state = str(task_state.get("state") or "planning")
+        step = int(task_state.get("step") or 0)
+        total = int(task_state.get("total") or 0)
+        paused = bool(task_state.get("is_paused", False))
+        current = str(task_state.get("current") or "").strip()
+        return {
+            "state": state,
+            "step": step,
+            "total": total,
+            "paused": paused,
+            "current": current,
+        }
+
+    def _log_task_action(
+        self,
+        *,
+        action: str,
+        before: Dict[str, Any],
+        after: Optional[Dict[str, Any]] = None,
+        error: str = "",
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "action": action,
+            "before": self._task_log_snapshot(before if isinstance(before, dict) else {}),
+        }
+        if isinstance(after, dict):
+            payload["after"] = self._task_log_snapshot(after)
+            payload["transition"] = f"{payload['before']['state']} -> {payload['after']['state']}"
+        if error:
+            payload["error"] = error
+        self.logger.write("INFO" if not error else "WARN", "TASK_FSM_ACTION", extra=json.dumps(payload, ensure_ascii=False))
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
@@ -911,6 +1380,103 @@ class LLMAgentServer:
             },
         )
 
+    async def _handle_get_task_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        task_state = self.task_store.get_state()
+        try:
+            sig = json.dumps(self._task_log_snapshot(task_state), ensure_ascii=False, sort_keys=True)
+        except Exception:
+            sig = ""
+        if sig and sig != self._last_task_state_log_sig:
+            self._last_task_state_log_sig = sig
+            self._log_task_action(action="get_task_state", before=task_state, after=task_state)
+        await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+
+    async def _handle_generate_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        task = str(request.get("task") or "").strip()
+        if not task:
+            await self._send_error(writer, "task is required")
+            return
+        before = self.task_store.get_state()
+        try:
+            plan = self._make_auto_plan(task)
+            task_state = self.task_store.generate_plan(task=task, plan=plan)
+            self._log_task_action(action="generate_task_plan", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_GENERATE_PLAN_FAILED", extra=str(e))
+            self._log_task_action(action="generate_task_plan", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
+    async def _handle_confirm_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.confirm_plan()
+            self._log_task_action(action="confirm_task_plan", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_CONFIRM_PLAN_FAILED", extra=str(e))
+            self._log_task_action(action="confirm_task_plan", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
+    async def _handle_pause_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.set_paused(True)
+            self._log_task_action(action="pause_task", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_PAUSE_FAILED", extra=str(e))
+            self._log_task_action(action="pause_task", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
+    async def _handle_resume_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.set_paused(False)
+            self._log_task_action(action="resume_task", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_RESUME_FAILED", extra=str(e))
+            self._log_task_action(action="resume_task", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
+    async def _handle_next_task_step(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.next_step()
+            self._log_task_action(action="next_task_step", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_NEXT_STEP_FAILED", extra=str(e))
+            self._log_task_action(action="next_task_step", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
+    async def _handle_update_task_progress(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        current = str(request.get("current") or "")
+        expected_action = str(request.get("expected_action") or "")
+        done_item = str(request.get("done_item") or "")
+        step_raw = request.get("step")
+        step = None
+        if step_raw is not None:
+            try:
+                step = int(step_raw)
+            except Exception:
+                step = None
+        before = self.task_store.get_state()
+        try:
+            task_state = self.task_store.update_progress(
+                current=current,
+                expected_action=expected_action,
+                done_item=done_item,
+                step=step,
+            )
+            self._log_task_action(action="update_task_progress", before=before, after=task_state)
+            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+        except Exception as e:
+            self.logger.write("WARN", "TASK_UPDATE_PROGRESS_FAILED", extra=str(e))
+            self._log_task_action(action="update_task_progress", before=before, error=str(e))
+            await self._send_error(writer, str(e))
+
     # Основной сценарий запроса: читает параметры стратегии, готовит контекст, запускает стрим к модели, обновляет ветку/память и возвращает done с полной телеметрией.
 
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
@@ -963,6 +1529,356 @@ class LLMAgentServer:
 
         session = self.memory_store.load_session(session_id)
         self._ensure_title(session, user_text)
+        session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.memory_store.save_session(session)
+        title = str(session.get("title") or "")
+
+        async def _send_orchestrator_done(
+            *,
+            answer_text: str,
+            usage_data: Dict[str, Any],
+            final_task_state: Dict[str, Any],
+            strategy_name: str = "task_orchestrator",
+            error_text: str = "",
+        ) -> None:
+            if answer_text.strip():
+                await self._send_json(writer, {"type": "chunk", "chunk": answer_text.strip() + "\n"})
+            task_state_now = final_task_state if isinstance(final_task_state, dict) else self.task_store.get_state()
+            prompt_tokens = int(usage_data.get("prompt_tokens") or usage_data.get("input_tokens") or 0)
+            completion_tokens = int(usage_data.get("completion_tokens") or usage_data.get("output_tokens") or 0)
+            total_tokens_call = int(usage_data.get("total_tokens") or (prompt_tokens + completion_tokens))
+            token_stats = {
+                "user_text_tokens_est": int(self._estimate_tokens_text(user_text)),
+                "context_tokens_est": 0,
+                "assistant_tokens": int(completion_tokens),
+                "total_tokens_call": int(total_tokens_call),
+                "dialog_tokens_est": 0,
+                "model_context_limit": int(self._resolve_context_limit(model)),
+                "may_exceed_context": False,
+            }
+            message_stats = {
+                "strategy": strategy_name,
+                "branch_id": "main",
+                "use_profile": False,
+                "active_profile": "Без профиля",
+                "profile_description_len": 0,
+                "profile_applied": False,
+                "keep_last_n": int(keep_last_n),
+                "sent_messages": 1,
+                "facts_count": None,
+                "memory_layers_counts": {"short_term": 0, "working": 0, "long_term": 0},
+                "task_state": str(task_state_now.get("state") or "planning"),
+                "task_step": int(task_state_now.get("step") or 0),
+                "task_total": int(task_state_now.get("total") or 0),
+                "task_paused": bool(task_state_now.get("is_paused", False)),
+                "task_injected": True,
+                "token_stats": token_stats,
+            }
+            if error_text:
+                message_stats["error"] = error_text
+            await self._send_json(
+                writer,
+                {
+                    "type": "done",
+                    "model": model,
+                    "endpoint": endpoint,
+                    "usage": usage_data,
+                    "cost_rub": self._calc_cost_rub(model_id=model, usage=usage_data),
+                    "session_id": session_id,
+                    "title": title,
+                    "active_branch": "main",
+                    "message_stats": message_stats,
+                    "facts": {},
+                    "memory_layers": {},
+                    "token_stats": token_stats,
+                    "task_state": task_state_now,
+                    "profile_info": {
+                        "use_profile": False,
+                        "active_profile": "",
+                        "profile_description_len": 0,
+                        "profile_applied": False,
+                    },
+                },
+            )
+
+        task_state = self.task_store.get_state()
+        if bool(task_state.get("is_paused", False)):
+            before_resume = task_state
+            try:
+                task_state = self.task_store.set_paused(False)
+                self._log_task_action(action="auto_resume_on_message", before=before_resume, after=task_state)
+            except Exception as e:
+                self._log_task_action(action="auto_resume_on_message", before=before_resume, error=str(e))
+                task_state = self.task_store.get_state()
+
+        state_now = str(task_state.get("state") or "planning").strip().lower()
+        has_task = bool(str(task_state.get("task") or "").strip()) and int(task_state.get("total") or 0) > 0
+
+        # Шаг 1-3: новая задача -> LLM планирование -> показать план на подтверждение.
+        if (not has_task) or state_now == "done":
+            plan_prompt_system = (
+                "Ты task-orchestrator. Составь короткий, исполнимый план в 3-6 шагов.\n"
+                "Не добавляй отдельные шаги навигации по директориям (например, 'перейти в папку').\n"
+                "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
+                "Без markdown и пояснений."
+            )
+            plan_raw, usage = await self._llm_generate_text(
+                user_text=f"Задача пользователя: {user_text}",
+                system_text=plan_prompt_system,
+                model=model,
+                endpoint=endpoint,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                trace_id=f"{req_id}-plan",
+            )
+            plan = self._extract_plan_items(plan_raw)
+            before_generate = self.task_store.get_state()
+            task_state = self.task_store.generate_plan(task=user_text, plan=plan)
+            self._log_task_action(action="auto_generate_task_plan_llm", before=before_generate, after=task_state)
+            plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(plan, start=1))
+            answer = (
+                "План сформирован. Подтверди план сообщением (например: \"да\"), "
+                "или отклони и дай правки.\n\n"
+                f"[PLAN]\n{plan_lines}"
+            )
+            await _send_orchestrator_done(answer_text=answer, usage_data=usage, final_task_state=task_state, strategy_name="task_plan")
+            return
+
+        # Шаг 4: planning -> approve/reject (reject = replanning loop).
+        if state_now == "planning":
+            if self._is_plan_confirmation_signal(user_text):
+                before_confirm = task_state
+                task_state = self.task_store.confirm_plan()
+                self._log_task_action(action="auto_confirm_plan_on_message", before=before_confirm, after=task_state)
+                state_now = "execution"
+            else:
+                task_text = str(task_state.get("task") or "").strip() or user_text
+                replan_system = (
+                    "Ты task-orchestrator. Перепланируй задачу с учетом комментария пользователя.\n"
+                    "Не добавляй отдельные шаги навигации по директориям (например, 'перейти в папку').\n"
+                    "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
+                    "Без markdown и пояснений."
+                )
+                replan_raw, usage = await self._llm_generate_text(
+                    user_text=(
+                        f"Исходная задача: {task_text}\n"
+                        f"Комментарий пользователя к плану: {user_text}"
+                    ),
+                    system_text=replan_system,
+                    model=model,
+                    endpoint=endpoint,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    trace_id=f"{req_id}-replan",
+                )
+                new_plan = self._extract_plan_items(replan_raw)
+                before_replan = task_state
+                task_state = self.task_store.generate_plan(task=task_text, plan=new_plan)
+                log_action = "auto_replan_reject_signal" if self._is_plan_reject_signal(user_text) else "auto_replan_feedback"
+                self._log_task_action(action=log_action, before=before_replan, after=task_state)
+                plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(new_plan, start=1))
+                answer = (
+                    "План обновлен по твоему комментарию. Подтверди его или снова отклони.\n\n"
+                    f"[PLAN]\n{plan_lines}"
+                )
+                await _send_orchestrator_done(answer_text=answer, usage_data=usage, final_task_state=task_state, strategy_name="task_replan")
+                return
+
+        # Шаги 5-6: execution + validation под управлением агента (полный проход за один цикл).
+        if state_now in ("execution", "validation"):
+            task_text = str(task_state.get("task") or "").strip()
+            usage_agg: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            progress_lines: List[str] = []
+            last_run_result: Dict[str, Any] = {}
+
+            def _acc_usage(usage_piece: Dict[str, Any]) -> None:
+                usage_agg["prompt_tokens"] += int(usage_piece.get("prompt_tokens") or usage_piece.get("input_tokens") or 0)
+                usage_agg["completion_tokens"] += int(usage_piece.get("completion_tokens") or usage_piece.get("output_tokens") or 0)
+                usage_agg["total_tokens"] += int(
+                    usage_piece.get("total_tokens")
+                    or (
+                        int(usage_piece.get("prompt_tokens") or usage_piece.get("input_tokens") or 0)
+                        + int(usage_piece.get("completion_tokens") or usage_piece.get("output_tokens") or 0)
+                    )
+                )
+
+            def _format_runs_error(title: str, run_data: Dict[str, Any]) -> str:
+                lines = [title]
+                runs = run_data.get("runs") if isinstance(run_data.get("runs"), list) else []
+                for item in runs:
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(f"- cmd: {item.get('command')}")
+                    lines.append(f"  exit: {item.get('exit_code')}")
+                    stderr = str(item.get("stderr") or "").strip()
+                    if stderr:
+                        lines.append(f"  stderr: {stderr[:500]}")
+                return "\n".join(lines)
+
+            exec_system = (
+                "Ты исполнитель задач для локального Windows проекта.\n"
+                "Сформируй команды, которые агент должен выполнить автоматически для ТЕКУЩЕГО шага.\n"
+                "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
+                "Команды должны быть идемпотентными: повторный запуск не должен падать (используй `-Force`, `Test-Path`, `if (...) { ... }`).\n"
+                "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"note\": \"...\"}\n"
+                "Только безопасные и конкретные команды без поясняющего текста вне JSON."
+            )
+            validation_system = (
+                "Ты проверяющий агент. По результатам выполнения дай команды проверки.\n"
+                "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
+                "Команды проверки должны быть идемпотентными и явно проверять целевой результат задачи.\n"
+                "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"success_criteria\": \"...\"}\n"
+                "Без markdown и пояснений вне JSON."
+            )
+
+            safety_limit = max(3, int(task_state.get("total") or 0) + 3)
+            for _ in range(safety_limit):
+                cur_state = str(task_state.get("state") or "").strip().lower()
+                if cur_state == "execution":
+                    plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
+                    done_steps = task_state.get("done") if isinstance(task_state.get("done"), list) else []
+                    current_step = str(task_state.get("current") or "").strip()
+                    exec_user = (
+                        f"Задача: {task_text}\n"
+                        f"План: {json.dumps(plan, ensure_ascii=False)}\n"
+                        f"Выполнено: {json.dumps(done_steps, ensure_ascii=False)}\n"
+                        f"Текущий шаг: {current_step}\n"
+                        f"Рабочая директория: {self.project_root}"
+                    )
+                    exec_raw, usage_exec = await self._llm_generate_text(
+                        user_text=exec_user,
+                        system_text=exec_system,
+                        model=model,
+                        endpoint=endpoint,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        trace_id=f"{req_id}-exec-plan",
+                    )
+                    _acc_usage(usage_exec)
+                    commands = self._extract_commands(exec_raw)
+                    if not commands:
+                        step_lc = current_step.lower()
+                        if (
+                            "перейти" in step_lc
+                            or "директори" in step_lc
+                            or "папк" in step_lc
+                            or "root" in step_lc
+                            or "корнев" in step_lc
+                        ):
+                            commands = ["Write-Output 'navigation no-op: cwd already set by agent'"]
+                        else:
+                            self.logger.write(
+                                "WARN",
+                                "TASK_EXEC_EMPTY_COMMANDS_RAW",
+                                extra=exec_raw[:800],
+                            )
+                    if not commands:
+                        err_state = self.task_store.update_progress(
+                            expected_action="Ошибка: LLM не вернул исполняемые команды. Ожидается уточнение пользователя."
+                        )
+                        await _send_orchestrator_done(
+                            answer_text="Ошибка оркестратора: не удалось получить команды выполнения от LLM.",
+                            usage_data=usage_agg,
+                            final_task_state=err_state,
+                            strategy_name="task_execution_failed",
+                            error_text="empty_execution_commands",
+                        )
+                        return
+
+                    run_result = await self._run_powershell_commands(commands)
+                    last_run_result = run_result
+                    if not bool(run_result.get("ok", False)):
+                        fail_state = self.task_store.update_progress(
+                            expected_action="Выполнение шага завершилось ошибкой. Нужна корректировка команды/плана."
+                        )
+                        await _send_orchestrator_done(
+                            answer_text=_format_runs_error("Ошибка выполнения шага. Логи:", run_result),
+                            usage_data=usage_agg,
+                            final_task_state=fail_state,
+                            strategy_name="task_execution_failed",
+                            error_text="command_execution_failed",
+                        )
+                        return
+
+                    progress_lines.append(f"Шаг выполнен: {current_step}")
+                    before_next = self.task_store.get_state()
+                    task_state = self.task_store.next_step()
+                    self._log_task_action(action="auto_advance_execution_after_run", before=before_next, after=task_state)
+                    continue
+
+                if cur_state == "validation":
+                    plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
+                    validation_user = (
+                        f"Задача: {task_text}\n"
+                        f"План: {json.dumps(plan, ensure_ascii=False)}\n"
+                        f"Результаты выполнения: {json.dumps(last_run_result, ensure_ascii=False)}\n"
+                        f"Рабочая директория: {self.project_root}"
+                    )
+                    val_raw, usage_val = await self._llm_generate_text(
+                        user_text=validation_user,
+                        system_text=validation_system,
+                        model=model,
+                        endpoint=endpoint,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        trace_id=f"{req_id}-validate-plan",
+                    )
+                    _acc_usage(usage_val)
+                    validation_commands = self._extract_commands(val_raw)
+                    if not validation_commands:
+                        validation_commands = ["Test-Path ."]
+                    validation_result = await self._run_powershell_commands(validation_commands)
+                    if bool(validation_result.get("ok", False)):
+                        before_done = task_state
+                        task_state = self.task_store.transition("done")
+                        self._log_task_action(action="auto_validation_to_done", before=before_done, after=task_state)
+                        answer_lines = progress_lines + ["Проверка пройдена. Задача завершена."]
+                        await _send_orchestrator_done(
+                            answer_text="\n".join(answer_lines),
+                            usage_data=usage_agg,
+                            final_task_state=task_state,
+                            strategy_name="task_validation_done",
+                        )
+                        return
+
+                    before_back = task_state
+                    task_state = self.task_store.transition("execution")
+                    task_state = self.task_store.update_progress(
+                        expected_action="Проверка не пройдена. Агент сообщил об ошибке, требуется доработка шага."
+                    )
+                    self._log_task_action(action="auto_validation_to_execution", before=before_back, after=task_state)
+                    answer_lines = progress_lines + [_format_runs_error("Проверка не пройдена. Логи:", validation_result)]
+                    await _send_orchestrator_done(
+                        answer_text="\n".join(answer_lines),
+                        usage_data=usage_agg,
+                        final_task_state=task_state,
+                        strategy_name="task_validation_failed",
+                        error_text="validation_failed",
+                    )
+                    return
+
+                if cur_state == "done":
+                    await _send_orchestrator_done(
+                        answer_text="Задача уже завершена.",
+                        usage_data=usage_agg,
+                        final_task_state=task_state,
+                        strategy_name="task_done",
+                    )
+                    return
+
+                break
+
+            fail_safe_state = self.task_store.update_progress(
+                expected_action="Оркестратор прервал цикл выполнения по safety-limit. Требуется диагностика."
+            )
+            await _send_orchestrator_done(
+                answer_text="Оркестратор остановлен по safety-limit. Проверь логи.",
+                usage_data=usage_agg,
+                final_task_state=fail_safe_state,
+                strategy_name="task_execution_failed",
+                error_text="safety_limit_reached",
+            )
+            return
 
         branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
         session["branches"] = branches
@@ -1043,6 +1959,29 @@ class LLMAgentServer:
             system_text = self._merge_system_text(profile_system_text, system_text)
             profile_applied = True
 
+        task_system_text = self._build_task_system_text(task_state)
+        task_injected = bool(task_system_text)
+        system_text = self._merge_system_text(task_system_text, system_text)
+
+        task_state_for_call = str(task_state.get("state") or "planning")
+        if task_state_for_call == "execution":
+            execution_instruction = (
+                "TASK ORCHESTRATOR MODE (execution):\n"
+                "- Выполняй текущий шаг самостоятельно и выдай конкретный результат этого шага.\n"
+                "- Не проси пользователя выполнить шаг вместо тебя.\n"
+                "- Если шаг завершен в этом ответе, добавь в конце отдельной строкой маркер [STEP_DONE].\n"
+                "- Если шаг не завершен, не добавляй маркер."
+            )
+            system_text = self._merge_system_text(execution_instruction, system_text)
+        elif task_state_for_call == "validation":
+            validation_instruction = (
+                "TASK ORCHESTRATOR MODE (validation):\n"
+                "- Проверь результат и дай короткий вердикт.\n"
+                "- Если валидация успешна, добавь в конце отдельной строкой [VALIDATION_OK].\n"
+                "- Если нужна доработка, добавь в конце отдельной строкой [VALIDATION_NEEDS_WORK]."
+            )
+            system_text = self._merge_system_text(validation_instruction, system_text)
+
         explicit_memory = request.get("memory_write")
         if isinstance(explicit_memory, dict):
             layer = str(explicit_memory.get("layer") or "").strip()
@@ -1087,6 +2026,21 @@ class LLMAgentServer:
                     ensure_ascii=False,
                 ),
             )
+            self.logger.write(
+                "INFO",
+                "SERVER_TASK_CONTEXT",
+                extra=json.dumps(
+                    {
+                        "req_id": req_id,
+                        "task_state": str(task_state.get("state") or "planning"),
+                        "task_step": int(task_state.get("step") or 0),
+                        "task_total": int(task_state.get("total") or 0),
+                        "task_paused": bool(task_state.get("is_paused", False)),
+                        "task_injected": task_injected,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
             gen = self.gpt.stream_chat(
                 user_text=user_text_for_api,
                 system_text=system_text,
@@ -1119,6 +2073,57 @@ class LLMAgentServer:
             session["active_branch"] = bid
             self.memory_store.save_session(session)
 
+            task_before_auto_step = self.task_store.get_state()
+            current_task_state = task_before_auto_step
+            try:
+                cur_state = str(task_before_auto_step.get("state") or "planning")
+                if (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "execution":
+                    if self._has_step_done_marker(assistant_answer):
+                        current_task_state = self.task_store.next_step()
+                        self._log_task_action(
+                            action="auto_advance_execution_after_response",
+                            before=task_before_auto_step,
+                            after=current_task_state,
+                        )
+                    else:
+                        self._log_task_action(
+                            action="auto_hold_execution_wait_step_done",
+                            before=task_before_auto_step,
+                            after=task_before_auto_step,
+                        )
+                elif (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "validation":
+                    if self._has_validation_fail_marker(assistant_answer) or self._is_validation_failed_signal(assistant_answer):
+                        current_task_state = self.task_store.transition("execution")
+                        self._log_task_action(
+                            action="auto_validation_to_execution",
+                            before=task_before_auto_step,
+                            after=current_task_state,
+                        )
+                    elif self._has_validation_pass_marker(assistant_answer):
+                        current_task_state = self.task_store.transition("done")
+                        self._log_task_action(
+                            action="auto_validation_to_done",
+                            before=task_before_auto_step,
+                            after=current_task_state,
+                        )
+                    else:
+                        self._log_task_action(
+                            action="auto_hold_validation_wait_marker",
+                            before=task_before_auto_step,
+                            after=task_before_auto_step,
+                        )
+            except Exception as e:
+                self._log_task_action(
+                    action="auto_advance_after_response",
+                    before=task_before_auto_step,
+                    error=str(e),
+                )
+                current_task_state = self.task_store.get_state()
+
+            assistant_answer = self._strip_control_markers(assistant_answer)
+            if history and isinstance(history[-1], dict) and str(history[-1].get("role") or "") == "assistant":
+                history[-1]["content"] = assistant_answer
+
             sent_messages = int(len(history_for_llm) + (1 if system_text else 0) + 1)
             prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
@@ -1140,7 +2145,6 @@ class LLMAgentServer:
                 "model_context_limit": int(model_context_limit),
                 "may_exceed_context": may_exceed_context,
             }
-
             facts_count = int(len(facts) if isinstance(facts, dict) else 0) if strategy_for_context == "facts" else None
             message_stats = {
                 "strategy": strategy_display,
@@ -1157,6 +2161,11 @@ class LLMAgentServer:
                     "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
                     "long_term": int(len(memory_layers.get("long_term") or {})) if isinstance(memory_layers.get("long_term"), dict) else 0,
                 },
+                "task_state": str(current_task_state.get("state") or "planning"),
+                "task_step": int(current_task_state.get("step") or 0),
+                "task_total": int(current_task_state.get("total") or 0),
+                "task_paused": bool(current_task_state.get("is_paused", False)),
+                "task_injected": task_injected,
                 "token_stats": token_stats,
             }
 
@@ -1175,6 +2184,7 @@ class LLMAgentServer:
                     "facts": (facts if strategy_for_context == "facts" and isinstance(facts, dict) else {}),
                     "memory_layers": memory_layers,
                     "token_stats": token_stats,
+                    "task_state": current_task_state,
                     "profile_info": {
                         "use_profile": use_profile,
                         "active_profile": active_profile,

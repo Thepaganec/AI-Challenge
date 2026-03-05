@@ -61,6 +61,8 @@ class ChatTab(BaseTab):
         self.profile_none_label = "Без профиля"
         self.active_profile_name = ""
         self._profile_selector_changing = False
+        self.task_state_cache: dict = {}
+        self._task_state_signature: str = ""
 
         self.profile_selector.currentIndexChanged.connect(self.on_profile_selected)
         self.profile_selector.currentTextChanged.connect(self.on_profile_text_changed)
@@ -115,6 +117,44 @@ class ChatTab(BaseTab):
         session_layout.setSpacing(6)
         session_layout.addWidget(self.sessions_list)
         session_layout.addWidget(sessions_buttons)
+
+        self.task_state_box = QTextEdit()
+        self.task_state_box.setReadOnly(True)
+        self.task_state_box.setMinimumHeight(120)
+        self.task_state_box.setPlaceholderText("Task state появится после генерации плана.")
+
+        self.task_confirm_btn = QPushButton("Confirm Plan")
+        self.task_confirm_btn.clicked.connect(self.on_task_confirm_clicked)
+        self.task_confirm_btn.setToolTip("Подтверждение плана выполняется сообщением пользователя (например: 'да').")
+        self.task_confirm_btn.setVisible(False)
+
+        self.task_pause_btn = QPushButton("Pause")
+        self.task_pause_btn.clicked.connect(self.on_task_pause_clicked)
+
+        self.task_resume_btn = QPushButton("Resume")
+        self.task_resume_btn.clicked.connect(self.on_task_resume_clicked)
+
+        self.task_next_btn = QPushButton("Next Step")
+        self.task_next_btn.clicked.connect(self.on_task_next_clicked)
+        self.task_next_btn.setToolTip("Переходы этапов выполняются серверным оркестратором автоматически.")
+        self.task_next_btn.setVisible(False)
+
+        task_buttons_row = QWidget()
+        tb_l = QHBoxLayout(task_buttons_row)
+        tb_l.setContentsMargins(0, 0, 0, 0)
+        tb_l.setSpacing(6)
+        tb_l.addWidget(self.task_confirm_btn)
+        tb_l.addWidget(self.task_pause_btn)
+        tb_l.addWidget(self.task_resume_btn)
+        tb_l.addWidget(self.task_next_btn)
+
+        task_box = QGroupBox("Task State")
+        task_box.setMinimumWidth(320)
+        task_layout = QVBoxLayout(task_box)
+        task_layout.setContentsMargins(8, 8, 8, 8)
+        task_layout.setSpacing(6)
+        task_layout.addWidget(self.task_state_box)
+        task_layout.addWidget(task_buttons_row)
 
         # ===== top params =====
         self.model_selector = QComboBox()
@@ -387,7 +427,13 @@ class ChatTab(BaseTab):
         # ВАЖНО: даём правый отступ, чтобы левый контент не прилипал к сплиттеру
         lp.setContentsMargins(8, 8, 12, 8)
         lp.setSpacing(10)
-        lp.addWidget(session_box)
+        top_left_row = QWidget()
+        tl = QHBoxLayout(top_left_row)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(8)
+        tl.addWidget(session_box)
+        tl.addWidget(task_box, 1)
+        lp.addWidget(top_left_row)
         lp.addWidget(QLabel("Ввод:"))
         lp.addWidget(self.input_editbox)
         lp.addWidget(self.sent_len_label)
@@ -415,6 +461,7 @@ class ChatTab(BaseTab):
         self.refresh_sessions_timer.start()
 
         self.output_editbox.setMinimumHeight(160)
+        self.render_task_state({})
 
     # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
 
@@ -424,6 +471,7 @@ class ChatTab(BaseTab):
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
+        self.render_task_state(self.task_state_cache)
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
@@ -493,13 +541,16 @@ class ChatTab(BaseTab):
                 await self.refresh_sessions_list()
                 await self.load_session_to_ui(self.current_session_id)
                 await self.bootstrap_profile_ui()
+                await self.refresh_task_state()
             else:
                 self.logger.warning("Агент не отвечает. Запусти core/agent/agent_server.py перед UI.")
                 self._set_profile_none_ui()
+                self.render_task_state({})
         except Exception as e:
             self.is_agent_connected = False
             self.logger.warning(f"Не удалось подключиться к агенту: {e}")
             self._set_profile_none_ui()
+            self.render_task_state({})
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
@@ -698,6 +749,146 @@ class ChatTab(BaseTab):
             self.profile_use_toggle.setEnabled(False)
             self.logger.warning("Нельзя включить персонализацию без выбранного профиля.")
 
+    # === Task state ===
+
+    def render_task_state(self, task_state: dict):
+        if not isinstance(task_state, dict):
+            task_state = {}
+        normalized = {
+            "task": str(task_state.get("task") or "").strip(),
+            "state": str(task_state.get("state") or "planning").strip().lower(),
+            "step": int(task_state.get("step") or 0),
+            "total": int(task_state.get("total") or 0),
+            "current": str(task_state.get("current") or "").strip(),
+            "expected_action": str(task_state.get("expected_action") or "").strip(),
+            "is_paused": bool(task_state.get("is_paused", False)),
+            "plan": task_state.get("plan") if isinstance(task_state.get("plan"), list) else [],
+            "done": task_state.get("done") if isinstance(task_state.get("done"), list) else [],
+        }
+        self.task_state_cache = normalized
+        signature = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+        task = normalized["task"]
+        state = normalized["state"]
+        step = normalized["step"]
+        total = normalized["total"]
+        current = normalized["current"]
+        expected_action = normalized["expected_action"]
+        paused = normalized["is_paused"]
+        plan = normalized["plan"]
+        done = normalized["done"]
+
+        if signature != self._task_state_signature:
+            scrollbar = self.task_state_box.verticalScrollBar()
+            prev_value = int(scrollbar.value()) if scrollbar is not None else 0
+
+            if not task and not plan:
+                self.task_state_box.setPlainText("Задача пока не инициализирована.")
+            else:
+                lines = [
+                    f"Task: {task or '-'}",
+                    f"State: {state}",
+                    f"Step: {step}/{total}",
+                    f"Paused: {paused}",
+                    f"Current: {current or '-'}",
+                    f"Expected action: {expected_action or '-'}",
+                    "",
+                    "[PLAN]",
+                ]
+                if plan:
+                    for idx, item in enumerate(plan, start=1):
+                        marker = "->" if idx == step and state != "done" else "  "
+                        lines.append(f"{marker} {idx}. {item}")
+                else:
+                    lines.append("- (empty)")
+                lines.append("")
+                lines.append("[DONE]")
+                if done:
+                    for item in done:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
+                self.task_state_box.setPlainText("\n".join(lines))
+
+            if scrollbar is not None:
+                scrollbar.setValue(min(prev_value, int(scrollbar.maximum())))
+            self._task_state_signature = signature
+
+        has_task = bool(task) and total > 0
+        can_pause = has_task and (not paused)
+        can_resume = has_task and paused
+
+        self.task_confirm_btn.setEnabled(False)
+        self.task_pause_btn.setEnabled(can_pause and not self.is_generating)
+        self.task_resume_btn.setEnabled(can_resume and not self.is_generating)
+        self.task_next_btn.setEnabled(False)
+
+    async def refresh_task_state(self):
+        if not self.is_agent_connected:
+            self.render_task_state({})
+            return
+        try:
+            task_state = await self.agent.get_task_state()
+            self.render_task_state(task_state)
+        except Exception as e:
+            self.logger.warning(f"Не удалось получить task_state: {e}")
+
+    def on_task_confirm_clicked(self):
+        asyncio.get_event_loop().create_task(self._confirm_task_async())
+
+    async def _confirm_task_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: confirm plan недоступен.")
+            return
+        try:
+            task_state = await self.agent.confirm_task_plan()
+            self.render_task_state(task_state)
+            self.logger.success("План подтвержден. Состояние: execution.")
+        except Exception as e:
+            self.logger.warning(f"Не удалось подтвердить план: {e}")
+
+    def on_task_pause_clicked(self):
+        asyncio.get_event_loop().create_task(self._pause_task_async())
+
+    async def _pause_task_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: pause недоступен.")
+            return
+        try:
+            task_state = await self.agent.pause_task()
+            self.render_task_state(task_state)
+            self.logger.success("Задача поставлена на паузу.")
+        except Exception as e:
+            self.logger.warning(f"Не удалось поставить задачу на паузу: {e}")
+
+    def on_task_resume_clicked(self):
+        asyncio.get_event_loop().create_task(self._resume_task_async())
+
+    async def _resume_task_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: resume недоступен.")
+            return
+        try:
+            task_state = await self.agent.resume_task()
+            self.render_task_state(task_state)
+            self.logger.success("Задача возвращена в контекст.")
+        except Exception as e:
+            self.logger.warning(f"Не удалось продолжить задачу: {e}")
+
+    def on_task_next_clicked(self):
+        asyncio.get_event_loop().create_task(self._next_task_async())
+
+    async def _next_task_async(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: next step недоступен.")
+            return
+        try:
+            task_state = await self.agent.next_task_step()
+            self.render_task_state(task_state)
+            self.logger.success("Переход к следующему шагу выполнен.")
+        except Exception as e:
+            self.logger.warning(f"Не удалось перейти к следующему шагу: {e}")
+
     # === Список сессий и загрузка состояния ===
 
     # Показывает offline-список, периодически синхронизируется с сервером и загружает выбранную сессию вместе с ветками/checkpoints.
@@ -730,6 +921,7 @@ class ChatTab(BaseTab):
         async def _run():
             try:
                 await self.refresh_sessions_list()
+                await self.refresh_task_state()
             finally:
                 self._sessions_refresh_inflight = False
 
@@ -1298,6 +1490,7 @@ class ChatTab(BaseTab):
             ms = getattr(self.agent, "last_message_stats", None) or {}
             token_stats = getattr(self.agent, "last_token_stats", None) or {}
             profile_info = getattr(self.agent, "last_profile_info", None) or {}
+            task_state = getattr(self.agent, "last_task_state", None) or {}
             active_branch = getattr(self.agent, "last_active_branch", None) or self.current_branch_id
             self.current_branch_id = active_branch
 
@@ -1311,6 +1504,11 @@ class ChatTab(BaseTab):
             use_profile_stat = bool(profile_info.get("use_profile", use_profile))
             active_profile_stat = str(profile_info.get("active_profile") or "Без профиля")
             desc_len_stat = int(profile_info.get("profile_description_len") or 0)
+            task_state_stat = str(ms.get("task_state") or task_state.get("state") or "planning")
+            task_step_stat = int(ms.get("task_step") or task_state.get("step") or 0)
+            task_total_stat = int(ms.get("task_total") or task_state.get("total") or 0)
+            task_paused_stat = bool(ms.get("task_paused", task_state.get("is_paused", False)))
+            task_injected_stat = bool(ms.get("task_injected", False))
             self.sent_len_label.setText(f"API context tokens(est): {api_context_tokens if api_context_tokens is not None else 'N/A'}")
 
             line = (
@@ -1318,7 +1516,8 @@ class ChatTab(BaseTab):
                 f"TTFT={ttft_str} | Total={total_sec:.3f}s | "
                 f"prompt={prompt_tokens} | completion={completion_tokens} | total={total_tokens_call} | Cost={cost_str} | "
                 f"Temp={temp_str} | max_tokens={max_tokens} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
-                f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat}"
+                f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat} | "
+                f"task_state={task_state_stat} | task_step={task_step_stat}/{task_total_stat} | task_paused={task_paused_stat} | task_injected={task_injected_stat}"
             )
             if facts_count is not None:
                 line += f" | facts={facts_count}"
@@ -1340,6 +1539,8 @@ class ChatTab(BaseTab):
             last_memory = getattr(self.agent, "last_memory_layers", None)
             if isinstance(last_memory, dict):
                 self.render_memory_layers(last_memory)
+            if isinstance(task_state, dict):
+                self.render_task_state(task_state)
 
             # refresh session list (title updates) — без перезагрузки UI (иначе может чистить поля)
             if self.is_agent_connected:
@@ -1359,6 +1560,16 @@ class ChatTab(BaseTab):
         self.stop_requested = True
         if self.current_task is not None and not self.current_task.done():
             self.current_task.cancel()
+        async def _pause_task_after_stop():
+            if not self.is_agent_connected:
+                return
+            try:
+                task_state = await self.agent.pause_task()
+                self.render_task_state(task_state)
+                self.logger.info("Активная задача поставлена на паузу (STOP).")
+            except Exception as e:
+                self.logger.warning(f"Не удалось поставить задачу на паузу после STOP: {e}")
+        asyncio.get_event_loop().create_task(_pause_task_after_stop())
         self.stop_button.setEnabled(False)
         self.set_loading(False)
         self.logger.warning("Стрим остановлен пользователем.")
