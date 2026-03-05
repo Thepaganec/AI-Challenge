@@ -5,7 +5,7 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-from qasync import QEventLoop
+from qasync import QEventLoop 
 from PySide6.QtWidgets import QApplication
 
 from ui.main_window import MainWindow

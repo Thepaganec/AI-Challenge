@@ -918,6 +918,7 @@ class ChatTab(BaseTab):
             return
         stage = str(payload.get("stage") or "").strip()
         message = str(payload.get("message") or "").strip()
+        extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
         if not message and not stage:
             return
         if stage and message:
@@ -926,6 +927,15 @@ class ChatTab(BaseTab):
             self.task_signal_label.setText(f"Task signal: {message}")
         else:
             self.task_signal_label.setText(f"Task signal [{stage}]")
+        try:
+            if stage and message:
+                self.logger.info(f"TASK_SIGNAL [{stage}] {message} | extra={extra}")
+            elif message:
+                self.logger.info(f"TASK_SIGNAL {message} | extra={extra}")
+            else:
+                self.logger.info(f"TASK_SIGNAL [{stage}] | extra={extra}")
+        except Exception:
+            pass
 
     # === Список сессий и загрузка состояния ===
 

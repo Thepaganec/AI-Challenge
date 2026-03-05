@@ -436,6 +436,13 @@ class LLMAgentServer:
             "Зафиксировать итог и подготовить завершение задачи.",
         ]
 
+    def _normalize_plan_item_text(self, value: Any) -> str:
+        clean = str(value or "").strip()
+        if not clean:
+            return ""
+        clean = re.sub(r"^\d+[\).\-\s]+", "", clean).strip("- ").strip()
+        return clean
+
     def _is_plan_confirmation_signal(self, user_text: str) -> bool:
         txt = " ".join(str(user_text or "").strip().lower().split())
         if not txt:
@@ -463,6 +470,11 @@ class LLMAgentServer:
             r"^можно начинать",
             r"^старт",
             r"^поехали",
+            r"^выполняй план$",
+            r"^выполни план$",
+            r"^приступай$",
+            r"^приступай к выполнению$",
+            r"^начинай выполнение$",
         )
         return any(re.search(p, txt) for p in patterns)
 
@@ -589,13 +601,14 @@ class LLMAgentServer:
     def _extract_plan_items(self, plan_text: str) -> List[str]:
         obj = self._extract_json_block(plan_text)
         if isinstance(obj, dict) and isinstance(obj.get("plan"), list):
-            plan = [str(x).strip() for x in obj.get("plan") if str(x).strip()]
+            plan = [self._normalize_plan_item_text(x) for x in obj.get("plan")]
+            plan = [x for x in plan if x]
             if plan:
                 return plan
         lines = [x.strip() for x in str(plan_text or "").splitlines() if x.strip()]
         plan: List[str] = []
         for line in lines:
-            clean = re.sub(r"^\d+[\).\-\s]+", "", line).strip("- ").strip()
+            clean = self._normalize_plan_item_text(line)
             if len(clean) >= 3:
                 plan.append(clean)
         unique: List[str] = []
@@ -766,6 +779,8 @@ class LLMAgentServer:
         *,
         timeout_sec: int = 120,
         on_signal: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        trace_id: str = "",
+        stage: str = "",
     ) -> Dict[str, Any]:
         runs: List[Dict[str, Any]] = []
         all_ok = True
@@ -773,6 +788,22 @@ class LLMAgentServer:
             cmd = self._normalize_powershell_command(command)
             if not cmd:
                 continue
+            try:
+                self.logger.write(
+                    "INFO",
+                    "TASK_COMMAND_START",
+                    extra=json.dumps(
+                        {
+                            "req_id": trace_id,
+                            "stage": stage,
+                            "index": idx,
+                            "command": cmd,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
             if on_signal is not None:
                 try:
                     await on_signal({"event": "command_start", "index": idx, "command": cmd})
@@ -790,6 +821,26 @@ class LLMAgentServer:
                         "ok": True,
                     }
                 )
+                try:
+                    self.logger.write(
+                        "INFO",
+                        "TASK_COMMAND_DONE",
+                        extra=json.dumps(
+                            {
+                                "req_id": trace_id,
+                                "stage": stage,
+                                "index": idx,
+                                "command": cmd,
+                                "exit_code": 0,
+                                "stdout": "",
+                                "stderr": "",
+                                "navigation_noop": True,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                except Exception:
+                    pass
                 if on_signal is not None:
                     try:
                         await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": 0})
@@ -840,6 +891,25 @@ class LLMAgentServer:
                     "ok": code == 0,
                 }
             )
+            try:
+                self.logger.write(
+                    "INFO" if code == 0 else "WARN",
+                    "TASK_COMMAND_DONE",
+                    extra=json.dumps(
+                        {
+                            "req_id": trace_id,
+                            "stage": stage,
+                            "index": idx,
+                            "command": cmd,
+                            "exit_code": code,
+                            "stdout": stdout[-1200:],
+                            "stderr": stderr[-1200:],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
             if on_signal is not None:
                 try:
                     await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": code})
@@ -1889,7 +1959,12 @@ class LLMAgentServer:
                         elif event == "command_done":
                             await _signal("execution", f"Команда {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
 
-                    run_result = await self._run_powershell_commands(commands, on_signal=_on_exec_signal)
+                    run_result = await self._run_powershell_commands(
+                        commands,
+                        on_signal=_on_exec_signal,
+                        trace_id=f"{req_id}-exec-run",
+                        stage="execution",
+                    )
                     last_run_result = run_result
                     if not bool(run_result.get("ok", False)):
                         await _signal("execution", "Шаг завершился ошибкой, запрашиваю корректировку команд")
@@ -1920,7 +1995,12 @@ class LLMAgentServer:
                         self._log_task_payload(name="TASK_EXEC_REPAIR_COMMANDS_PARSED", req_id=f"{req_id}-exec-repair", payload=repair_commands)
                         if repair_commands:
                             await _signal("execution", "Выполняю исправленные команды шага")
-                            repair_result = await self._run_powershell_commands(repair_commands, on_signal=_on_exec_signal)
+                            repair_result = await self._run_powershell_commands(
+                                repair_commands,
+                                on_signal=_on_exec_signal,
+                                trace_id=f"{req_id}-exec-repair-run",
+                                stage="execution_repair",
+                            )
                             last_run_result = repair_result
                             if bool(repair_result.get("ok", False)):
                                 run_result = repair_result
@@ -1989,12 +2069,20 @@ class LLMAgentServer:
                         elif event == "command_done":
                             await _signal("validation", f"Проверка {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
 
-                    validation_result = await self._run_powershell_commands(validation_commands, on_signal=_on_val_signal)
+                    validation_result = await self._run_powershell_commands(
+                        validation_commands,
+                        on_signal=_on_val_signal,
+                        trace_id=f"{req_id}-validation-run",
+                        stage="validation",
+                    )
                     if bool(validation_result.get("ok", False)):
                         before_done = task_state
                         task_state = self.task_store.transition("done")
                         self._log_task_action(action="auto_validation_to_done", before=before_done, after=task_state)
-                        answer_lines = progress_lines + ["Проверка пройдена. Задача завершена."]
+                        done_snapshot = task_state
+                        task_state = self.task_store.clear_task()
+                        self._log_task_action(action="auto_clear_done_task", before=done_snapshot, after=task_state)
+                        answer_lines = progress_lines + ["Проверка пройдена. Задача завершена и автоматически удалена."]
                         await _send_orchestrator_done(
                             answer_text="\n".join(answer_lines),
                             usage_data=usage_agg,
