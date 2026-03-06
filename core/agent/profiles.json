@@ -13,11 +13,11 @@
     }
   },
   "invariants": {
-    "architecture": "microsoft",
+    "architecture": "",
     "technical_decisions": "",
-    "stack_constraints": "sql",
+    "stack_constraints": "можно использовать только bat и sql или powershell",
     "business_rules": "",
-    "safety_restrictions": "нельзя использовать drop",
+    "safety_restrictions": "drop использовать можно",
     "response_style": ""
   },
   "invariant_policy": {
@@ -28,5 +28,5 @@
     "safety_restrictions": "strict",
     "response_style": "strict"
   },
-  "updated_at": "2026-03-05 17:16:35"
+  "updated_at": "2026-03-06 09:33:45"
 }

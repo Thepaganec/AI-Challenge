@@ -12,6 +12,10 @@ INVARIANT_KEYS: Tuple[str, ...] = (
 )
 INVARIANT_POLICIES: Tuple[str, ...] = ("strict", "warn")
 KNOWN_TECH_TERMS: Tuple[str, ...] = (
+    "bat",
+    "cmd",
+    "powershell",
+    "pwsh",
     "java",
     "kotlin",
     "python",
@@ -115,6 +119,8 @@ def _parse_invariant_value(raw_value: str) -> Dict[str, List[str]]:
     # Natural-language constraints: "не используй X", "нельзя использовать X".
     for pat in (
         r"(?:не\s+используй(?:те)?|нельзя\s+использовать|запрещено\s+использовать|не\s+применяй(?:те)?)\s+([^\n\.;]+)",
+        r"([^\n\.;]+?)\s+использовать\s+нельзя",
+        r"([^\n\.;]+?)\s+запрещено\s+использовать",
     ):
         for m in re.finditer(pat, value, flags=re.IGNORECASE):
             forbid.extend(_split_terms(m.group(1)))
@@ -122,6 +128,8 @@ def _parse_invariant_value(raw_value: str) -> Dict[str, List[str]]:
     # Natural-language allow-list: "используй только Kotlin или Java".
     for pat in (
         r"(?:всегда\s+)?(?:используй(?:те)?|применяй(?:те)?|use)\s+только\s+([^\n\.;]+)",
+        r"(?:можно|разрешено)\s+использовать\s+только\s+([^\n\.;]+)",
+        r"(?:использовать\s+можно\s+только)\s+([^\n\.;]+)",
         r"only\s+use\s+([^\n\.;]+)",
     ):
         for m in re.finditer(pat, value, flags=re.IGNORECASE):

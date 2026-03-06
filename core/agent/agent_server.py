@@ -23,7 +23,6 @@ from core.agent.invariants import (
     build_runtime_context_text,
     build_invariants_system_text,
     normalize_invariants_state,
-    validate_text_with_invariants,
 )
 from core.agent.strategies import (
     build_sliding_window,
@@ -458,14 +457,6 @@ class LLMAgentServer:
     ) -> Optional[str]:
         return self._merge_system_text(base_system, runtime_system, profile_system, task_system, memory_system, invariants_system)
 
-    def _validate_output_by_invariants(self, text: str) -> Dict[str, Any]:
-        inv_state = self._get_invariants_state()
-        return validate_text_with_invariants(
-            text=text,
-            invariants=inv_state.get("invariants", {}),
-            policy=inv_state.get("invariant_policy", {}),
-        )
-
     async def _llm_self_validate_invariants(
         self,
         *,
@@ -526,16 +517,23 @@ class LLMAgentServer:
         obj = self._extract_json_block(text)
         if not isinstance(obj, dict):
             return {
-                "decision": "pass",
+                "decision": "fail",
                 "conflict_key": "",
-                "reason": "",
+                "reason": "LLM validator returned non-JSON response.",
                 "warnings": [],
                 "items": [],
                 "raw": str(text or "")[:2000],
             }
         decision = str(obj.get("decision") or "pass").strip().lower()
         if decision not in ("pass", "warn", "fail"):
-            decision = "pass"
+            return {
+                "decision": "fail",
+                "conflict_key": str(obj.get("conflict_key") or ""),
+                "reason": "LLM validator returned unsupported decision.",
+                "warnings": [],
+                "items": obj.get("items") if isinstance(obj.get("items"), list) else [],
+                "raw": str(text or "")[:2000],
+            }
         warnings = obj.get("warnings") if isinstance(obj.get("warnings"), list) else []
         items = obj.get("items") if isinstance(obj.get("items"), list) else []
         return {
@@ -547,26 +545,34 @@ class LLMAgentServer:
             "raw": str(text or "")[:2000],
         }
 
-    def _merge_invariant_validations(self, hard: Dict[str, Any], llm: Dict[str, Any]) -> Dict[str, Any]:
-        hard_decision = str(hard.get("decision") or "pass")
-        llm_decision = str(llm.get("decision") or "pass")
-        if hard_decision == "fail" or llm_decision == "fail":
+    async def _validate_commands_with_invariants(
+        self,
+        *,
+        commands: List[str],
+        stage: str,
+        model: str,
+        endpoint: str,
+        trace_id: str,
+    ) -> Dict[str, Any]:
+        blob = "\n".join(str(c or "") for c in commands if str(c or "").strip())
+        if not blob:
+            return {"decision": "pass", "conflict_key": "", "reason": "", "warnings": [], "items": []}
+        try:
+            return await self._llm_self_validate_invariants(
+                stage=stage,
+                model=model,
+                endpoint=endpoint,
+                trace_id=trace_id,
+                candidate_text=blob,
+            )
+        except Exception as e:
             return {
                 "decision": "fail",
-                "conflict_key": str(hard.get("conflict_key") or llm.get("conflict_key") or ""),
-                "reason": str(hard.get("reason") or llm.get("reason") or "Invariant validation failed"),
-                "warnings": (hard.get("warnings") if isinstance(hard.get("warnings"), list) else [])
-                + (llm.get("warnings") if isinstance(llm.get("warnings"), list) else []),
+                "conflict_key": "",
+                "reason": f"LLM invariant validator error: {e}",
+                "warnings": [],
+                "items": [],
             }
-        if hard_decision == "warn" or llm_decision == "warn":
-            return {
-                "decision": "warn",
-                "conflict_key": str(hard.get("conflict_key") or llm.get("conflict_key") or ""),
-                "reason": str(hard.get("reason") or llm.get("reason") or ""),
-                "warnings": (hard.get("warnings") if isinstance(hard.get("warnings"), list) else [])
-                + (llm.get("warnings") if isinstance(llm.get("warnings"), list) else []),
-            }
-        return {"decision": "pass", "conflict_key": "", "reason": "", "warnings": []}
 
     def _make_auto_plan(self, task_text: str) -> List[str]:
         clean_task = " ".join(str(task_text or "").strip().split())
@@ -684,7 +690,7 @@ class LLMAgentServer:
         stage: str = "chat",
         max_retries: int = 2,
         validate_invariants: bool = True,
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
         hist = history if isinstance(history, list) else []
         inv_state = self._get_invariants_state()
         runtime_system = build_runtime_context_text(stage=stage)
@@ -702,7 +708,16 @@ class LLMAgentServer:
         )
         last_text = ""
         last_usage: Dict[str, Any] = {}
+        last_validation: Dict[str, Any] = {
+            "decision": "pass",
+            "conflict_key": "",
+            "reason": "",
+            "warnings": [],
+            "items": [],
+        }
         retries = max(0, int(max_retries))
+        if validate_invariants:
+            retries = max(retries, 2)
         retry_reason = ""
         for attempt in range(retries + 1):
             text = ""
@@ -740,13 +755,16 @@ class LLMAgentServer:
             last_text = text.strip()
             last_usage = usage if isinstance(usage, dict) else {}
 
-            hard_validation = {"decision": "pass", "conflict_key": "", "reason": "", "warnings": []}
-            if validate_invariants:
-                hard_validation = self._validate_output_by_invariants(last_text)
-            llm_validation: Dict[str, Any] = {"decision": "pass", "conflict_key": "", "reason": "", "warnings": [], "items": []}
+            validation: Dict[str, Any] = {
+                "decision": "pass",
+                "conflict_key": "",
+                "reason": "",
+                "warnings": [],
+                "items": [],
+            }
             if validate_invariants:
                 try:
-                    llm_validation = await self._llm_self_validate_invariants(
+                    validation = await self._llm_self_validate_invariants(
                         stage=stage,
                         model=model,
                         endpoint=endpoint,
@@ -754,17 +772,22 @@ class LLMAgentServer:
                         candidate_text=last_text,
                     )
                 except Exception as e:
-                    llm_validation = {
-                        "decision": "pass",
+                    validation = {
+                        "decision": "fail",
                         "conflict_key": "",
-                        "reason": "",
+                        "reason": f"LLM invariant validator error: {e}",
                         "warnings": [],
                         "items": [],
                         "error": str(e),
                     }
-            validation = self._merge_invariant_validations(hard_validation, llm_validation)
-            decision = str(validation.get("decision") or "pass")
+            decision = str(validation.get("decision") or "fail").strip().lower()
+            if decision not in ("pass", "warn", "fail"):
+                decision = "fail"
+                validation["reason"] = str(validation.get("reason") or "Invalid decision from invariant validator.")
+            validation["decision"] = decision
+            last_validation = validation
             retry_reason = str(validation.get("reason") or "")
+            validation_source = "llm"
             try:
                 self.logger.write(
                     "INFO" if decision != "fail" else "WARN",
@@ -775,9 +798,9 @@ class LLMAgentServer:
                             "attempt": attempt + 1,
                             "stage": stage,
                             "validation_decision": decision,
+                            "validation_source": validation_source,
                             "validation": validation,
-                            "hard_validation": hard_validation,
-                            "llm_validation": llm_validation,
+                            "llm_validation": validation,
                             "text": str(last_text or "")[:8000],
                             "usage": last_usage,
                         },
@@ -791,7 +814,7 @@ class LLMAgentServer:
                     warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else []
                     if warnings:
                         last_text = f"[INVARIANT_WARNING] {'; '.join(str(x) for x in warnings[:2])}\n{last_text}"
-                return last_text, last_usage
+                return last_text, last_usage, last_validation
 
         try:
             self.logger.write(
@@ -963,10 +986,6 @@ class LLMAgentServer:
             "./",
         )
         return any(cmd.startswith(p) for p in mutating_prefixes)
-
-    def _validate_commands_with_invariants(self, commands: List[str]) -> Dict[str, Any]:
-        blob = "\n".join(str(c or "") for c in commands if str(c or "").strip())
-        return self._validate_output_by_invariants(blob)
 
     def _extract_step_artifact_tokens(self, step_text: str) -> List[str]:
         raw = str(step_text or "").strip()
@@ -1344,7 +1363,7 @@ class LLMAgentServer:
             "Output compact bullet points."
         )
 
-        summary_text, _ = await self._llm_generate_text(
+        summary_text, _, _ = await self._llm_generate_text(
             user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
             system_text=summary_system,
             history=[],
@@ -2165,7 +2184,7 @@ class LLMAgentServer:
                 "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
                 "Без markdown и пояснений."
             )
-            plan_raw, usage = await self._llm_generate_text(
+            plan_raw, usage, _ = await self._llm_generate_text(
                 user_text=(
                     "TASK_REQUEST:\n"
                     f"{user_text}\n\n"
@@ -2212,7 +2231,7 @@ class LLMAgentServer:
                     "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
                     "Без markdown и пояснений."
                 )
-                replan_raw, usage = await self._llm_generate_text(
+                replan_raw, usage, _ = await self._llm_generate_text(
                     user_text=(
                         "ORIGINAL_TASK:\n"
                         f"{task_text}\n\n"
@@ -2320,7 +2339,7 @@ class LLMAgentServer:
                         "OUTPUT_SCHEMA:\n"
                         "{\"commands\": [\"powershell command 1\", \"powershell command 2\"], \"note\": \"...\"}"
                     )
-                    exec_raw, usage_exec = await self._llm_generate_text(
+                    exec_raw, usage_exec, _ = await self._llm_generate_text(
                         user_text=exec_user,
                         system_text=exec_system,
                         model=model,
@@ -2393,7 +2412,7 @@ class LLMAgentServer:
                             "OUTPUT_SCHEMA:\n"
                             "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
                         )
-                        repair_raw, usage_repair = await self._llm_generate_text(
+                        repair_raw, usage_repair, _ = await self._llm_generate_text(
                             user_text=repair_user,
                             system_text=repair_system,
                             model=model,
@@ -2423,7 +2442,13 @@ class LLMAgentServer:
                             )
                             return
 
-                    commands_validation = self._validate_commands_with_invariants(commands)
+                    commands_validation = await self._validate_commands_with_invariants(
+                        commands=commands,
+                        stage="execution",
+                        model=model,
+                        endpoint=endpoint,
+                        trace_id=f"{req_id}-exec-cmd-invariants",
+                    )
                     if str(commands_validation.get("decision") or "pass") == "fail":
                         fail_state = self.task_store.update_progress(
                             expected_action="Команды выполнения отклонены strict-инвариантами."
@@ -2486,7 +2511,7 @@ class LLMAgentServer:
                             "OUTPUT_SCHEMA:\n"
                             "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
                         )
-                        repair_raw, usage_repair = await self._llm_generate_text(
+                        repair_raw, usage_repair, _ = await self._llm_generate_text(
                             user_text=repair_user,
                             system_text=repair_system,
                             model=model,
@@ -2550,7 +2575,7 @@ class LLMAgentServer:
                         "OUTPUT_SCHEMA:\n"
                         "{\"commands\": [\"powershell check 1\", \"powershell check 2\"], \"success_criteria\": \"...\"}"
                     )
-                    val_raw, usage_val = await self._llm_generate_text(
+                    val_raw, usage_val, _ = await self._llm_generate_text(
                         user_text=validation_user,
                         system_text=validation_system,
                         model=model,
@@ -2576,7 +2601,13 @@ class LLMAgentServer:
                             error_text="empty_validation_commands",
                         )
                         return
-                    validation_commands_check = self._validate_commands_with_invariants(validation_commands)
+                    validation_commands_check = await self._validate_commands_with_invariants(
+                        commands=validation_commands,
+                        stage="validation",
+                        model=model,
+                        endpoint=endpoint,
+                        trace_id=f"{req_id}-validate-cmd-invariants",
+                    )
                     if str(validation_commands_check.get("decision") or "pass") == "fail":
                         fail_state = self.task_store.update_progress(
                             expected_action="Команды проверки отклонены strict-инвариантами."
@@ -2824,7 +2855,7 @@ class LLMAgentServer:
                 ensure_ascii=False,
             ),
         )
-        assistant_answer, usage = await self._llm_generate_text(
+        assistant_answer, usage, validation_snapshot = await self._llm_generate_text(
             user_text=user_text_for_api,
             system_text=system_text,
             history=history_for_llm,
@@ -2839,7 +2870,6 @@ class LLMAgentServer:
         )
         usage = usage if isinstance(usage, dict) else {}
         cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
-        validation_snapshot = self._validate_output_by_invariants(assistant_answer)
         invariants_decision = str(validation_snapshot.get("decision") or "pass")
         invariants_conflict_key = str(validation_snapshot.get("conflict_key") or "")
         if assistant_answer:
