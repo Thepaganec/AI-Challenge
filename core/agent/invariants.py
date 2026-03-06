@@ -86,7 +86,7 @@ def _split_terms(raw: str) -> List[str]:
     data = str(raw or "").strip()
     if not data:
         return []
-    parts = re.split(r"(?:[\n,;]+|\s+или\s+|\s+or\s+|/)", data, flags=re.IGNORECASE)
+    parts = re.split(r"(?:[\n,;]+|\s+или\s+|\s+or\s+|\s+и\s+|\s+and\s+|/)", data, flags=re.IGNORECASE)
     out: List[str] = []
     for part in parts:
         token = " ".join(str(part).strip().split()).strip(" .,:;\"'`()[]{}")

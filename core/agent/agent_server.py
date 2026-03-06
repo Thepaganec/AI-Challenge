@@ -20,6 +20,7 @@ from core.agent.profile_store import AgentProfileStore
 from core.agent.task_state_store import TaskStateStore
 from core.agent.invariants import (
     INVARIANT_KEYS,
+    INVARIANT_POLICIES,
     build_runtime_context_text,
     build_invariants_system_text,
     normalize_invariants_state,
@@ -467,8 +468,19 @@ class LLMAgentServer:
         candidate_text: str,
     ) -> Dict[str, Any]:
         inv_state = self._get_invariants_state()
-        invariants = inv_state.get("invariants", {}) if isinstance(inv_state.get("invariants"), dict) else {}
-        policy = inv_state.get("invariant_policy", {}) if isinstance(inv_state.get("invariant_policy"), dict) else {}
+        source_invariants = inv_state.get("invariants", {}) if isinstance(inv_state.get("invariants"), dict) else {}
+        source_policy = inv_state.get("invariant_policy", {}) if isinstance(inv_state.get("invariant_policy"), dict) else {}
+        invariants: Dict[str, str] = {}
+        policy: Dict[str, str] = {}
+        for key in INVARIANT_KEYS:
+            value = str(source_invariants.get(key) or "").strip()
+            if not value:
+                continue
+            mode = str(source_policy.get(key) or "strict").strip().lower()
+            if mode not in INVARIANT_POLICIES:
+                mode = "strict"
+            invariants[key] = value
+            policy[key] = mode
         payload = {
             "stage": str(stage or "chat"),
             "candidate_text": str(candidate_text or ""),
@@ -488,7 +500,11 @@ class LLMAgentServer:
             "Правила:\n"
             "- strict + нарушение => fail.\n"
             "- warn + нарушение => warn.\n"
-            "- Если нарушений нет => pass."
+            "- Если нарушений нет => pass.\n"
+            "- Для fail/warn обязательно укажи conflict_key и reason.\n"
+            "- Для каждого fail/warn в items обязательно заполни note с конкретным объяснением.\n"
+            "- Не выдумывай технологии/термины, которых нет в candidate_text.\n"
+            "- Если нет проверяемых признаков нарушения, верни pass."
         )
 
         text = ""
@@ -557,22 +573,104 @@ class LLMAgentServer:
         blob = "\n".join(str(c or "") for c in commands if str(c or "").strip())
         if not blob:
             return {"decision": "pass", "conflict_key": "", "reason": "", "warnings": [], "items": []}
-        try:
-            return await self._llm_self_validate_invariants(
-                stage=stage,
-                model=model,
-                endpoint=endpoint,
-                trace_id=trace_id,
-                candidate_text=blob,
+        return await self._validate_candidate_with_invariants(
+            candidate_text=blob,
+            stage=stage,
+            model=model,
+            endpoint=endpoint,
+            trace_id=trace_id,
+        )
+
+    async def _validate_candidate_with_invariants(
+        self,
+        *,
+        candidate_text: str,
+        stage: str,
+        model: str,
+        endpoint: str,
+        trace_id: str,
+    ) -> Dict[str, Any]:
+        max_attempts = 3
+        last: Dict[str, Any] = {
+            "decision": "fail",
+            "conflict_key": "",
+            "reason": "Валидатор не вернул адекватного ответа.",
+            "warnings": [],
+            "items": [],
+            "validation_source": "llm_inadequate",
+        }
+        for attempt in range(1, max_attempts + 1):
+            try:
+                llm = await self._llm_self_validate_invariants(
+                    stage=stage,
+                    model=model,
+                    endpoint=endpoint,
+                    trace_id=f"{trace_id}-a{attempt}",
+                    candidate_text=candidate_text,
+                )
+            except Exception as e:
+                llm = {
+                    "decision": "fail",
+                    "conflict_key": "",
+                    "reason": f"LLM invariant validator error: {e}",
+                    "warnings": [],
+                    "items": [],
+                    "validation_source": "llm_error",
+                }
+            decision = str(llm.get("decision") or "fail").strip().lower()
+            reason = str(llm.get("reason") or "").strip()
+            conflict_key = str(llm.get("conflict_key") or "").strip()
+            items = llm.get("items") if isinstance(llm.get("items"), list) else []
+            has_fail_item_note = any(
+                isinstance(it, dict)
+                and str(it.get("status") or "").strip().lower() == "fail"
+                and str(it.get("note") or "").strip()
+                for it in items
             )
-        except Exception as e:
-            return {
+            fail_has_explanation = bool(reason) or bool(has_fail_item_note)
+            adequate = True
+            if decision == "fail" and not fail_has_explanation:
+                adequate = False
+            try:
+                self.logger.write(
+                    "INFO" if adequate else "WARN",
+                    "INVARIANT_VALIDATOR_ATTEMPT",
+                    extra=json.dumps(
+                        {
+                            "req_id": trace_id,
+                            "attempt": attempt,
+                            "stage": stage,
+                            "adequate": adequate,
+                            "decision": decision,
+                            "conflict_key": conflict_key,
+                            "reason": reason,
+                            "raw": str(llm.get("raw") or "")[:2000],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
+            if adequate:
+                return llm
+            last = {
                 "decision": "fail",
-                "conflict_key": "",
-                "reason": f"LLM invariant validator error: {e}",
+                "conflict_key": conflict_key,
+                "reason": "Валидатор вернул fail без пояснения.",
                 "warnings": [],
-                "items": [],
+                "items": items,
+                "validation_source": "llm_inadequate",
+                "raw": str(llm.get("raw") or "")[:2000],
             }
+        return {
+            "decision": "fail",
+            "conflict_key": str(last.get("conflict_key") or ""),
+            "reason": "Валидатор инвариантов не возвращает адекватного ответа после 3 попыток.",
+            "warnings": [],
+            "items": last.get("items") if isinstance(last.get("items"), list) else [],
+            "validation_source": "llm_inadequate",
+            "raw": str(last.get("raw") or "")[:2000],
+        }
 
     def _make_auto_plan(self, task_text: str) -> List[str]:
         clean_task = " ".join(str(task_text or "").strip().split())
@@ -676,6 +774,25 @@ class LLMAgentServer:
             txt = txt.replace(marker, "")
         return txt.strip()
 
+    def _format_invariant_fail_message(self, validation: Dict[str, Any], default_text: str) -> str:
+        reason = str(validation.get("reason") or "").strip()
+        items = validation.get("items") if isinstance(validation.get("items"), list) else []
+        notes: List[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            note = str(item.get("note") or "").strip()
+            if status == "fail" and note:
+                notes.append(note)
+        if reason and notes:
+            return f"{reason}\nДетали:\n- " + "\n- ".join(notes[:3])
+        if reason:
+            return reason
+        if notes:
+            return "Нарушены инварианты.\nДетали:\n- " + "\n- ".join(notes[:3])
+        return default_text
+
     async def _llm_generate_text(
         self,
         *,
@@ -764,12 +881,12 @@ class LLMAgentServer:
             }
             if validate_invariants:
                 try:
-                    validation = await self._llm_self_validate_invariants(
+                    validation = await self._validate_candidate_with_invariants(
+                        candidate_text=last_text,
                         stage=stage,
                         model=model,
                         endpoint=endpoint,
                         trace_id=f"{trace_id}-v{attempt + 1}",
-                        candidate_text=last_text,
                     )
                 except Exception as e:
                     validation = {
@@ -788,6 +905,8 @@ class LLMAgentServer:
             last_validation = validation
             retry_reason = str(validation.get("reason") or "")
             validation_source = "llm"
+            if str(validation.get("validation_source") or "").strip():
+                validation_source = str(validation.get("validation_source"))
             try:
                 self.logger.write(
                     "INFO" if decision != "fail" else "WARN",
@@ -2177,6 +2296,49 @@ class LLMAgentServer:
 
         # Шаг 1-3: новая задача -> LLM планирование -> показать план на подтверждение.
         if (not has_task) or state_now == "done":
+            await _signal("planning", "Проверяю входную задачу на инварианты")
+            request_validation = await self._validate_candidate_with_invariants(
+                candidate_text=user_text,
+                stage="planning",
+                model=model,
+                endpoint=endpoint,
+                trace_id=f"{req_id}-task-input-invariants",
+            )
+            request_validation_decision = str(request_validation.get("decision") or "fail").strip().lower()
+            try:
+                self.logger.write(
+                    "INFO" if request_validation_decision != "fail" else "WARN",
+                    "TASK_INPUT_INVARIANTS_VALIDATION",
+                    extra=json.dumps(
+                        {
+                            "req_id": req_id,
+                            "stage": "planning",
+                            "decision": request_validation_decision,
+                            "validation": request_validation,
+                            "text": str(user_text or "")[:2000],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
+            if request_validation_decision == "fail":
+                reason = self._format_invariant_fail_message(
+                    request_validation,
+                    "Задача отклонена strict-инвариантами.",
+                )
+                await _send_orchestrator_done(
+                    answer_text=reason,
+                    usage_data={},
+                    final_task_state=task_state,
+                    strategy_name="task_request_rejected_by_invariants",
+                    error_text="invariants_block_task_request",
+                )
+                return
+            if request_validation_decision == "warn":
+                warnings = request_validation.get("warnings") if isinstance(request_validation.get("warnings"), list) else []
+                if warnings:
+                    await _signal("planning", f"Предупреждение инвариантов: {str(warnings[0])}")
             await _signal("planning", "Формирую план задачи через LLM")
             plan_prompt_system = (
                 "Ты task-orchestrator. Составь короткий, исполнимый план в 3-6 шагов.\n"
@@ -2198,6 +2360,7 @@ class LLMAgentServer:
                 max_tokens=max_tokens,
                 trace_id=f"{req_id}-plan",
                 stage="planning",
+                validate_invariants=False,
             )
             plan = self._extract_plan_items(plan_raw)
             self._log_task_payload(name="TASK_PLAN_PARSED", req_id=f"{req_id}-plan", payload=plan)
@@ -2249,6 +2412,7 @@ class LLMAgentServer:
                     max_tokens=max_tokens,
                     trace_id=f"{req_id}-replan",
                     stage="planning",
+                    validate_invariants=False,
                 )
                 new_plan = self._extract_plan_items(replan_raw)
                 self._log_task_payload(name="TASK_REPLAN_PARSED", req_id=f"{req_id}-replan", payload=new_plan)
@@ -2348,6 +2512,7 @@ class LLMAgentServer:
                         max_tokens=max_tokens,
                         trace_id=f"{req_id}-exec-plan",
                         stage="execution",
+                        validate_invariants=False,
                     )
                     _acc_usage(usage_exec)
                     commands = self._extract_commands(exec_raw)
@@ -2421,6 +2586,7 @@ class LLMAgentServer:
                             max_tokens=max_tokens,
                             trace_id=f"{req_id}-exec-repair-mismatch",
                             stage="execution",
+                            validate_invariants=False,
                         )
                         _acc_usage(usage_repair)
                         repair_commands = self._extract_commands(repair_raw)
@@ -2454,7 +2620,10 @@ class LLMAgentServer:
                             expected_action="Команды выполнения отклонены strict-инвариантами."
                         )
                         await _send_orchestrator_done(
-                            answer_text=str(commands_validation.get("reason") or "Команды отклонены инвариантами."),
+                            answer_text=self._format_invariant_fail_message(
+                                commands_validation,
+                                "Команды отклонены инвариантами.",
+                            ),
                             usage_data=usage_agg,
                             final_task_state=fail_state,
                             strategy_name="task_execution_failed",
@@ -2520,6 +2689,7 @@ class LLMAgentServer:
                             max_tokens=max_tokens,
                             trace_id=f"{req_id}-exec-repair",
                             stage="execution",
+                            validate_invariants=False,
                         )
                         _acc_usage(usage_repair)
                         repair_commands = self._extract_commands(repair_raw)
@@ -2584,6 +2754,7 @@ class LLMAgentServer:
                         max_tokens=max_tokens,
                         trace_id=f"{req_id}-validate-plan",
                         stage="validation",
+                        validate_invariants=False,
                     )
                     _acc_usage(usage_val)
                     validation_commands = self._extract_commands(val_raw)
@@ -2613,7 +2784,10 @@ class LLMAgentServer:
                             expected_action="Команды проверки отклонены strict-инвариантами."
                         )
                         await _send_orchestrator_done(
-                            answer_text=str(validation_commands_check.get("reason") or "Команды проверки отклонены инвариантами."),
+                            answer_text=self._format_invariant_fail_message(
+                                validation_commands_check,
+                                "Команды проверки отклонены инвариантами.",
+                            ),
                             usage_data=usage_agg,
                             final_task_state=fail_state,
                             strategy_name="task_validation_failed",
