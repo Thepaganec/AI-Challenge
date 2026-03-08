@@ -11,8 +11,8 @@ def _now_str() -> str:
 class TaskStateStore:
     ALLOWED_STATES = ("planning", "execution", "validation", "done")
     ALLOWED_TRANSITIONS = {
-        "planning": {"execution"},
-        "execution": {"planning", "validation"},
+        "planning": {"execution", "done"},
+        "execution": {"validation"},
         "validation": {"execution", "done"},
         "done": set(),
     }

@@ -1057,7 +1057,8 @@ class LLMAgentServer:
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         out: List[str] = []
         cmd_prefix = re.compile(
-            r"^(?i)(new-item|set-content|add-content|test-path|get-childitem|mkdir|md|ni|copy-item|move-item|remove-item|write-output|echo|set-location|cd|if\s*\()"
+            r"^(new-item|set-content|add-content|test-path|get-childitem|mkdir|md|ni|copy-item|move-item|remove-item|write-output|echo|set-location|cd|if\s*\()",
+            flags=re.IGNORECASE,
         )
         for ln in lines:
             ln = re.sub(r"^\d+[\).\s-]+", "", ln).strip()
@@ -1239,6 +1240,234 @@ class LLMAgentServer:
             and "||" not in cmd
         )
 
+    def _is_interactive_command(self, command: str) -> bool:
+        cmd = str(command or "").strip().lower()
+        if not cmd:
+            return False
+        interactive_patterns = (
+            r"\bread-host\b",
+            r"\bpause\b",
+            r"\$host\.ui\.prompt",
+            r"\bout-gridview\b.*\b-passthru\b",
+        )
+        return any(re.search(p, cmd, flags=re.IGNORECASE) for p in interactive_patterns)
+
+    def _step_requires_user_input(self, step_text: str) -> bool:
+        text = str(step_text or "").strip().lower()
+        if not text:
+            return False
+        markers = (
+            "спрос",
+            "уточн",
+            "пользовател",
+            "введите",
+            "ввод",
+            "получить текст",
+            "ask user",
+            "user input",
+        )
+        return any(m in text for m in markers)
+
+    def _to_powershell_literal(self, value: str) -> str:
+        return "'" + str(value or "").replace("'", "''") + "'"
+
+    def _rewrite_interactive_with_user_payload(self, command: str, user_payload: str) -> str:
+        cmd = str(command or "").strip()
+        if not self._is_interactive_command(cmd):
+            return cmd
+        payload = str(user_payload or "")
+        m = re.match(r"(?is)^\s*read-host\b.*?\|\s*(.+)$", cmd)
+        if not m:
+            return cmd
+        sink = str(m.group(1) or "").strip()
+        if not sink:
+            return cmd
+        return f"{self._to_powershell_literal(payload)} | {sink}"
+
+    def _inject_user_payload_into_command(self, command: str, user_payload: str) -> str:
+        cmd = str(command or "").strip()
+        if not cmd:
+            return ""
+        # Drop intermediate variable assignment lines like `$script = ...`:
+        # each command runs in isolated process, so such assignments are ineffective.
+        if re.match(r"^\s*\$[A-Za-z_]\w*\s*=", cmd):
+            return ""
+        payload_lit = self._to_powershell_literal(user_payload)
+        cmd = re.sub(r"(?i)(\b-Value\s+)\$[A-Za-z_]\w*", rf"\1{payload_lit}", cmd)
+        cmd = re.sub(r"(?i)(\b-InputObject\s+)\$[A-Za-z_]\w*", rf"\1{payload_lit}", cmd)
+        return cmd
+
+    def _materialize_user_payload_in_commands(self, commands: List[str], user_payload: str) -> List[str]:
+        out: List[str] = []
+        for raw in commands:
+            cmd = self._rewrite_interactive_with_user_payload(str(raw or ""), user_payload)
+            cmd = self._inject_user_payload_into_command(cmd, user_payload)
+            cmd = str(cmd or "").strip()
+            if cmd:
+                out.append(cmd)
+        return out
+
+    async def _classify_task_control_intent(
+        self,
+        *,
+        user_text: str,
+        current_state: str,
+        model: str,
+        endpoint: str,
+        max_tokens: int,
+        trace_id: str,
+    ) -> Dict[str, str]:
+        clean = str(user_text or "").strip()
+        if not clean:
+            return {"intent": "none", "target_state": "", "reason": ""}
+        system_text = (
+            "Ты классификатор управляющих намерений пользователя для state machine задачи.\n"
+            "Определи, просит ли пользователь ЯВНО перевести задачу в другой статус.\n"
+            "Разрешенные статусы: planning, execution, validation, done.\n"
+            "Верни строго JSON: {\"intent\":\"state_transition|none\", \"target_state\":\"planning|execution|validation|done|\", \"reason\":\"кратко\"}\n"
+            "Если явной просьбы сменить статус нет, верни intent=none."
+        )
+        user_prompt = (
+            "CURRENT_STATE:\n"
+            f"{current_state}\n\n"
+            "USER_MESSAGE:\n"
+            f"{clean}\n\n"
+            "OUTPUT_SCHEMA:\n"
+            "{\"intent\":\"state_transition|none\", \"target_state\":\"planning|execution|validation|done|\", \"reason\":\"...\"}"
+        )
+        raw, _, _ = await self._llm_generate_text(
+            user_text=user_prompt,
+            system_text=system_text,
+            model=model,
+            endpoint=endpoint,
+            temperature=0.0,
+            max_tokens=max(120, int(max_tokens)),
+            trace_id=trace_id,
+            stage="execution",
+            validate_invariants=False,
+        )
+        obj = self._extract_json_block(raw) or {}
+        intent = str(obj.get("intent") or "none").strip().lower()
+        target_state = str(obj.get("target_state") or "").strip().lower()
+        reason = str(obj.get("reason") or "").strip()
+        if intent != "state_transition":
+            return {"intent": "none", "target_state": "", "reason": reason}
+        if target_state not in ("planning", "execution", "validation", "done"):
+            return {"intent": "none", "target_state": "", "reason": reason or "Не удалось определить целевой статус."}
+        return {"intent": "state_transition", "target_state": target_state, "reason": reason}
+
+    async def _assess_user_payload_for_step(
+        self,
+        *,
+        current_step: str,
+        user_payload: str,
+        model: str,
+        endpoint: str,
+        max_tokens: int,
+        trace_id: str,
+    ) -> Dict[str, str | bool]:
+        payload = str(user_payload or "").strip()
+        if not payload:
+            return {"suitable": False, "reason": "Пустой ввод пользователя.", "normalized_payload": ""}
+        system_text = (
+            "Ты классификатор пригодности пользовательского ввода для шага задачи.\n"
+            "Оцени, подходит ли USER_PAYLOAD для выполнения CURRENT_STEP.\n"
+            "Если шаг связан с записью содержимого в файл (например script.sql), трактуй USER_PAYLOAD как контент для записи, а не как команду к исполнению.\n"
+            "SQL/код/текстовые фрагменты (включая неполные) обычно считаются подходящими для записи в файл.\n"
+            "suitable=false ставь только если это мета-управление задачей: просьба перепланировать, изменить шаги, сменить статус, подтвердить/отклонить план, или пустой ввод.\n"
+            "Любой вопрос к ассистенту о процессе (например: 'что от меня требуется?') всегда unsuitable.\n"
+            "Если USER_PAYLOAD является диалоговой репликой, а не содержимым скрипта/кода, верни suitable=false.\n"
+            "Верни строго JSON: {\"suitable\": true|false, \"reason\":\"кратко\", \"normalized_payload\":\"...\"}.\n"
+            "normalized_payload верни как очищенную версию полезного ввода; если unsuitable — пустую строку."
+        )
+        user_prompt = (
+            "CURRENT_STEP:\n"
+            f"{current_step}\n\n"
+            "USER_PAYLOAD:\n"
+            f"{payload}\n\n"
+            "OUTPUT_SCHEMA:\n"
+            "{\"suitable\": true, \"reason\":\"...\", \"normalized_payload\":\"...\"}"
+        )
+        raw, _, _ = await self._llm_generate_text(
+            user_text=user_prompt,
+            system_text=system_text,
+            model=model,
+            endpoint=endpoint,
+            temperature=0.0,
+            max_tokens=max(140, int(max_tokens)),
+            trace_id=trace_id,
+            stage="execution",
+            validate_invariants=False,
+        )
+        obj = self._extract_json_block(raw) or {}
+        suitable = bool(obj.get("suitable", False))
+        reason = str(obj.get("reason") or "").strip()
+        normalized_payload = str(obj.get("normalized_payload") or "").strip()
+        if suitable and not normalized_payload:
+            normalized_payload = payload
+        return {
+            "suitable": suitable,
+            "reason": reason or ("Ввод подходит." if suitable else "Ввод не подходит для текущего шага."),
+            "normalized_payload": normalized_payload if suitable else "",
+        }
+
+    async def _classify_user_message_for_step(
+        self,
+        *,
+        current_step: str,
+        user_message: str,
+        model: str,
+        endpoint: str,
+        max_tokens: int,
+        trace_id: str,
+    ) -> Dict[str, str]:
+        msg = str(user_message or "").strip()
+        if not msg:
+            return {"kind": "empty", "reason": "Пустое сообщение."}
+        system_text = (
+            "Ты классификатор сообщения пользователя для execution-шагов.\n"
+            "Определи тип USER_MESSAGE относительно CURRENT_STEP.\n"
+            "Варианты kind:\n"
+            "- content_for_step: пользователь дал содержимое, которое нужно записать/использовать в шаге.\n"
+            "- task_management: пользователь обсуждает изменение плана/шагов/статусов/ожиданий, а не дает контент.\n"
+            "- clarification_question: пользователь задает вопрос про процесс (например: что сейчас ожидается?).\n"
+            "- empty: нет полезного текста.\n"
+            "Если CURRENT_STEP про запись в файл, SQL/код/текст скрипта -> обычно content_for_step.\n"
+            "Важно: вопрос к ассистенту о том, что делать дальше, всегда clarification_question.\n"
+            "Важно: просьбы изменить план/шаги/артефакты задачи всегда task_management.\n"
+            "Примеры:\n"
+            "- 'DELETE FROM test;' -> content_for_step\n"
+            "- 'тогда что от меня требуется?' -> clarification_question\n"
+            "- 'хочу переименовать папку SQL в BQL' -> task_management\n"
+            "Верни строго JSON: {\"kind\":\"content_for_step|task_management|clarification_question|empty\", \"reason\":\"кратко\"}."
+        )
+        user_prompt = (
+            "CURRENT_STEP:\n"
+            f"{current_step}\n\n"
+            "USER_MESSAGE:\n"
+            f"{msg}\n\n"
+            "OUTPUT_SCHEMA:\n"
+            "{\"kind\":\"content_for_step|task_management|clarification_question|empty\", \"reason\":\"...\"}"
+        )
+        raw, _, _ = await self._llm_generate_text(
+            user_text=user_prompt,
+            system_text=system_text,
+            model=model,
+            endpoint=endpoint,
+            temperature=0.0,
+            max_tokens=max(120, int(max_tokens)),
+            trace_id=trace_id,
+            stage="execution",
+            validate_invariants=False,
+        )
+        obj = self._extract_json_block(raw) or {}
+        kind = str(obj.get("kind") or "").strip().lower()
+        reason = str(obj.get("reason") or "").strip()
+        allowed = {"content_for_step", "task_management", "clarification_question", "empty"}
+        if kind not in allowed:
+            kind = "task_management"
+        return {"kind": kind, "reason": reason or "Требуется уточнение ввода для текущего шага."}
+
     async def _run_powershell_commands(
         self,
         commands: List[str],
@@ -1319,6 +1548,46 @@ class LLMAgentServer:
                 if on_signal is not None:
                     try:
                         await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": 0})
+                    except Exception:
+                        pass
+                continue
+            if self._is_interactive_command(cmd):
+                all_ok = False
+                runs.append(
+                    {
+                        "index": idx,
+                        "command": cmd,
+                        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_code": -2,
+                        "stdout": "",
+                        "stderr": "Interactive commands are not allowed in orchestrator execution.",
+                        "ok": False,
+                        "cwd_after": effective_cwd,
+                    }
+                )
+                try:
+                    self.logger.write(
+                        "WARN",
+                        "TASK_COMMAND_DONE",
+                        extra=json.dumps(
+                            {
+                                "req_id": trace_id,
+                                "stage": stage,
+                                "index": idx,
+                                "command": cmd,
+                                "exit_code": -2,
+                                "stdout": "",
+                                "stderr": "Interactive commands are not allowed in orchestrator execution.",
+                                "cwd_after": effective_cwd,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                except Exception:
+                    pass
+                if on_signal is not None:
+                    try:
+                        await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": -2})
                     except Exception:
                         pass
                 continue
@@ -2293,6 +2562,57 @@ class LLMAgentServer:
 
         state_now = str(task_state.get("state") or "planning").strip().lower()
         has_task = bool(str(task_state.get("task") or "").strip()) and int(task_state.get("total") or 0) > 0
+        ignore_current_user_payload_in_execution = False
+
+        if has_task and state_now in ("planning", "execution", "validation"):
+            control_intent = await self._classify_task_control_intent(
+                user_text=user_text,
+                current_state=state_now,
+                model=model,
+                endpoint=endpoint,
+                max_tokens=max_tokens,
+                trace_id=f"{req_id}-control-intent",
+            )
+            if str(control_intent.get("intent") or "none") == "state_transition":
+                target_state = str(control_intent.get("target_state") or "").strip().lower()
+                reason = str(control_intent.get("reason") or "").strip()
+                before_transition = self.task_store.get_state()
+                try:
+                    task_state = self.task_store.transition(target_state)
+                    self._log_task_action(action="auto_user_state_transition_request", before=before_transition, after=task_state)
+                    await _send_orchestrator_done(
+                        answer_text=f"Запрос на смену статуса выполнен: {state_now} -> {target_state}.",
+                        usage_data={},
+                        final_task_state=task_state,
+                        strategy_name="task_state_transition_applied",
+                    )
+                    return
+                except Exception:
+                    allowed = sorted(list(self.task_store.ALLOWED_TRANSITIONS.get(state_now, set())))
+                    allowed_text = ", ".join(allowed) if allowed else "нет"
+                    fail_state = self.task_store.update_progress(
+                        expected_action=f"Запрошен недопустимый переход состояния: {state_now} -> {target_state}."
+                    )
+                    if state_now == "execution":
+                        current_step = str(fail_state.get("current") or "").strip()
+                        if self._step_requires_user_input(current_step):
+                            fail_state = self.task_store.set_paused(True)
+                    self._log_task_action(
+                        action="auto_user_state_transition_rejected",
+                        before=before_transition,
+                        after=fail_state,
+                    )
+                    await _send_orchestrator_done(
+                        answer_text=(
+                            f"Переход состояния запрещен: {state_now} -> {target_state}. "
+                            f"Разрешены только: {allowed_text}. "
+                            f"{reason}".strip()
+                        ),
+                        usage_data={},
+                        final_task_state=fail_state,
+                        strategy_name="task_state_transition_rejected",
+                    )
+                    return
 
         # Шаг 1-3: новая задача -> LLM планирование -> показать план на подтверждение.
         if (not has_task) or state_now == "done":
@@ -2385,6 +2705,7 @@ class LLMAgentServer:
                 self._log_task_action(action="auto_confirm_plan_on_message", before=before_confirm, after=task_state)
                 await _signal("execution", "План подтвержден, начинаю выполнение")
                 state_now = "execution"
+                ignore_current_user_payload_in_execution = True
             else:
                 await _signal("planning", "Обновляю план по комментарию пользователя")
                 task_text = str(task_state.get("task") or "").strip() or user_text
@@ -2467,6 +2788,8 @@ class LLMAgentServer:
                 "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
                 "Команды должны быть идемпотентными: повторный запуск не должен падать (используй `-Force`, `Test-Path`, `if (...) { ... }`).\n"
                 "В execution НЕ делай финальную проверку результата задачи и не проверяй артефакты будущих шагов.\n"
+                "Запрещены интерактивные команды (`Read-Host`, `pause`, любые prompt-команды): шаг выполняется без TTY-ввода.\n"
+                "Если шаг требует данные от пользователя, используй блок LATEST_USER_MESSAGE как уже полученный ввод.\n"
                 "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"note\": \"...\"}\n"
                 "Только безопасные и конкретные команды без поясняющего текста вне JSON."
             )
@@ -2487,6 +2810,82 @@ class LLMAgentServer:
                     plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
                     done_steps = task_state.get("done") if isinstance(task_state.get("done"), list) else []
                     current_step = str(task_state.get("current") or "").strip()
+                    if ignore_current_user_payload_in_execution:
+                        latest_user_message = ""
+                    else:
+                        latest_user_message = str(user_text or "").strip()
+                    if self._step_requires_user_input(current_step) and (not latest_user_message):
+                        before_pause = self.task_store.get_state()
+                        _ = self.task_store.update_progress(
+                            expected_action="Требуется ввод пользователя для текущего шага. Пришлите данные сообщением."
+                        )
+                        task_state = self.task_store.set_paused(True)
+                        self._log_task_action(action="auto_pause_wait_user_input", before=before_pause, after=task_state)
+                        await _signal("execution", "Шаг требует ввода пользователя, выполнение приостановлено")
+                        await _send_orchestrator_done(
+                            answer_text=(
+                                "Для завершения текущего шага пришлите данные пользователя отдельным сообщением. "
+                                "После этого выполнение автоматически продолжится."
+                            ),
+                            usage_data=usage_agg,
+                            final_task_state=task_state,
+                            strategy_name="task_execution_wait_user_input",
+                        )
+                        return
+                    if self._step_requires_user_input(current_step) and latest_user_message:
+                        message_kind = await self._classify_user_message_for_step(
+                            current_step=current_step,
+                            user_message=latest_user_message,
+                            model=model,
+                            endpoint=endpoint,
+                            max_tokens=max_tokens,
+                            trace_id=f"{req_id}-step-message-kind",
+                        )
+                        msg_kind = str(message_kind.get("kind") or "").strip().lower()
+                        if msg_kind != "content_for_step":
+                            reason = str(message_kind.get("reason") or "Ожидается контент для текущего шага.").strip()
+                            before_pause = self.task_store.get_state()
+                            _ = self.task_store.update_progress(
+                                expected_action=f"Ожидается контент для шага. Причина отклонения текущего сообщения: {reason}"
+                            )
+                            task_state = self.task_store.set_paused(True)
+                            self._log_task_action(action="auto_pause_user_message_not_step_content", before=before_pause, after=task_state)
+                            await _signal("execution", "Сообщение не содержит контент для текущего шага")
+                            await _send_orchestrator_done(
+                                answer_text=(
+                                    "Сейчас от вас ожидается содержимое для текущего шага (например текст SQL-скрипта). "
+                                    f"Текущее сообщение отклонено: {reason}"
+                                ),
+                                usage_data=usage_agg,
+                                final_task_state=task_state,
+                                strategy_name="task_execution_wait_user_input",
+                            )
+                            return
+                        payload_assessment = await self._assess_user_payload_for_step(
+                            current_step=current_step,
+                            user_payload=latest_user_message,
+                            model=model,
+                            endpoint=endpoint,
+                            max_tokens=max_tokens,
+                            trace_id=f"{req_id}-step-payload-check",
+                        )
+                        if not bool(payload_assessment.get("suitable", False)):
+                            reason = str(payload_assessment.get("reason") or "Ввод не подходит для текущего шага.").strip()
+                            before_pause = self.task_store.get_state()
+                            _ = self.task_store.update_progress(
+                                expected_action=f"Текущий ввод не подходит для шага. Причина: {reason}"
+                            )
+                            task_state = self.task_store.set_paused(True)
+                            self._log_task_action(action="auto_pause_user_payload_rejected", before=before_pause, after=task_state)
+                            await _signal("execution", "Ввод пользователя отклонен для текущего шага")
+                            await _send_orchestrator_done(
+                                answer_text=f"Данные не подходят для текущего шага. Причина: {reason}",
+                                usage_data=usage_agg,
+                                final_task_state=task_state,
+                                strategy_name="task_execution_user_payload_rejected",
+                            )
+                            return
+                        latest_user_message = str(payload_assessment.get("normalized_payload") or latest_user_message).strip()
                     exec_user = (
                         "TASK:\n"
                         f"{task_text}\n\n"
@@ -2496,6 +2895,8 @@ class LLMAgentServer:
                         f"{json.dumps(done_steps, ensure_ascii=False)}\n\n"
                         "CURRENT_STEP:\n"
                         f"{current_step}\n\n"
+                        "LATEST_USER_MESSAGE:\n"
+                        f"{latest_user_message}\n\n"
                         "WORKDIR_ROOT:\n"
                         f"{self.project_root}\n\n"
                         "WORKDIR_CURRENT:\n"
@@ -2608,6 +3009,84 @@ class LLMAgentServer:
                             )
                             return
 
+                    interactive_commands = [c for c in commands if self._is_interactive_command(c)]
+                    if interactive_commands:
+                        before_pause = self.task_store.get_state()
+                        if self._step_requires_user_input(current_step) and latest_user_message:
+                            commands = self._materialize_user_payload_in_commands(commands, latest_user_message)
+                            interactive_commands = [c for c in commands if self._is_interactive_command(c)]
+                        if interactive_commands:
+                            repair_interactive_system = (
+                                "Ты исправляешь execution-команды, чтобы они были неинтерактивными.\n"
+                                "Удали Read-Host/pause/prompt-команды.\n"
+                                "Если нужен пользовательский контент, используй LATEST_USER_MESSAGE как уже полученный ввод.\n"
+                                "Верни строго JSON: {\"commands\": [\"...\"]}"
+                            )
+                            repair_interactive_user = (
+                                "CURRENT_STEP:\n"
+                                f"{current_step}\n\n"
+                                "LATEST_USER_MESSAGE:\n"
+                                f"{latest_user_message}\n\n"
+                                "INTERACTIVE_COMMANDS:\n"
+                                f"{json.dumps(commands, ensure_ascii=False)}\n\n"
+                                "OUTPUT_SCHEMA:\n"
+                                "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
+                            )
+                            fix_raw, usage_fix, _ = await self._llm_generate_text(
+                                user_text=repair_interactive_user,
+                                system_text=repair_interactive_system,
+                                model=model,
+                                endpoint=endpoint,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                trace_id=f"{req_id}-exec-repair-interactive",
+                                stage="execution",
+                                validate_invariants=False,
+                            )
+                            _acc_usage(usage_fix)
+                            fixed_commands = self._extract_commands(fix_raw)
+                            if fixed_commands:
+                                commands = fixed_commands
+                                if self._step_requires_user_input(current_step) and latest_user_message:
+                                    commands = self._materialize_user_payload_in_commands(commands, latest_user_message)
+                                interactive_commands = [c for c in commands if self._is_interactive_command(c)]
+                        if self._step_requires_user_input(current_step) and not interactive_commands:
+                            await _signal("execution", "Заменяю интерактивный ввод на данные из последнего сообщения пользователя")
+                        elif self._step_requires_user_input(current_step):
+                            _ = self.task_store.update_progress(
+                                expected_action="Пришлите содержимое для текущего шага сообщением (без изменения плана)."
+                            )
+                            task_state = self.task_store.set_paused(True)
+                            self._log_task_action(action="auto_pause_interactive_command_blocked", before=before_pause, after=task_state)
+                            await _signal("execution", "Интерактивные команды отклонены, ожидаю данные пользователя сообщением")
+                            await _send_orchestrator_done(
+                                answer_text=(
+                                    "Нужен ваш ввод для текущего шага, но интерактивный ввод в консоли отключен. "
+                                    "Пришлите содержимое (например SQL-скрипт) отдельным сообщением, и выполнение продолжится автоматически."
+                                ),
+                                usage_data=usage_agg,
+                                final_task_state=task_state,
+                                strategy_name="task_execution_wait_user_input",
+                            )
+                            return
+                        if interactive_commands:
+                            expected = str((before_pause or {}).get("expected_action") or "").strip()
+                            fail_state = self.task_store.update_progress(
+                                expected_action=expected or "Ожидается уточнение пользователя для текущего шага."
+                            )
+                            await _send_orchestrator_done(
+                                answer_text=(
+                                    "Не удалось продолжить автоматически: модель снова вернула интерактивные команды. "
+                                    f"Текущий шаг: {current_step}. "
+                                    f"Ожидаемое действие: {str(fail_state.get('expected_action') or '').strip() or 'уточните входные данные для шага'}."
+                                ),
+                                usage_data=usage_agg,
+                                final_task_state=fail_state,
+                                strategy_name="task_execution_wait_clarification",
+                                error_text="interactive_commands_blocked",
+                            )
+                            return
+
                     commands_validation = await self._validate_commands_with_invariants(
                         commands=commands,
                         stage="execution",
@@ -2619,6 +3098,8 @@ class LLMAgentServer:
                         fail_state = self.task_store.update_progress(
                             expected_action="Команды выполнения отклонены strict-инвариантами."
                         )
+                        if self._step_requires_user_input(current_step):
+                            fail_state = self.task_store.set_paused(True)
                         await _send_orchestrator_done(
                             answer_text=self._format_invariant_fail_message(
                                 commands_validation,
