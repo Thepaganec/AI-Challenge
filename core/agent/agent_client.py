@@ -37,6 +37,9 @@ class AgentClient:
         self.last_task_state: Dict[str, Any] = {}
         self.last_task_signal: Dict[str, Any] = {}
         self.on_task_signal = None
+        self.last_mcp_status: Dict[str, Any] = {}
+        self.last_mcp_tools: List[Dict[str, Any]] = []
+        self.last_mcp_tool_result: Dict[str, Any] = {}
 
     # === Управление TCP-соединением ===
 
@@ -157,6 +160,46 @@ class AgentClient:
             return msg.get("type") == "pong"
         except Exception:
             return False
+
+    async def mcp_status(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "mcp_status"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "mcp_status":
+            status = msg.get("status") if isinstance(msg.get("status"), dict) else {}
+            self.last_mcp_status = status
+            return status
+        return {}
+
+    async def mcp_list_tools(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "mcp_list_tools"})
+        self._raise_if_error(msg)
+        if msg.get("type") == "mcp_tools":
+            tools = msg.get("tools") if isinstance(msg.get("tools"), list) else []
+            payload = {
+                "enabled": bool(msg.get("enabled")),
+                "connected": bool(msg.get("connected")),
+                "source": str(msg.get("source") or "live"),
+                "error": str(msg.get("error") or ""),
+                "tools": tools,
+            }
+            self.last_mcp_tools = tools
+            return payload
+        return {"enabled": False, "connected": False, "source": "live", "error": "", "tools": []}
+
+    async def mcp_call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = {
+            "action": "mcp_call_tool",
+            "tool_name": str(tool_name or "").strip(),
+            "arguments": arguments if isinstance(arguments, dict) else {},
+        }
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        if msg.get("type") == "mcp_tool_result":
+            result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
+            out = {"tool_name": str(msg.get("tool_name") or ""), "result": result}
+            self.last_mcp_tool_result = out
+            return out
+        return {"tool_name": str(tool_name or ""), "result": {}}
 
     # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
 

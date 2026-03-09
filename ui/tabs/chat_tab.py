@@ -555,6 +555,7 @@ class ChatTab(BaseTab):
             self.is_agent_connected = bool(ok)
             if self.is_agent_connected:
                 self.logger.success("Агент найден: подключение успешно")
+                await self.bootstrap_mcp_ui()
                 await self.refresh_sessions_list()
                 await self.load_session_to_ui(self.current_session_id)
                 await self.bootstrap_profile_ui()
@@ -571,6 +572,37 @@ class ChatTab(BaseTab):
             self._set_profile_none_ui()
             self._render_invariants({})
             self.render_task_state({})
+
+    async def bootstrap_mcp_ui(self):
+        try:
+            status = await self.agent.mcp_status()
+            enabled = bool(status.get("enabled"))
+            connected = bool(status.get("connected"))
+            server_url = str(status.get("server_url") or "")
+            if not enabled:
+                self.logger.info("MCP: отключен (MCP_ENABLED=false).")
+                return
+            if connected:
+                self.logger.success(f"MCP подключен: {server_url}")
+            else:
+                err = str(status.get("last_error") or "unknown")
+                self.logger.warning(f"MCP недоступен: {server_url} | {err}")
+            tools_state = await self.agent.mcp_list_tools()
+            self._log_mcp_tools_state(tools_state)
+        except Exception as e:
+            self.logger.warning(f"Не удалось получить статус MCP: {e}")
+
+    def _log_mcp_tools_state(self, tools_state: dict):
+        tools = tools_state.get("tools") if isinstance(tools_state, dict) and isinstance(tools_state.get("tools"), list) else []
+        names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
+        source = str(tools_state.get("source") or "live") if isinstance(tools_state, dict) else "live"
+        error = str(tools_state.get("error") or "") if isinstance(tools_state, dict) else ""
+        if names:
+            self.logger.info(f"MCP tools ({source}): {', '.join(names)}")
+        else:
+            self.logger.warning(f"MCP tools пусто ({source})")
+        if error:
+            self.logger.warning(f"MCP tools error: {error}")
 
     # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
@@ -1498,6 +1530,16 @@ class ChatTab(BaseTab):
             self.logger.warning("Отсутствует текст для отправки!")
             return
 
+        if text.lower() == "/mcp tools":
+            self.input_editbox.clear()
+            asyncio.get_event_loop().create_task(self._handle_mcp_tools_command())
+            return
+
+        if text.lower().startswith("/mcp call "):
+            self.input_editbox.clear()
+            asyncio.get_event_loop().create_task(self._handle_mcp_call_command(text))
+            return
+
         self.input_editbox.clear()
 
         self.output_editbox.append(f"Ты: {text}\n")
@@ -1541,6 +1583,53 @@ class ChatTab(BaseTab):
             )
         )
         self.pending_memory_write = None
+
+    async def _handle_mcp_tools_command(self):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: MCP tools недоступны.")
+            return
+        try:
+            state = await self.agent.mcp_list_tools()
+            self._log_mcp_tools_state(state)
+            tools = state.get("tools") if isinstance(state.get("tools"), list) else []
+            names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
+            self.output_editbox.append(f"[MCP] tools: {', '.join(names) if names else 'нет инструментов'}\n")
+        except Exception as e:
+            self.logger.warning(f"Не удалось получить MCP tools: {e}")
+            self.output_editbox.append(f"[MCP] ошибка tools: {e}\n")
+
+    async def _handle_mcp_call_command(self, raw_text: str):
+        if not self.is_agent_connected:
+            self.logger.warning("Агент OFFLINE: MCP call недоступен.")
+            return
+        # Формат: /mcp call <tool_name> {"k":"v"}
+        body = raw_text[len("/mcp call "):].strip()
+        if not body:
+            self.logger.warning("Формат: /mcp call <tool_name> {json_args}")
+            return
+        parts = body.split(" ", 1)
+        tool_name = str(parts[0] or "").strip()
+        args_text = parts[1].strip() if len(parts) > 1 else ""
+        args: dict = {}
+        if args_text:
+            try:
+                parsed = json.loads(args_text)
+                if isinstance(parsed, dict):
+                    args = parsed
+                else:
+                    self.logger.warning("Аргументы MCP должны быть JSON-объектом.")
+                    return
+            except Exception as e:
+                self.logger.warning(f"Невалидный JSON аргументов MCP: {e}")
+                return
+        try:
+            result = await self.agent.mcp_call_tool(tool_name, args)
+            self.logger.success(f"MCP tool выполнен: {tool_name}")
+            self.logger.info(f"MCP tool result: {json.dumps(result.get('result') or {}, ensure_ascii=False)}")
+            self.output_editbox.append(f"[MCP] {tool_name}: {json.dumps(result.get('result') or {}, ensure_ascii=False)}\n")
+        except Exception as e:
+            self.logger.warning(f"Ошибка MCP tool {tool_name}: {e}")
+            self.output_editbox.append(f"[MCP] ошибка {tool_name}: {e}\n")
 
     # Ведёт полный цикл стриминга: проверка соединения, чтение чанков, расчёт TTFT/токенов/стоимости и обновление UI/метрик по итогам ответа.
 

@@ -31,6 +31,7 @@ from core.agent.strategies import (
     build_facts_strategy,
     build_summary_strategy,
 )
+from core.mcp.client import MCPClient
 
 
 class LLMAgentServer:
@@ -73,6 +74,16 @@ class LLMAgentServer:
         self._last_task_state_log_sig: str = ""
 
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
+        self.mcp_enabled = str(os.getenv("MCP_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        self.mcp_transport = str(os.getenv("MCP_TRANSPORT", "sse")).strip() or "sse"
+        self.mcp_server_url = str(os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001")).strip() or "http://127.0.0.1:8001"
+        self.mcp_timeout_sec = int(str(os.getenv("MCP_TIMEOUT_SEC", "15")).strip() or "15")
+        self.mcp_auth_token = str(os.getenv("MCP_AUTH_TOKEN", "")).strip()
+        self.mcp_client = MCPClient(
+            server_url=self.mcp_server_url,
+            timeout_sec=self.mcp_timeout_sec,
+            auth_token=self.mcp_auth_token,
+        )
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
         self._action_handlers: Dict[str, Callable[[Dict[str, Any], asyncio.StreamWriter], Awaitable[None]]] = {
@@ -105,6 +116,9 @@ class LLMAgentServer:
             "next_task_step": self._handle_next_task_step,
             "update_task_progress": self._handle_update_task_progress,
             "delete_task": self._handle_delete_task,
+            "mcp_status": self._handle_mcp_status,
+            "mcp_list_tools": self._handle_mcp_list_tools,
+            "mcp_call_tool": self._handle_mcp_call_tool,
             "stream_chat": self._handle_stream_chat,
         }
         self._model_context_limit: Dict[str, int] = {
@@ -1879,6 +1893,49 @@ class LLMAgentServer:
         except Exception:
             return None
 
+    def _log_mcp_event(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        extra = ""
+        if isinstance(payload, dict):
+            try:
+                extra = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                extra = str(payload)
+        self.logger.write("INFO", event, extra=extra)
+
+    async def _bootstrap_mcp(self) -> None:
+        if not self.mcp_enabled:
+            self._log_mcp_event(
+                "MCP_DISABLED",
+                {"enabled": False, "server_url": self.mcp_server_url, "transport": self.mcp_transport},
+            )
+            return
+        ok = await self.mcp_client.connect()
+        if ok:
+            self._log_mcp_event(
+                "MCP_CONNECTED",
+                {"enabled": True, "server_url": self.mcp_server_url, "transport": self.mcp_transport},
+            )
+            tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
+            tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
+            self._log_mcp_event(
+                "MCP_TOOLS_LIST",
+                {
+                    "count": len(tools),
+                    "source": tools_state.get("source") or "live",
+                    "tools": [str(t.get("name") or "") for t in tools if isinstance(t, dict)],
+                },
+            )
+            return
+        self._log_mcp_event(
+            "MCP_CONNECT_FAILED",
+            {
+                "enabled": True,
+                "server_url": self.mcp_server_url,
+                "transport": self.mcp_transport,
+                "error": self.mcp_client.last_error,
+            },
+        )
+
     # === Обработчики команд клиента ===
 
     # Реализует действия протокола: сессии, ветки, checkpoints, память, профили и основной chat-stream с сохранением результатов в стор.
@@ -1887,6 +1944,110 @@ class LLMAgentServer:
 
     async def _handle_ping(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         await self._send_json(writer, {"type": "pong"})
+
+    async def _handle_mcp_status(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        if self.mcp_enabled and not self.mcp_client.connected:
+            await self.mcp_client.connect()
+        status = self.mcp_client.status()
+        status["enabled"] = bool(self.mcp_enabled)
+        status["transport"] = self.mcp_transport
+        if status.get("connected"):
+            self._log_mcp_event("MCP_CONNECTED", status)
+        elif self.mcp_enabled:
+            self._log_mcp_event("MCP_CONNECT_FAILED", status)
+        await self._send_json(writer, {"type": "mcp_status", "status": status})
+
+    async def _handle_mcp_list_tools(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        if not self.mcp_enabled:
+            await self._send_json(
+                writer,
+                {
+                    "type": "mcp_tools",
+                    "enabled": False,
+                    "connected": False,
+                    "tools": [],
+                    "source": "disabled",
+                    "error": "MCP disabled by MCP_ENABLED=false",
+                },
+            )
+            return
+
+        tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
+        tool_names: List[str] = []
+        tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
+        for tool in tools:
+            if isinstance(tool, dict):
+                tool_names.append(str(tool.get("name") or ""))
+
+        self._log_mcp_event(
+            "MCP_TOOLS_LIST",
+            {
+                "connected": bool(tools_state.get("connected")),
+                "source": tools_state.get("source") or "live",
+                "tools": tool_names,
+                "error": tools_state.get("error") or "",
+            },
+        )
+        await self._send_json(
+            writer,
+            {
+                "type": "mcp_tools",
+                "enabled": True,
+                "connected": bool(tools_state.get("connected")),
+                "tools": tools,
+                "source": tools_state.get("source") or "live",
+                "error": tools_state.get("error") or "",
+            },
+        )
+
+    async def _handle_mcp_call_tool(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        tool_name = str(request.get("tool_name") or "").strip()
+        arguments = request.get("arguments") if isinstance(request.get("arguments"), dict) else {}
+        if not self.mcp_enabled:
+            await self._send_error(writer, "MCP disabled by MCP_ENABLED=false")
+            return
+        if not tool_name:
+            await self._send_error(writer, "tool_name is required")
+            return
+
+        # Перед вызовом инструмента запрашиваем актуальный список и логируем его.
+        tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
+        tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
+        tool_names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
+        self._log_mcp_event(
+            "MCP_TOOLS_LIST",
+            {
+                "connected": bool(tools_state.get("connected")),
+                "source": tools_state.get("source") or "live",
+                "tools": tool_names,
+                "error": tools_state.get("error") or "",
+            },
+        )
+        if tool_names and tool_name not in tool_names:
+            await self._send_error(writer, f"Tool not found: {tool_name}")
+            return
+
+        self._log_mcp_event(
+            "MCP_TOOL_CALL_START",
+            {"tool_name": tool_name, "arguments": arguments},
+        )
+        try:
+            result = await self.mcp_client.call_tool(tool_name, arguments)
+            self._log_mcp_event("MCP_TOOL_CALL_RESULT", {"tool_name": tool_name, "result": result})
+            await self._send_json(
+                writer,
+                {
+                    "type": "mcp_tool_result",
+                    "tool_name": tool_name,
+                    "result": result,
+                },
+            )
+        except Exception as e:
+            self._log_mcp_event(
+                "MCP_TOOL_CALL_ERROR",
+                {"tool_name": tool_name, "error": str(e)},
+            )
+            await self._send_error(writer, str(e))
 
     # Обрабатывает действие 'list_sessions' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
@@ -3719,6 +3880,7 @@ class LLMAgentServer:
 
     async def run(self) -> None:
         await self.preload_pricing()
+        await self._bootstrap_mcp()
 
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
