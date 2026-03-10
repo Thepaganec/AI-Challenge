@@ -1,56 +1,30 @@
-import sys
-sys.dont_write_bytecode = True
-
 import asyncio
 import json
 import os
-import re
 import traceback
 import uuid
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, Optional, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-load_dotenv(override=True)
 
 from core.api.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
+from core.agent.invariants import build_invariants_system_text, normalize_invariants_state
 from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
-from core.agent.task_state_store import TaskStateStore
-from core.agent.invariants import (
-    INVARIANT_KEYS,
-    INVARIANT_POLICIES,
-    build_runtime_context_text,
-    build_invariants_system_text,
-    normalize_invariants_state,
-)
 from core.agent.strategies import (
-    build_sliding_window,
-    parse_facts_and_strip_user_text,
     build_facts_strategy,
+    build_sliding_window,
     build_summary_strategy,
+    parse_facts_and_strip_user_text,
 )
-from core.mcp.client import MCPClient
+from core.mcp import MCPClient, MCPClientError
+
+load_dotenv(override=True)
 
 
 class LLMAgentServer:
-    """
-    Локальный TCP сервер (JSONL протокол).
-    Клиент шлёт одну строку JSON -> сервер отвечает либо одной строкой, либо стримом (chunk/done).
-
-    В рамках Day 10:
-    - Sliding Window
-    - Sticky Facts (key-value facts) + последние N сообщений
-    - Branching (ветки от checkpoint)
-    """
-
-    # === Инициализация сервера ===
-
-    # Создаёт хранилища сессий/профилей, GPT-клиент, кэш тарифов и таблицу роутинга action->handler для JSONL протокола.
-
-    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
-
     def __init__(
         self,
         host: str = "127.0.0.1",
@@ -61,7 +35,6 @@ class LLMAgentServer:
     ):
         self.host = host
         self.port = port
-
         self.base_dir = os.path.dirname(__file__)
         self.project_root = os.path.abspath(os.path.join(self.base_dir, "..", ".."))
         self.logger = AgentFileLogger(logs_dir=self.base_dir, prefix="agentlogs")
@@ -70,2335 +43,579 @@ class LLMAgentServer:
         self.memory_dir = os.path.join(self.base_dir, "memory")
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
         self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
-        self.task_store = TaskStateStore(file_path=os.path.join(self.base_dir, "task_state.json"))
-        self._last_task_state_log_sig: str = ""
-
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
-        self.mcp_enabled = str(os.getenv("MCP_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
-        self.mcp_transport = str(os.getenv("MCP_TRANSPORT", "sse")).strip() or "sse"
-        self.mcp_server_url = str(os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001")).strip() or "http://127.0.0.1:8001"
-        self.mcp_timeout_sec = int(str(os.getenv("MCP_TIMEOUT_SEC", "15")).strip() or "15")
-        self.mcp_auth_token = str(os.getenv("MCP_AUTH_TOKEN", "")).strip()
-        self.mcp_client = MCPClient(
-            server_url=self.mcp_server_url,
-            timeout_sec=self.mcp_timeout_sec,
-            auth_token=self.mcp_auth_token,
-        )
+        self.mcp = MCPClient(logger=self.logger)
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
-        self._action_handlers: Dict[str, Callable[[Dict[str, Any], asyncio.StreamWriter], Awaitable[None]]] = {
-            "ping": self._handle_ping,
-            "list_sessions": self._handle_list_sessions,
-            "get_session": self._handle_get_session,
-            "reset_session": self._handle_reset_session,
-            "list_branches": self._handle_list_branches,
-            "set_active_branch": self._handle_switch_branch,
-            "switch_branch": self._handle_switch_branch,
-            "list_checkpoints": self._handle_list_checkpoints,
-            "create_checkpoint": self._handle_create_checkpoint,
-            "create_branch": self._handle_create_branch,
-            "get_memory": self._handle_get_memory,
-            "save_memory": self._handle_save_memory,
-            "list_profiles": self._handle_list_profiles,
-            "get_profile": self._handle_get_profile,
-            "save_profile": self._handle_save_profile,
-            "delete_profile": self._handle_delete_profile,
-            "set_active_profile": self._handle_set_active_profile,
-            "get_profile_state": self._handle_get_profile_state,
-            "get_invariants_state": self._handle_get_invariants_state,
-            "save_invariant": self._handle_save_invariant,
-            "set_invariant_policy": self._handle_set_invariant_policy,
-            "get_task_state": self._handle_get_task_state,
-            "generate_task_plan": self._handle_generate_task_plan,
-            "confirm_task_plan": self._handle_confirm_task_plan,
-            "pause_task": self._handle_pause_task,
-            "resume_task": self._handle_resume_task,
-            "next_task_step": self._handle_next_task_step,
-            "update_task_progress": self._handle_update_task_progress,
-            "delete_task": self._handle_delete_task,
-            "mcp_status": self._handle_mcp_status,
-            "mcp_list_tools": self._handle_mcp_list_tools,
-            "mcp_call_tool": self._handle_mcp_call_tool,
-            "stream_chat": self._handle_stream_chat,
-        }
         self._model_context_limit: Dict[str, int] = {
             "gpt-3.5-turbo": 16384,
             "gpt-4o-mini": 128000,
             "gpt-4o": 128000,
             "gpt-5.2-chat-latest": 400000,
         }
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        self._action_handlers: Dict[str, Callable[[Dict[str, Any], asyncio.StreamWriter], Awaitable[None]]] = {}
+        self._action_handlers = {
+            "ping": self._handle_ping,
+            "list_sessions": self._handle_list_sessions,
+            "get_session": self._handle_get_session,
+            "reset_session": self._handle_reset_session,
+            "list_branches": self._handle_list_branches,
+            "switch_branch": self._handle_switch_branch,
+            "set_active_branch": self._handle_switch_branch,
+            "list_checkpoints": self._handle_list_checkpoints,
+            "create_checkpoint": self._handle_create_checkpoint,
+            "create_branch": self._handle_create_branch,
+            "get_memory": self._handle_get_memory,
+            "save_memory": self._handle_save_memory,
+            "get_profile": self._handle_get_profile,
+            "save_profile": self._handle_save_profile,
+            "delete_profile": self._handle_delete_profile,
+            "set_active_profile": self._handle_set_active_profile,
+            "get_profile_state": self._handle_get_profile_state,
+            "list_profiles": self._handle_get_profile_state,
+            "get_invariants_state": self._handle_get_invariants_state,
+            "save_invariant": self._handle_save_invariant,
+            "set_invariant_policy": self._handle_set_invariant_policy,
+            "mcp_status": self._handle_mcp_status,
+            "mcp_list_tools": self._handle_mcp_list_tools,
+            "mcp_call_tool": self._handle_mcp_call_tool,
+            "stream_chat": self._handle_stream_chat,
+        }
 
     async def preload_pricing(self) -> None:
         try:
-            self.logger.write("INFO", "Загрузка тарифов ProxyAPI (pricing/list)...")
+            self.logger.write("INFO", "Загрузка тарифов ProxyAPI")
             self.pricing_cache = await self.gpt.get_pricing_rub_per_1m()
             self.logger.write("SUCCESS", "Тарифы загружены", extra=f"models={len(self.pricing_cache)}")
         except Exception as e:
             self.logger.write("WARN", "Не удалось загрузить тарифы ProxyAPI", extra=str(e))
             self.pricing_cache = {}
 
-    # === Транспорт JSONL ===
-
-    # Отправляет ответы клиенту обычной строкой или по частям, а также унифицирует отправку сообщений об ошибке.
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     async def _send_json(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        writer.write(data)
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     async def _send_json_maybe_chunked(self, writer: asyncio.StreamWriter, payload: Dict[str, Any], *, max_line_bytes: int = 60000) -> None:
-        text = json.dumps(payload, ensure_ascii=False)
-        raw = (text + "\n").encode("utf-8")
-
+        raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         if len(raw) <= max_line_bytes:
             writer.write(raw)
             await writer.drain()
             return
-
+        text = json.dumps(payload, ensure_ascii=False)
         part_size = max(1000, max_line_bytes - 2000)
         parts = [text[i:i + part_size] for i in range(0, len(text), part_size)]
-
-        start = {"type": "chunked_start", "orig_type": payload.get("type"), "chunks": len(parts)}
-        writer.write((json.dumps(start, ensure_ascii=False) + "\n").encode("utf-8"))
-        await writer.drain()
-
-        for i, part in enumerate(parts):
-            msg = {"type": "chunked_part", "orig_type": payload.get("type"), "i": i, "data": part}
-            writer.write((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
-            await writer.drain()
-
-        end = {"type": "chunked_end", "orig_type": payload.get("type")}
-        writer.write((json.dumps(end, ensure_ascii=False) + "\n").encode("utf-8"))
-        await writer.drain()
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        await self._send_json(writer, {"type": "chunked_start", "orig_type": payload.get("type"), "chunks": len(parts)})
+        for idx, part in enumerate(parts):
+            await self._send_json(writer, {"type": "chunked_part", "orig_type": payload.get("type"), "i": idx, "data": part})
+        await self._send_json(writer, {"type": "chunked_end", "orig_type": payload.get("type")})
 
     async def _send_error(self, writer: asyncio.StreamWriter, message: str) -> None:
         await self._send_json(writer, {"type": "error", "message": message})
 
-    async def _send_task_signal(
-        self,
-        writer: asyncio.StreamWriter,
-        *,
-        message: str,
-        stage: str = "",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        payload: Dict[str, Any] = {
-            "type": "task_signal",
-            "message": str(message or "").strip(),
-            "stage": str(stage or "").strip(),
-        }
-        if isinstance(extra, dict) and extra:
-            payload["extra"] = extra
-        await self._send_json(writer, payload)
-
-    # === Работа с ветками и чекпоинтами ===
-
-    # Нормализует структуру ветки, подготавливает историю и память, создаёт чекпоинты и новые ветки от среза диалога.
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _get_branch(self, session: Dict[str, Any], branch_id: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-        branches = session.get("branches") or {}
-        if not isinstance(branches, dict):
-            branches = {}
-            session["branches"] = branches
-
-        active = (session.get("active_branch") or "main").strip() or "main"
-        if branch_id:
-            bid = str(branch_id).strip()
+    def _log(self, level: str, message: str, payload: Any = None) -> None:
+        if payload is None:
+            self.logger.write(level, message)
+            return
+        if isinstance(payload, str):
+            extra = payload
         else:
-            bid = active
+            extra = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.logger.write(level, message, extra=extra)
 
-        if bid not in branches:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            branches[bid] = {
-                "branch_id": bid,
-                "name": bid,
-                "created_at": now,
-                "updated_at": now,
-                "facts": {},
-                "checkpoints": [],   # <<< ВАЖНО: список, не dict
-                "history": [],
-                "summary": "",
-                "memory_layers": {
-                    "short_term": [],
-                    "working": {},
-                    "long_term": {},
-                },
-            }
+    def _estimate_tokens_text(self, text: Any) -> int:
+        clean = str(text or "").strip()
+        return max(1, int(len(clean) / 4)) if clean else 0
 
-        session["active_branch"] = bid
-        self._ensure_branch_memory_model(branches[bid])
-        return bid, branches[bid]
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _branch_history(self, branch: Dict[str, Any]) -> List[Dict[str, str]]:
-        h = branch.get("history")
-        if not isinstance(h, list):
-            h = []
-            branch["history"] = h
-
-        normalized: List[Dict[str, str]] = []
-        for m in h:
-            if not isinstance(m, dict):
-                continue
-            role = (m.get("role") or "").strip()
-            content = m.get("content")
-            if role and content is not None:
-                normalized.append({"role": role, "content": str(content)})
-
-        branch["history"] = normalized
-        return branch["history"]
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _make_checkpoint(self, history: List[Dict[str, str]], name: Optional[str] = None) -> Dict[str, Any]:
-        cut = 0
-        try:
-            cut = int(len(history) if isinstance(history, list) else 0)
-        except Exception:
-            cut = 0
-
-        cp_id = str(uuid.uuid4())
-        cp_name = (name or "").strip()
-        if not cp_name:
-            cp_name = f"checkpoint_{cut}"
-
-        return {
-            "id": cp_id,
-            "name": cp_name,
-            "cut": cut,  # индекс "после последнего сообщения"
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _create_branch_from_checkpoint(self, session: Dict[str, Any], base_branch_id: str, checkpoint: Dict[str, Any], name: Optional[str] = None) -> str:
-        branches = session.get("branches")
-        if not isinstance(branches, dict):
-            branches = {}
-            session["branches"] = branches
-
-        base_branch = branches.get(base_branch_id) if isinstance(branches.get(base_branch_id), dict) else None
-        if base_branch is None:
-            base_branch = branches.get("main") if isinstance(branches.get("main"), dict) else {"title": "main", "history": [], "facts": {}, "checkpoints": []}
-            branches[base_branch_id] = base_branch
-
-        base_history = base_branch.get("history") if isinstance(base_branch.get("history"), list) else []
-        try:
-            cut = int(checkpoint.get("cut") or 0)
-        except Exception:
-            cut = 0
-
-        new_history = list(base_history[:cut])
-
-        new_id = str(uuid.uuid4())[:8]
-        new_title = (name or "").strip() or f"branch_{new_id}"
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        branches[new_id] = {
-            "title": new_title,
-            "history": new_history,
-            "facts": dict(base_branch.get("facts") or {}) if isinstance(base_branch.get("facts"), dict) else {},
-            "checkpoints": [],
-            "summary": str(base_branch.get("summary") or ""),
-            "memory_layers": self._copy_memory_layers(base_branch.get("memory_layers")),
-            "created_at": now,
-            "updated_at": now,
-        }
-
-        session["branches"] = branches
-        return new_id
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _copy_memory_layers(self, layers: Any) -> Dict[str, Any]:
-        if not isinstance(layers, dict):
-            return {"short_term": [], "working": {}, "long_term": {}}
-        short_term = layers.get("short_term")
-        working = layers.get("working")
-        long_term = layers.get("long_term")
-        return {
-            "short_term": list(short_term) if isinstance(short_term, list) else [],
-            "working": dict(working) if isinstance(working, dict) else {},
-            "long_term": dict(long_term) if isinstance(long_term, dict) else {},
-        }
-
-    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
-
-    def _ensure_branch_memory_model(self, branch: Dict[str, Any]) -> Dict[str, Any]:
-        if not isinstance(branch.get("summary"), str):
-            branch["summary"] = ""
-        branch["memory_layers"] = self._copy_memory_layers(branch.get("memory_layers"))
-        return branch["memory_layers"]
-
-    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
-
-    def _ensure_title(self, session: Dict[str, Any], user_text: str) -> None:
-        self.memory_store.set_title_if_empty(session, user_text)
-
-    # === Подготовка контекста и метрик ===
-
-    # Собирает системный контекст (memory/profile/summary), оценивает токены, пишет структурные логи API и считает стоимость ответа.
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _estimate_tokens_text(self, text: str) -> int:
-        clean = (text or "").strip()
-        if not clean:
-            return 0
-        return max(1, int(len(clean) / 4))
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _estimate_tokens_messages(self, messages: List[Dict[str, str]]) -> int:
+    def _estimate_tokens_messages(self, messages: List[Dict[str, Any]]) -> int:
         total = 0
         for msg in messages or []:
             if not isinstance(msg, dict):
                 continue
-            total += self._estimate_tokens_text(str(msg.get("content") or ""))
+            total += self._estimate_tokens_text(msg.get("content"))
             total += 4
-        return int(total)
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        return total
 
     def _resolve_context_limit(self, model: str) -> int:
-        model_id = (model or "").strip()
-        return int(self._model_context_limit.get(model_id, 128000))
+        return int(self._model_context_limit.get(str(model or "").strip(), 128000))
 
-    # Собирает производные данные/текст из текущего состояния, чтобы использовать их как часть контекста или итогового ответа.
+    def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> float:
+        row = self.pricing_cache.get(str(model_id or "").strip()) if isinstance(self.pricing_cache, dict) else None
+        if not isinstance(row, dict):
+            return 0.0
+        prompt_tokens = float(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion_tokens = float(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        in_price = float(row.get("in") or 0.0)
+        out_price = float(row.get("out") or 0.0)
+        return (prompt_tokens / 1_000_000.0) * in_price + (completion_tokens / 1_000_000.0) * out_price
+
+    def _merge_usage(self, left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(left or {})
+        for key in ("prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "total_tokens"):
+            merged[key] = int(merged.get(key) or 0) + int((right or {}).get(key) or 0)
+        return merged
+
+    def _copy_memory_layers(self, layers: Any) -> Dict[str, Any]:
+        if not isinstance(layers, dict):
+            return {"short_term": [], "working": {}, "long_term": {}}
+        return {
+            "short_term": list(layers.get("short_term")) if isinstance(layers.get("short_term"), list) else [],
+            "working": dict(layers.get("working")) if isinstance(layers.get("working"), dict) else {},
+            "long_term": dict(layers.get("long_term")) if isinstance(layers.get("long_term"), dict) else {},
+        }
+
+    def _ensure_branch(self, session: Dict[str, Any], branch_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
+        session["branches"] = branches
+        active = str(session.get("active_branch") or "main").strip() or "main"
+        bid = str(branch_id or active).strip() or "main"
+        if bid not in branches or not isinstance(branches.get(bid), dict):
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            branches[bid] = {
+                "branch_id": bid,
+                "title": bid,
+                "history": [],
+                "facts": {},
+                "checkpoints": [],
+                "summary": "",
+                "memory_layers": {"short_term": [], "working": {}, "long_term": {}},
+                "created_at": now,
+                "updated_at": now,
+            }
+        branch = branches[bid]
+        if not isinstance(branch.get("history"), list):
+            branch["history"] = []
+        if not isinstance(branch.get("facts"), dict):
+            branch["facts"] = {}
+        if not isinstance(branch.get("checkpoints"), list):
+            branch["checkpoints"] = []
+        if not isinstance(branch.get("summary"), str):
+            branch["summary"] = ""
+        branch["memory_layers"] = self._copy_memory_layers(branch.get("memory_layers"))
+        session["active_branch"] = bid
+        return bid, branch
+
+    def _make_checkpoint(self, history: List[Dict[str, Any]], name: str = "") -> Dict[str, Any]:
+        cp_name = str(name or "").strip() or f"checkpoint_{len(history)}"
+        return {
+            "id": str(uuid.uuid4()),
+            "name": cp_name,
+            "cut": int(len(history)),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _create_branch_from_checkpoint(self, session: Dict[str, Any], from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
+        _, source = self._ensure_branch(session, from_branch_id)
+        checkpoints = source.get("checkpoints") if isinstance(source.get("checkpoints"), list) else []
+        checkpoint = next((cp for cp in checkpoints if isinstance(cp, dict) and str(cp.get("id")) == str(checkpoint_id)), None)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint not found")
+        cut = int(checkpoint.get("cut") or 0)
+        history = source.get("history") if isinstance(source.get("history"), list) else []
+        bid = str(uuid.uuid4())[:8]
+        title = str(new_branch_name or "").strip() or f"branch_{bid}"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["branches"][bid] = {
+            "branch_id": bid,
+            "title": title,
+            "history": list(history[:cut]),
+            "facts": dict(source.get("facts") or {}),
+            "checkpoints": [],
+            "summary": str(source.get("summary") or ""),
+            "memory_layers": self._copy_memory_layers(source.get("memory_layers")),
+            "created_at": now,
+            "updated_at": now,
+        }
+        session["active_branch"] = bid
+        return bid
+
+    def _normalize_tool_result_for_history(self, payload: Dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, Any]], keep_last_items: int = 12) -> None:
+        recent: List[str] = []
+        for msg in history[-keep_last_items:]:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = msg.get("content")
+            if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                names = [str((item.get("function") or {}).get("name") or "") for item in msg.get("tool_calls") if isinstance(item, dict)]
+                if names:
+                    recent.append(f"assistant_tool_calls: {', '.join(name for name in names if name)}")
+                continue
+            if content is None:
+                continue
+            text = str(content).replace("\n", " ").strip()
+            if not text:
+                continue
+            if len(text) > 240:
+                text = text[:237].rstrip() + "..."
+            recent.append(f"{role}: {text}")
+        memory_layers["short_term"] = recent[-keep_last_items:]
+
+    def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> None:
+        clean_layer = str(layer or "").strip()
+        clean_key = str(key or "").strip()
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            return
+        if clean_layer == "short_term":
+            bucket = memory_layers.get("short_term") if isinstance(memory_layers.get("short_term"), list) else []
+            bucket.append(clean_value)
+            memory_layers["short_term"] = bucket[-20:]
+            return
+        if clean_layer in ("working", "long_term"):
+            mapping = memory_layers.get(clean_layer) if isinstance(memory_layers.get(clean_layer), dict) else {}
+            mapping[clean_key or f"item_{len(mapping) + 1}"] = clean_value
+            memory_layers[clean_layer] = mapping
 
     def _build_memory_system_text(self, memory_layers: Dict[str, Any]) -> Optional[str]:
         if not isinstance(memory_layers, dict):
             return None
-        working = memory_layers.get("working")
-        long_term = memory_layers.get("long_term")
         lines: List[str] = []
-        if isinstance(working, dict) and working:
+        if isinstance(memory_layers.get("working"), dict) and memory_layers.get("working"):
             lines.append("[MEMORY_WORKING]")
-            for k, v in working.items():
-                if k and v is not None:
-                    lines.append(f"- {k}: {v}")
-        if isinstance(long_term, dict) and long_term:
+            for key, value in memory_layers["working"].items():
+                lines.append(f"- {key}: {value}")
+        if isinstance(memory_layers.get("long_term"), dict) and memory_layers.get("long_term"):
             lines.append("[MEMORY_LONG_TERM]")
-            for k, v in long_term.items():
-                if k and v is not None:
-                    lines.append(f"- {k}: {v}")
+            for key, value in memory_layers["long_term"].items():
+                lines.append(f"- {key}: {value}")
         if not lines:
             return None
         return "\n".join(lines)
-
-    # Собирает производные данные/текст из текущего состояния, чтобы использовать их как часть контекста или итогового ответа.
 
     def _build_profile_system_text(self, profile_name: str, profile_description: str) -> Optional[str]:
         clean_name = str(profile_name or "").strip()
         clean_desc = str(profile_description or "").strip()
         if not clean_name or not clean_desc:
             return None
-        return (
-            "[PROFILE]\n"
-            f"- name: {clean_name}\n"
-            f"- description: {clean_desc}\n"
-            "Follow this profile automatically when generating the answer."
-        )
+        return f"[PROFILE]\n- name: {clean_name}\n- description: {clean_desc}"
 
-    def _build_task_system_text(self, task_state: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(task_state, dict):
-            return None
-        if bool(task_state.get("is_paused")):
-            return None
-        task = str(task_state.get("task") or "").strip()
-        plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
-        done = task_state.get("done") if isinstance(task_state.get("done"), list) else []
-        state = str(task_state.get("state") or "planning").strip().lower()
-        step = int(task_state.get("step") or 0)
-        total = int(task_state.get("total") or len(plan))
-        current = str(task_state.get("current") or "").strip()
-        expected_action = str(task_state.get("expected_action") or "").strip()
+    def _merge_system_text(self, *parts: Optional[str]) -> Optional[str]:
+        cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
+        return "\n\n".join(cleaned) if cleaned else None
 
-        if state == "done":
-            return None
-        if not task or total <= 0 or not plan:
-            return None
+    def _build_messages_for_llm(self, *, system_text: Optional[str], history_for_llm: List[Dict[str, Any]], user_text: str) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        for item in history_for_llm:
+            if isinstance(item, dict):
+                messages.append(dict(item))
+        messages.append({"role": "user", "content": user_text})
+        return messages
 
-        plan_lines = [f"- {str(x).strip()}" for x in plan if str(x).strip()]
-        done_lines = [f"- {str(x).strip()}" for x in done if str(x).strip()]
-        if not plan_lines:
-            plan_lines = ["- -"]
-        if not done_lines:
-            done_lines = ["- -"]
-
-        return (
-            "[TASK_CONTEXT]\n"
-            f"TASK: {task}\n"
-            f"TASK_STATE: {state}\n"
-            f"TASK_STEP: {step}\n"
-            f"TASK_TOTAL: {total}\n"
-            f"TASK_CURRENT: {current or '-'}\n"
-            f"TASK_EXPECTED_ACTION: {expected_action or '-'}\n"
-            "TASK_PLAN:\n"
-            f"{chr(10).join(plan_lines)}\n"
-            "TASK_DONE:\n"
-            f"{chr(10).join(done_lines)}\n\n"
-            "TASK_RULES:\n"
-            "- Work only inside the current step.\n"
-            "- Do not skip FSM stages.\n"
-            "- If step is complete, proceed via next_step.\n"
-            "- Never claim a state transition unless server task action was executed."
-        )
-
-    def _get_invariants_state(self) -> Dict[str, Dict[str, str]]:
-        raw = self.profile_store.get_invariants_state()
-        return normalize_invariants_state(raw)
-
-    def _build_prompt_system_text(
-        self,
-        *,
-        base_system: Optional[str],
-        runtime_system: Optional[str],
-        profile_system: Optional[str],
-        task_system: Optional[str],
-        memory_system: Optional[str],
-        invariants_system: Optional[str],
-    ) -> Optional[str]:
-        return self._merge_system_text(base_system, runtime_system, profile_system, task_system, memory_system, invariants_system)
-
-    async def _llm_self_validate_invariants(
-        self,
-        *,
-        stage: str,
-        model: str,
-        endpoint: str,
-        trace_id: str,
-        candidate_text: str,
-    ) -> Dict[str, Any]:
-        inv_state = self._get_invariants_state()
-        source_invariants = inv_state.get("invariants", {}) if isinstance(inv_state.get("invariants"), dict) else {}
-        source_policy = inv_state.get("invariant_policy", {}) if isinstance(inv_state.get("invariant_policy"), dict) else {}
-        invariants: Dict[str, str] = {}
-        policy: Dict[str, str] = {}
-        for key in INVARIANT_KEYS:
-            value = str(source_invariants.get(key) or "").strip()
-            if not value:
-                continue
-            mode = str(source_policy.get(key) or "strict").strip().lower()
-            if mode not in INVARIANT_POLICIES:
-                mode = "strict"
-            invariants[key] = value
-            policy[key] = mode
-        payload = {
-            "stage": str(stage or "chat"),
-            "candidate_text": str(candidate_text or ""),
-            "invariants": invariants,
-            "invariant_policy": policy,
-        }
-        system_prompt = (
-            "Ты валидатор инвариантов. Оцени candidate_text относительно invariants.\n"
-            "Верни строго JSON без markdown:\n"
-            "{"
-            "\"decision\":\"pass|warn|fail\","
-            "\"conflict_key\":\"\","
-            "\"reason\":\"\","
-            "\"warnings\":[\"...\"],"
-            "\"items\":[{\"key\":\"...\",\"status\":\"pass|warn|fail\",\"note\":\"...\"}]"
-            "}\n"
-            "Правила:\n"
-            "- strict + нарушение => fail.\n"
-            "- warn + нарушение => warn.\n"
-            "- Если нарушений нет => pass.\n"
-            "- Для fail/warn обязательно укажи conflict_key и reason.\n"
-            "- Для каждого fail/warn в items обязательно заполни note с конкретным объяснением.\n"
-            "- Не выдумывай технологии/термины, которых нет в candidate_text.\n"
-            "- Если нет проверяемых признаков нарушения, верни pass."
-        )
-
-        text = ""
-        gen = None
-        try:
-            gen = self.gpt.stream_chat(
-                user_text=json.dumps(payload, ensure_ascii=False),
-                system_text=system_prompt,
-                history=[],
-                max_tokens=700,
-                model=model,
-                endpoint=endpoint,
-                temperature=0.0,
-                include_usage=False,
-                trace_id=f"{trace_id}-compliance",
-            )
-            async for chunk in gen:
-                text += chunk
-        finally:
-            if gen is not None:
-                try:
-                    await gen.aclose()
-                except Exception:
-                    pass
-
-        obj = self._extract_json_block(text)
-        if not isinstance(obj, dict):
-            return {
-                "decision": "fail",
-                "conflict_key": "",
-                "reason": "LLM validator returned non-JSON response.",
-                "warnings": [],
-                "items": [],
-                "raw": str(text or "")[:2000],
-            }
-        decision = str(obj.get("decision") or "pass").strip().lower()
-        if decision not in ("pass", "warn", "fail"):
-            return {
-                "decision": "fail",
-                "conflict_key": str(obj.get("conflict_key") or ""),
-                "reason": "LLM validator returned unsupported decision.",
-                "warnings": [],
-                "items": obj.get("items") if isinstance(obj.get("items"), list) else [],
-                "raw": str(text or "")[:2000],
-            }
-        warnings = obj.get("warnings") if isinstance(obj.get("warnings"), list) else []
-        items = obj.get("items") if isinstance(obj.get("items"), list) else []
-        return {
-            "decision": decision,
-            "conflict_key": str(obj.get("conflict_key") or ""),
-            "reason": str(obj.get("reason") or ""),
-            "warnings": [str(x) for x in warnings if str(x).strip()],
-            "items": items,
-            "raw": str(text or "")[:2000],
-        }
-
-    async def _validate_commands_with_invariants(
-        self,
-        *,
-        commands: List[str],
-        stage: str,
-        model: str,
-        endpoint: str,
-        trace_id: str,
-    ) -> Dict[str, Any]:
-        blob = "\n".join(str(c or "") for c in commands if str(c or "").strip())
-        if not blob:
-            return {"decision": "pass", "conflict_key": "", "reason": "", "warnings": [], "items": []}
-        return await self._validate_candidate_with_invariants(
-            candidate_text=blob,
-            stage=stage,
-            model=model,
-            endpoint=endpoint,
-            trace_id=trace_id,
-        )
-
-    async def _validate_candidate_with_invariants(
-        self,
-        *,
-        candidate_text: str,
-        stage: str,
-        model: str,
-        endpoint: str,
-        trace_id: str,
-    ) -> Dict[str, Any]:
-        max_attempts = 3
-        last: Dict[str, Any] = {
-            "decision": "fail",
-            "conflict_key": "",
-            "reason": "Валидатор не вернул адекватного ответа.",
-            "warnings": [],
-            "items": [],
-            "validation_source": "llm_inadequate",
-        }
-        for attempt in range(1, max_attempts + 1):
-            try:
-                llm = await self._llm_self_validate_invariants(
-                    stage=stage,
-                    model=model,
-                    endpoint=endpoint,
-                    trace_id=f"{trace_id}-a{attempt}",
-                    candidate_text=candidate_text,
-                )
-            except Exception as e:
-                llm = {
-                    "decision": "fail",
-                    "conflict_key": "",
-                    "reason": f"LLM invariant validator error: {e}",
-                    "warnings": [],
-                    "items": [],
-                    "validation_source": "llm_error",
-                }
-            decision = str(llm.get("decision") or "fail").strip().lower()
-            reason = str(llm.get("reason") or "").strip()
-            conflict_key = str(llm.get("conflict_key") or "").strip()
-            items = llm.get("items") if isinstance(llm.get("items"), list) else []
-            has_fail_item_note = any(
-                isinstance(it, dict)
-                and str(it.get("status") or "").strip().lower() == "fail"
-                and str(it.get("note") or "").strip()
-                for it in items
-            )
-            fail_has_explanation = bool(reason) or bool(has_fail_item_note)
-            adequate = True
-            if decision == "fail" and not fail_has_explanation:
-                adequate = False
-            try:
-                self.logger.write(
-                    "INFO" if adequate else "WARN",
-                    "INVARIANT_VALIDATOR_ATTEMPT",
-                    extra=json.dumps(
-                        {
-                            "req_id": trace_id,
-                            "attempt": attempt,
-                            "stage": stage,
-                            "adequate": adequate,
-                            "decision": decision,
-                            "conflict_key": conflict_key,
-                            "reason": reason,
-                            "raw": str(llm.get("raw") or "")[:2000],
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            except Exception:
-                pass
-            if adequate:
-                return llm
-            last = {
-                "decision": "fail",
-                "conflict_key": conflict_key,
-                "reason": "Валидатор вернул fail без пояснения.",
-                "warnings": [],
-                "items": items,
-                "validation_source": "llm_inadequate",
-                "raw": str(llm.get("raw") or "")[:2000],
-            }
-        return {
-            "decision": "fail",
-            "conflict_key": str(last.get("conflict_key") or ""),
-            "reason": "Валидатор инвариантов не возвращает адекватного ответа после 3 попыток.",
-            "warnings": [],
-            "items": last.get("items") if isinstance(last.get("items"), list) else [],
-            "validation_source": "llm_inadequate",
-            "raw": str(last.get("raw") or "")[:2000],
-        }
-
-    def _make_auto_plan(self, task_text: str) -> List[str]:
-        clean_task = " ".join(str(task_text or "").strip().split())
-        if not clean_task:
-            clean_task = "Текущая задача"
-        return [
-            f"Уточнить требования и критерии приемки: {clean_task}",
-            "Реализовать решение и подготовить артефакты.",
-            "Провести проверку результата и исправить замечания.",
-            "Зафиксировать итог и подготовить завершение задачи.",
-        ]
-
-    def _normalize_plan_item_text(self, value: Any) -> str:
-        clean = str(value or "").strip()
-        if not clean:
-            return ""
-        clean = re.sub(r"^\d+[\).\-\s]+", "", clean).strip("- ").strip()
-        return clean
-
-    def _is_plan_confirmation_signal(self, user_text: str) -> bool:
-        txt = " ".join(str(user_text or "").strip().lower().split())
-        if not txt:
-            return False
-        txt = txt.replace("ё", "е")
-        patterns = (
-            r"^да$",
-            r"^ок$",
-            r"^окей$",
-            r"^все ок$",
-            r"^все окей$",
-            r"^все хорошо$",
-            r"^все верно$",
-            r"^все правильно$",
-            r"^подтверждаю$",
-            r"^подтверждаю план$",
-            r"^согласен$",
-            r"^согласна$",
-            r"^согласен с планом$",
-            r"^согласна с планом$",
-            r"^да, подтверждаю$",
-            r"^ок, подтверждаю$",
-            r"^можно$",
-            r"^начина(й|ем)",
-            r"^можно начинать",
-            r"^старт",
-            r"^поехали",
-            r"^выполняй план$",
-            r"^выполни план$",
-            r"^приступай$",
-            r"^приступай к выполнению$",
-            r"^начинай выполнение$",
-        )
-        return any(re.search(p, txt) for p in patterns)
-
-    def _is_validation_failed_signal(self, assistant_text: str) -> bool:
-        txt = " ".join(str(assistant_text or "").strip().lower().split())
-        if not txt:
-            return False
-        bad_markers = (
-            "не прошло",
-            "есть замечания",
-            "есть проблемы",
-            "нужно доработ",
-            "требуется доработ",
-            "ошибк",
-            "несоответств",
-        )
-        return any(m in txt for m in bad_markers)
-
-    def _is_plan_reject_signal(self, user_text: str) -> bool:
-        txt = " ".join(str(user_text or "").strip().lower().split())
-        if not txt:
-            return False
-        txt = txt.replace("ё", "е")
-        patterns = (
-            r"^нет$",
-            r"^не соглас",
-            r"^не подходит",
-            r"^отклон",
-            r"^переделай",
-            r"^измени план",
-            r"^план не",
-        )
-        return any(re.search(p, txt) for p in patterns)
-
-    def _has_step_done_marker(self, assistant_text: str) -> bool:
-        txt = str(assistant_text or "")
-        return "[STEP_DONE]" in txt
-
-    def _has_validation_pass_marker(self, assistant_text: str) -> bool:
-        txt = str(assistant_text or "")
-        return "[VALIDATION_OK]" in txt
-
-    def _has_validation_fail_marker(self, assistant_text: str) -> bool:
-        txt = str(assistant_text or "")
-        return "[VALIDATION_NEEDS_WORK]" in txt
-
-    def _strip_control_markers(self, assistant_text: str) -> str:
-        txt = str(assistant_text or "")
-        for marker in ("[STEP_DONE]", "[VALIDATION_OK]", "[VALIDATION_NEEDS_WORK]"):
-            txt = txt.replace(marker, "")
-        return txt.strip()
-
-    def _format_invariant_fail_message(self, validation: Dict[str, Any], default_text: str) -> str:
-        reason = str(validation.get("reason") or "").strip()
-        items = validation.get("items") if isinstance(validation.get("items"), list) else []
-        notes: List[str] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status") or "").strip().lower()
-            note = str(item.get("note") or "").strip()
-            if status == "fail" and note:
-                notes.append(note)
-        if reason and notes:
-            return f"{reason}\nДетали:\n- " + "\n- ".join(notes[:3])
-        if reason:
-            return reason
-        if notes:
-            return "Нарушены инварианты.\nДетали:\n- " + "\n- ".join(notes[:3])
-        return default_text
-
-    async def _llm_generate_text(
-        self,
-        *,
-        user_text: str,
-        system_text: Optional[str],
-        history: Optional[List[Dict[str, str]]] = None,
-        model: str,
-        endpoint: str,
-        temperature: Optional[float],
-        max_tokens: int,
-        trace_id: str,
-        stage: str = "chat",
-        max_retries: int = 2,
-        validate_invariants: bool = True,
-    ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-        hist = history if isinstance(history, list) else []
-        inv_state = self._get_invariants_state()
-        runtime_system = build_runtime_context_text(stage=stage)
-        inv_system = build_invariants_system_text(
-            inv_state.get("invariants", {}),
-            inv_state.get("invariant_policy", {}),
-        )
-        base_system = self._build_prompt_system_text(
-            base_system=system_text,
-            runtime_system=runtime_system,
-            profile_system=None,
-            task_system=None,
-            memory_system=None,
-            invariants_system=inv_system,
-        )
-        last_text = ""
-        last_usage: Dict[str, Any] = {}
-        last_validation: Dict[str, Any] = {
-            "decision": "pass",
-            "conflict_key": "",
-            "reason": "",
-            "warnings": [],
-            "items": [],
-        }
-        retries = max(0, int(max_retries))
-        if validate_invariants:
-            retries = max(retries, 2)
-        retry_reason = ""
-        for attempt in range(retries + 1):
-            text = ""
-            gen = None
-            effective_system = base_system
-            if attempt > 0:
-                retry_hint = (
-                    "PREVIOUS OUTPUT FAILED VALIDATION.\n"
-                    f"Reason: {retry_reason or 'Invariant violation'}\n"
-                    "Regenerate answer and strictly respect invariants."
-                )
-                effective_system = self._merge_system_text(base_system, retry_hint)
-            try:
-                gen = self.gpt.stream_chat(
-                    user_text=user_text,
-                    system_text=effective_system,
-                    history=hist,
-                    max_tokens=max_tokens,
-                    model=model,
-                    endpoint=endpoint,
-                    temperature=temperature,
-                    include_usage=True,
-                    trace_id=f"{trace_id}-try{attempt + 1}",
-                )
-                async for chunk in gen:
-                    text += chunk
-            finally:
-                if gen is not None:
-                    try:
-                        await gen.aclose()
-                    except Exception:
-                        pass
-
-            usage = getattr(self.gpt, "last_usage", None) or {}
-            last_text = text.strip()
-            last_usage = usage if isinstance(usage, dict) else {}
-
-            validation: Dict[str, Any] = {
-                "decision": "pass",
-                "conflict_key": "",
-                "reason": "",
-                "warnings": [],
-                "items": [],
-            }
-            if validate_invariants:
-                try:
-                    validation = await self._validate_candidate_with_invariants(
-                        candidate_text=last_text,
-                        stage=stage,
-                        model=model,
-                        endpoint=endpoint,
-                        trace_id=f"{trace_id}-v{attempt + 1}",
-                    )
-                except Exception as e:
-                    validation = {
-                        "decision": "fail",
-                        "conflict_key": "",
-                        "reason": f"LLM invariant validator error: {e}",
-                        "warnings": [],
-                        "items": [],
-                        "error": str(e),
-                    }
-            decision = str(validation.get("decision") or "fail").strip().lower()
-            if decision not in ("pass", "warn", "fail"):
-                decision = "fail"
-                validation["reason"] = str(validation.get("reason") or "Invalid decision from invariant validator.")
-            validation["decision"] = decision
-            last_validation = validation
-            retry_reason = str(validation.get("reason") or "")
-            validation_source = "llm"
-            if str(validation.get("validation_source") or "").strip():
-                validation_source = str(validation.get("validation_source"))
-            try:
-                self.logger.write(
-                    "INFO" if decision != "fail" else "WARN",
-                    "TASK_LLM_RESPONSE_ATTEMPT",
-                    extra=json.dumps(
-                        {
-                            "req_id": trace_id,
-                            "attempt": attempt + 1,
-                            "stage": stage,
-                            "validation_decision": decision,
-                            "validation_source": validation_source,
-                            "validation": validation,
-                            "llm_validation": validation,
-                            "text": str(last_text or "")[:8000],
-                            "usage": last_usage,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            except Exception:
-                pass
-            if decision != "fail":
-                if decision == "warn":
-                    warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else []
-                    if warnings:
-                        last_text = f"[INVARIANT_WARNING] {'; '.join(str(x) for x in warnings[:2])}\n{last_text}"
-                return last_text, last_usage, last_validation
-
-        try:
-            self.logger.write(
-                "ERROR",
-                "TASK_LLM_RESPONSE_REJECTED",
-                extra=json.dumps(
-                    {
-                        "req_id": trace_id,
-                        "stage": stage,
-                        "attempts": retries + 1,
-                        "reason": "strict_invariants_violation",
-                        "last_text": str(last_text or "")[:8000],
-                        "last_usage": last_usage,
-                    },
-                    ensure_ascii=False,
+    async def _validate_invariants(self, *, req_id: str, messages: List[Dict[str, Any]], invariants_text: Optional[str], model: str) -> Dict[str, Any]:
+        if not invariants_text:
+            return {"decision": "pass", "reason": "no invariants"}
+        validator_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You validate whether the planned assistant response context respects invariants.\n"
+                    "Return strict JSON only: {\"decision\":\"pass|warn\",\"reason\":\"...\"}.\n"
+                    "Do not call tools."
                 ),
+            },
+            {"role": "user", "content": f"{invariants_text}\n\nConversation snapshot:\n{json.dumps(messages, ensure_ascii=False)}"},
+        ]
+        try:
+            result = await self.gpt.complete_text(
+                messages=validator_messages,
+                model=model,
+                max_tokens=200,
+                temperature=0.0,
+                trace_id=f"{req_id}:invariants",
             )
-        except Exception:
-            pass
-        raise RuntimeError(
-            "Ответ отклонен: нарушены strict-инварианты."
+            text = str(result.get("text") or "").strip()
+            payload = json.loads(text) if text.startswith("{") else {}
+            decision = str(payload.get("decision") or "pass").strip().lower()
+            if decision not in {"pass", "warn"}:
+                decision = "warn"
+            return {"decision": decision, "reason": str(payload.get("reason") or text)}
+        except Exception as e:
+            return {"decision": "warn", "reason": f"invariants validator failed: {e}"}
+
+    def _serialize_mcp_tools(self, tools: List[Any]) -> List[Dict[str, Any]]:
+        return [{"name": tool.name, "description": tool.description, "input_schema": tool.input_schema} for tool in tools]
+
+    def _build_tool_usage_instruction(self, tools: List[Any]) -> Optional[str]:
+        if not tools:
+            return None
+        return (
+            "[TOOLS_POLICY]\n"
+            "- Use a tool only when it materially helps answer the user.\n"
+            "- Never invent required arguments.\n"
+            "- If a required argument is missing, ask a clarifying question instead of calling the tool.\n"
+            "- Never send placeholder values like owner, repo, username, branch, tag, query, path.\n"
+            "- If a tool returns an error, explain the error briefly and ask only for the missing concrete data."
         )
 
-    def _extract_json_block(self, text: str) -> Optional[Dict[str, Any]]:
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        candidates: List[str] = [raw]
-        fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, flags=re.IGNORECASE)
-        if fence_match:
-            candidates.append(fence_match.group(1).strip())
-        brace_match = re.search(r"(\{[\s\S]*\})", raw)
-        if brace_match:
-            candidates.append(brace_match.group(1).strip())
-        for candidate in candidates:
-            try:
-                obj = json.loads(candidate)
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
+    def _validate_tool_arguments(self, tool_name: str, tool_args: Dict[str, Any], tools: List[Any]) -> Optional[Dict[str, Any]]:
+        name = str(tool_name or "").strip()
+        match = next((tool for tool in tools if str(getattr(tool, "name", "") or "") == name), None)
+        if match is None:
+            return {
+                "is_error": True,
+                "error_type": "unknown_tool",
+                "message": f"Tool '{name}' is not available in current MCP tools list.",
+                "tool_name": name,
+                "arguments": tool_args,
+            }
+
+        schema = match.input_schema if isinstance(match.input_schema, dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        missing = [key for key in required if str(tool_args.get(key) or "").strip() == ""]
+        if missing:
+            return {
+                "is_error": True,
+                "error_type": "missing_required_arguments",
+                "message": f"Missing required tool arguments: {', '.join(missing)}.",
+                "tool_name": name,
+                "arguments": tool_args,
+                "required": required,
+            }
+
+        placeholders = {
+            "owner", "repo", "username", "organization", "org", "branch", "tag", "query", "path", "sha",
+            "owner_name", "repo_name", "your_repo", "your_owner", "example", "value",
+        }
+        bad_fields: List[str] = []
+        for key, value in tool_args.items():
+            if not isinstance(value, str):
                 continue
+            clean = value.strip().lower()
+            if not clean:
+                continue
+            if clean in placeholders or clean == key.strip().lower():
+                bad_fields.append(key)
+                continue
+            if clean.startswith("your_") or clean.endswith("_name"):
+                bad_fields.append(key)
+        if bad_fields:
+            descriptions = []
+            for field in bad_fields:
+                desc = ""
+                if isinstance(properties.get(field), dict):
+                    desc = str(properties[field].get("description") or "").strip()
+                descriptions.append(f"{field}{f' ({desc})' if desc else ''}")
+            return {
+                "is_error": True,
+                "error_type": "placeholder_arguments",
+                "message": f"Tool arguments look like placeholders or invented values: {', '.join(descriptions)}.",
+                "tool_name": name,
+                "arguments": tool_args,
+                "required": required,
+            }
         return None
 
-    def _extract_plan_items(self, plan_text: str) -> List[str]:
-        obj = self._extract_json_block(plan_text)
-        if isinstance(obj, dict) and isinstance(obj.get("plan"), list):
-            plan = [self._normalize_plan_item_text(x) for x in obj.get("plan")]
-            plan = [x for x in plan if x]
-            if plan:
-                return plan
-        lines = [x.strip() for x in str(plan_text or "").splitlines() if x.strip()]
-        plan: List[str] = []
-        for line in lines:
-            clean = self._normalize_plan_item_text(line)
-            if len(clean) >= 3:
-                plan.append(clean)
-        unique: List[str] = []
-        for item in plan:
-            if item not in unique:
-                unique.append(item)
-        if unique:
-            return unique[:8]
-        return self._make_auto_plan(plan_text)
-
-    def _extract_commands(self, text: str) -> List[str]:
-        raw = str(text or "").strip()
-        if not raw:
-            return []
-
-        obj = self._extract_json_block(raw)
-        if isinstance(obj, dict):
-            commands_raw = obj.get("commands")
-            if isinstance(commands_raw, list):
-                out = [str(x).strip() for x in commands_raw if str(x).strip()]
-                if out:
-                    return out
-            command_raw = str(obj.get("command") or "").strip()
-            if command_raw:
-                return [command_raw]
-            script_raw = str(obj.get("script") or "").strip()
-            if script_raw:
-                return [script_raw]
-
-        # Иногда модель возвращает JSON-массив без обертки объекта.
-        array_match = re.search(r"(\[[\s\S]*\])", raw)
-        if array_match:
-            candidate = array_match.group(1).strip()
-            try:
-                arr = json.loads(candidate)
-                if isinstance(arr, list):
-                    out = [str(x).strip() for x in arr if str(x).strip()]
-                    if out:
-                        return out
-            except Exception:
-                pass
-
-        # Попытка вытащить commands: [ ... ] даже если остальной JSON сломан.
-        commands_field = re.search(r'(?is)"commands"\s*:\s*\[(.*?)\]', raw)
-        if commands_field:
-            payload = commands_field.group(1)
-            cmd_strings = re.findall(r'"([^"]+)"|\'([^\']+)\'', payload)
-            out: List[str] = []
-            for a, b in cmd_strings:
-                c = (a or b or "").strip()
-                if c:
-                    out.append(c)
-            if out:
-                return out
-
-        block_match = re.search(r"```(?:powershell|cmd|bat|shell|sh|json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
-        if block_match:
-            block = block_match.group(1).strip()
-            if block:
-                lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-                cleaned = [re.sub(r"^[-*]\s+", "", ln).strip() for ln in lines]
-                out = [ln for ln in cleaned if ln]
-                if out:
-                    return out
-
-        # Fallback: извлекаем "похожие на команды" строки из обычного текста.
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        out: List[str] = []
-        cmd_prefix = re.compile(
-            r"^(new-item|set-content|add-content|test-path|get-childitem|mkdir|md|ni|copy-item|move-item|remove-item|write-output|echo|set-location|cd|if\s*\()",
-            flags=re.IGNORECASE,
-        )
-        for ln in lines:
-            ln = re.sub(r"^\d+[\).\s-]+", "", ln).strip()
-            ln = re.sub(r"^[-*]\s+", "", ln).strip()
-            if not ln:
-                continue
-            if cmd_prefix.match(ln):
-                out.append(ln)
-        if out:
-            return out
-        return []
-
-    def _extract_set_location_target(self, command: str) -> Optional[str]:
-        cmd = str(command or "").strip()
-        m = re.match(r"(?i)^set-location\s+-literalpath\s+(.+)$", cmd)
-        if not m:
-            return None
-        raw = str(m.group(1) or "").strip()
-        if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
-            raw = raw[1:-1]
-        return raw.strip() or None
-
-    def _resolve_cwd(self, base_dir: str, target: str) -> str:
-        target_clean = str(target or "").strip()
-        if not target_clean:
-            return base_dir
-        if os.path.isabs(target_clean):
-            return os.path.abspath(target_clean)
-        return os.path.abspath(os.path.join(base_dir, target_clean))
-
-    def _is_mutating_command(self, command: str) -> bool:
-        cmd = str(command or "").strip().lower()
-        if not cmd:
-            return False
-        mutating_prefixes = (
-            "new-item",
-            "set-content",
-            "add-content",
-            "remove-item",
-            "move-item",
-            "copy-item",
-            "clear-content",
-            "invoke-item",
-            ".\\",
-            "./",
-        )
-        return any(cmd.startswith(p) for p in mutating_prefixes)
-
-    def _extract_step_artifact_tokens(self, step_text: str) -> List[str]:
-        raw = str(step_text or "").strip()
-        if not raw:
-            return []
-        tokens = re.findall(r"[A-Za-z0-9_.\\/-]+", raw)
-        stop = {
-            "new-item",
-            "set-content",
-            "add-content",
-            "test-path",
-            "get-childitem",
-            "path",
-            "itemtype",
-            "file",
-            "directory",
-        }
-        out: List[str] = []
-        for t in tokens:
-            tok = str(t).strip()
-            if len(tok) < 2:
-                continue
-            if tok.lower() in stop:
-                continue
-            if tok not in out:
-                out.append(tok)
-        return out
-
-    def _commands_cover_current_step(self, current_step: str, commands: List[str]) -> Tuple[bool, List[str]]:
-        step_tokens = self._extract_step_artifact_tokens(current_step)
-        if not step_tokens:
-            return True, []
-        cmd_blob = " ".join(str(c or "") for c in commands).lower()
-        missing: List[str] = []
-        for tok in step_tokens:
-            if tok.lower() not in cmd_blob:
-                missing.append(tok)
-        return len(missing) == 0, missing
-
-    def _normalize_powershell_command(self, command: str) -> str:
-        cmd = str(command or "").strip()
-        if not cmd:
-            return ""
-
-        # Исправляем частый сломанный формат от LLM:
-        # Test-Path '-Path "AI\BW"' -> Test-Path -Path "AI\BW"
-        cmd = re.sub(
-            r"(?i)\b(Test-Path|Get-ChildItem|New-Item|Set-Content|Add-Content)\s+'-(Path|LiteralPath)\s+\"([^\"]+)\"'",
-            r'\1 -\2 "\3"',
-            cmd,
-        )
-        cmd = re.sub(
-            r"(?i)\b(Test-Path|Get-ChildItem|New-Item|Set-Content|Add-Content)\s+\"-(Path|LiteralPath)\s+'([^']+)'\"",
-            r"\1 -\2 '\3'",
-            cmd,
-        )
-
-        def _quote_path_value(v: str) -> str:
-            value = str(v or "").strip()
-            if not value:
-                return value
-            if (
-                (value.startswith('"') and value.endswith('"'))
-                or (value.startswith("'") and value.endswith("'"))
-            ):
-                return value
-            # Не оборачиваем явные выражения PowerShell.
-            if value.startswith("$") or value.startswith("("):
-                return value
-            if " " in value:
-                return "'" + value.replace("'", "''") + "'"
-            return value
-
-        # Нормализация значений для -Path/-LiteralPath (особенно для путей с пробелами).
-        def _normalize_path_flags(src: str) -> str:
-            # Берем значение флага до следующего именованного параметра или конца строки.
-            # Это предотвращает кейс, когда `-Force` ошибочно попадал в путь.
-            pattern = r"(?i)(-(?:Path|LiteralPath)\s+)([^\s'\"].*?)(?=\s+-[A-Za-z]\w*\b|$)"
-
-            def _repl(m: re.Match) -> str:
-                prefix = m.group(1)
-                raw_val = m.group(2)
-                return f"{prefix}{_quote_path_value(raw_val)}"
-
-            return re.sub(pattern, _repl, src)
-
-        cmd = _normalize_path_flags(cmd)
-
-        # `cd <path>` -> Set-Location -LiteralPath '<path>'
-        m_cd = re.match(r"^cd\s+(.+)$", cmd, flags=re.IGNORECASE)
-        if m_cd:
-            raw_path = str(m_cd.group(1) or "").strip()
-            if raw_path:
-                if (
-                    (raw_path.startswith('"') and raw_path.endswith('"'))
-                    or (raw_path.startswith("'") and raw_path.endswith("'"))
-                ):
-                    return f"Set-Location -LiteralPath {raw_path}"
-                esc = raw_path.replace("'", "''")
-                return f"Set-Location -LiteralPath '{esc}'"
-
-        # `Set-Location -Path <path>` / `Set-Location -LiteralPath <path>` / `Set-Location <path>`
-        m_set = re.match(
-            r"^set-location(?:\s+-(?:path|literalpath))?\s+(.+)$",
-            cmd,
-            flags=re.IGNORECASE,
-        )
-        if m_set:
-            raw_path = str(m_set.group(1) or "").strip()
-            if raw_path:
-                if (
-                    (raw_path.startswith('"') and raw_path.endswith('"'))
-                    or (raw_path.startswith("'") and raw_path.endswith("'"))
-                ):
-                    return f"Set-Location -LiteralPath {raw_path}"
-                esc = raw_path.replace("'", "''")
-                return f"Set-Location -LiteralPath '{esc}'"
-        # Делаем New-Item более идемпотентным.
-        if re.match(r"^\s*new-item\b", cmd, flags=re.IGNORECASE) and (" -Force" not in cmd and " -force" not in cmd):
-            cmd = f"{cmd} -Force"
-        return cmd
-
-    def _is_navigation_only_command(self, command: str) -> bool:
-        cmd = str(command or "").strip().lower()
-        if not cmd:
-            return False
-        return bool(
-            re.match(r"^(cd|set-location)\b", cmd)
-            and "|" not in cmd
-            and ";" not in cmd
-            and "&&" not in cmd
-            and "||" not in cmd
-        )
-
-    def _is_interactive_command(self, command: str) -> bool:
-        cmd = str(command or "").strip().lower()
-        if not cmd:
-            return False
-        interactive_patterns = (
-            r"\bread-host\b",
-            r"\bpause\b",
-            r"\$host\.ui\.prompt",
-            r"\bout-gridview\b.*\b-passthru\b",
-        )
-        return any(re.search(p, cmd, flags=re.IGNORECASE) for p in interactive_patterns)
-
-    def _step_requires_user_input(self, step_text: str) -> bool:
-        text = str(step_text or "").strip().lower()
-        if not text:
-            return False
-        markers = (
-            "спрос",
-            "уточн",
-            "пользовател",
-            "введите",
-            "ввод",
-            "получить текст",
-            "ask user",
-            "user input",
-        )
-        return any(m in text for m in markers)
-
-    def _to_powershell_literal(self, value: str) -> str:
-        return "'" + str(value or "").replace("'", "''") + "'"
-
-    def _rewrite_interactive_with_user_payload(self, command: str, user_payload: str) -> str:
-        cmd = str(command or "").strip()
-        if not self._is_interactive_command(cmd):
-            return cmd
-        payload = str(user_payload or "")
-        m = re.match(r"(?is)^\s*read-host\b.*?\|\s*(.+)$", cmd)
-        if not m:
-            return cmd
-        sink = str(m.group(1) or "").strip()
-        if not sink:
-            return cmd
-        return f"{self._to_powershell_literal(payload)} | {sink}"
-
-    def _inject_user_payload_into_command(self, command: str, user_payload: str) -> str:
-        cmd = str(command or "").strip()
-        if not cmd:
-            return ""
-        # Drop intermediate variable assignment lines like `$script = ...`:
-        # each command runs in isolated process, so such assignments are ineffective.
-        if re.match(r"^\s*\$[A-Za-z_]\w*\s*=", cmd):
-            return ""
-        payload_lit = self._to_powershell_literal(user_payload)
-        cmd = re.sub(r"(?i)(\b-Value\s+)\$[A-Za-z_]\w*", rf"\1{payload_lit}", cmd)
-        cmd = re.sub(r"(?i)(\b-InputObject\s+)\$[A-Za-z_]\w*", rf"\1{payload_lit}", cmd)
-        return cmd
-
-    def _materialize_user_payload_in_commands(self, commands: List[str], user_payload: str) -> List[str]:
-        out: List[str] = []
-        for raw in commands:
-            cmd = self._rewrite_interactive_with_user_payload(str(raw or ""), user_payload)
-            cmd = self._inject_user_payload_into_command(cmd, user_payload)
-            cmd = str(cmd or "").strip()
-            if cmd:
-                out.append(cmd)
-        return out
-
-    async def _classify_task_control_intent(
-        self,
-        *,
-        user_text: str,
-        current_state: str,
-        model: str,
-        endpoint: str,
-        max_tokens: int,
-        trace_id: str,
-    ) -> Dict[str, str]:
-        clean = str(user_text or "").strip()
-        if not clean:
-            return {"intent": "none", "target_state": "", "reason": ""}
-        system_text = (
-            "Ты классификатор управляющих намерений пользователя для state machine задачи.\n"
-            "Определи, просит ли пользователь ЯВНО перевести задачу в другой статус.\n"
-            "Разрешенные статусы: planning, execution, validation, done.\n"
-            "Верни строго JSON: {\"intent\":\"state_transition|none\", \"target_state\":\"planning|execution|validation|done|\", \"reason\":\"кратко\"}\n"
-            "Если явной просьбы сменить статус нет, верни intent=none."
-        )
-        user_prompt = (
-            "CURRENT_STATE:\n"
-            f"{current_state}\n\n"
-            "USER_MESSAGE:\n"
-            f"{clean}\n\n"
-            "OUTPUT_SCHEMA:\n"
-            "{\"intent\":\"state_transition|none\", \"target_state\":\"planning|execution|validation|done|\", \"reason\":\"...\"}"
-        )
-        raw, _, _ = await self._llm_generate_text(
-            user_text=user_prompt,
-            system_text=system_text,
-            model=model,
-            endpoint=endpoint,
-            temperature=0.0,
-            max_tokens=max(120, int(max_tokens)),
-            trace_id=trace_id,
-            stage="execution",
-            validate_invariants=False,
-        )
-        obj = self._extract_json_block(raw) or {}
-        intent = str(obj.get("intent") or "none").strip().lower()
-        target_state = str(obj.get("target_state") or "").strip().lower()
-        reason = str(obj.get("reason") or "").strip()
-        if intent != "state_transition":
-            return {"intent": "none", "target_state": "", "reason": reason}
-        if target_state not in ("planning", "execution", "validation", "done"):
-            return {"intent": "none", "target_state": "", "reason": reason or "Не удалось определить целевой статус."}
-        return {"intent": "state_transition", "target_state": target_state, "reason": reason}
-
-    async def _assess_user_payload_for_step(
-        self,
-        *,
-        current_step: str,
-        user_payload: str,
-        model: str,
-        endpoint: str,
-        max_tokens: int,
-        trace_id: str,
-    ) -> Dict[str, str | bool]:
-        payload = str(user_payload or "").strip()
-        if not payload:
-            return {"suitable": False, "reason": "Пустой ввод пользователя.", "normalized_payload": ""}
-        system_text = (
-            "Ты классификатор пригодности пользовательского ввода для шага задачи.\n"
-            "Оцени, подходит ли USER_PAYLOAD для выполнения CURRENT_STEP.\n"
-            "Если шаг связан с записью содержимого в файл (например script.sql), трактуй USER_PAYLOAD как контент для записи, а не как команду к исполнению.\n"
-            "SQL/код/текстовые фрагменты (включая неполные) обычно считаются подходящими для записи в файл.\n"
-            "suitable=false ставь только если это мета-управление задачей: просьба перепланировать, изменить шаги, сменить статус, подтвердить/отклонить план, или пустой ввод.\n"
-            "Любой вопрос к ассистенту о процессе (например: 'что от меня требуется?') всегда unsuitable.\n"
-            "Если USER_PAYLOAD является диалоговой репликой, а не содержимым скрипта/кода, верни suitable=false.\n"
-            "Верни строго JSON: {\"suitable\": true|false, \"reason\":\"кратко\", \"normalized_payload\":\"...\"}.\n"
-            "normalized_payload верни как очищенную версию полезного ввода; если unsuitable — пустую строку."
-        )
-        user_prompt = (
-            "CURRENT_STEP:\n"
-            f"{current_step}\n\n"
-            "USER_PAYLOAD:\n"
-            f"{payload}\n\n"
-            "OUTPUT_SCHEMA:\n"
-            "{\"suitable\": true, \"reason\":\"...\", \"normalized_payload\":\"...\"}"
-        )
-        raw, _, _ = await self._llm_generate_text(
-            user_text=user_prompt,
-            system_text=system_text,
-            model=model,
-            endpoint=endpoint,
-            temperature=0.0,
-            max_tokens=max(140, int(max_tokens)),
-            trace_id=trace_id,
-            stage="execution",
-            validate_invariants=False,
-        )
-        obj = self._extract_json_block(raw) or {}
-        suitable = bool(obj.get("suitable", False))
-        reason = str(obj.get("reason") or "").strip()
-        normalized_payload = str(obj.get("normalized_payload") or "").strip()
-        if suitable and not normalized_payload:
-            normalized_payload = payload
-        return {
-            "suitable": suitable,
-            "reason": reason or ("Ввод подходит." if suitable else "Ввод не подходит для текущего шага."),
-            "normalized_payload": normalized_payload if suitable else "",
-        }
-
-    async def _classify_user_message_for_step(
-        self,
-        *,
-        current_step: str,
-        user_message: str,
-        model: str,
-        endpoint: str,
-        max_tokens: int,
-        trace_id: str,
-    ) -> Dict[str, str]:
-        msg = str(user_message or "").strip()
-        if not msg:
-            return {"kind": "empty", "reason": "Пустое сообщение."}
-        system_text = (
-            "Ты классификатор сообщения пользователя для execution-шагов.\n"
-            "Определи тип USER_MESSAGE относительно CURRENT_STEP.\n"
-            "Варианты kind:\n"
-            "- content_for_step: пользователь дал содержимое, которое нужно записать/использовать в шаге.\n"
-            "- task_management: пользователь обсуждает изменение плана/шагов/статусов/ожиданий, а не дает контент.\n"
-            "- clarification_question: пользователь задает вопрос про процесс (например: что сейчас ожидается?).\n"
-            "- empty: нет полезного текста.\n"
-            "Если CURRENT_STEP про запись в файл, SQL/код/текст скрипта -> обычно content_for_step.\n"
-            "Важно: вопрос к ассистенту о том, что делать дальше, всегда clarification_question.\n"
-            "Важно: просьбы изменить план/шаги/артефакты задачи всегда task_management.\n"
-            "Примеры:\n"
-            "- 'DELETE FROM test;' -> content_for_step\n"
-            "- 'тогда что от меня требуется?' -> clarification_question\n"
-            "- 'хочу переименовать папку SQL в BQL' -> task_management\n"
-            "Верни строго JSON: {\"kind\":\"content_for_step|task_management|clarification_question|empty\", \"reason\":\"кратко\"}."
-        )
-        user_prompt = (
-            "CURRENT_STEP:\n"
-            f"{current_step}\n\n"
-            "USER_MESSAGE:\n"
-            f"{msg}\n\n"
-            "OUTPUT_SCHEMA:\n"
-            "{\"kind\":\"content_for_step|task_management|clarification_question|empty\", \"reason\":\"...\"}"
-        )
-        raw, _, _ = await self._llm_generate_text(
-            user_text=user_prompt,
-            system_text=system_text,
-            model=model,
-            endpoint=endpoint,
-            temperature=0.0,
-            max_tokens=max(120, int(max_tokens)),
-            trace_id=trace_id,
-            stage="execution",
-            validate_invariants=False,
-        )
-        obj = self._extract_json_block(raw) or {}
-        kind = str(obj.get("kind") or "").strip().lower()
-        reason = str(obj.get("reason") or "").strip()
-        allowed = {"content_for_step", "task_management", "clarification_question", "empty"}
-        if kind not in allowed:
-            kind = "task_management"
-        return {"kind": kind, "reason": reason or "Требуется уточнение ввода для текущего шага."}
-
-    async def _run_powershell_commands(
-        self,
-        commands: List[str],
-        *,
-        timeout_sec: int = 120,
-        on_signal: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
-        trace_id: str = "",
-        stage: str = "",
-        cwd: str = "",
-    ) -> Dict[str, Any]:
-        runs: List[Dict[str, Any]] = []
-        all_ok = True
-        run_cwd = str(cwd or "").strip() or self.project_root
-        effective_cwd = run_cwd
-        for idx, command in enumerate(commands, start=1):
-            cmd = self._normalize_powershell_command(command)
-            if not cmd:
-                continue
-            try:
-                self.logger.write(
-                    "INFO",
-                    "TASK_COMMAND_START",
-                    extra=json.dumps(
-                        {
-                            "req_id": trace_id,
-                            "stage": stage,
-                            "index": idx,
-                            "command": cmd,
-                            "cwd": effective_cwd,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            except Exception:
-                pass
-            if on_signal is not None:
-                try:
-                    await on_signal({"event": "command_start", "index": idx, "command": cmd})
-                except Exception:
-                    pass
-            if self._is_navigation_only_command(cmd):
-                nav_target = self._extract_set_location_target(cmd)
-                if nav_target:
-                    effective_cwd = self._resolve_cwd(effective_cwd, nav_target)
-                runs.append(
-                    {
-                        "index": idx,
-                        "command": cmd,
-                        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "exit_code": 0,
-                        "stdout": "",
-                        "stderr": "",
-                        "ok": True,
-                        "cwd_after": effective_cwd,
-                    }
-                )
-                try:
-                    self.logger.write(
-                        "INFO",
-                        "TASK_COMMAND_DONE",
-                        extra=json.dumps(
-                            {
-                                "req_id": trace_id,
-                                "stage": stage,
-                                "index": idx,
-                                "command": cmd,
-                                "exit_code": 0,
-                                "stdout": "",
-                                "stderr": "",
-                                "navigation_noop": True,
-                                "cwd_after": effective_cwd,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-                except Exception:
-                    pass
-                if on_signal is not None:
-                    try:
-                        await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": 0})
-                    except Exception:
-                        pass
-                continue
-            if self._is_interactive_command(cmd):
-                all_ok = False
-                runs.append(
-                    {
-                        "index": idx,
-                        "command": cmd,
-                        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "exit_code": -2,
-                        "stdout": "",
-                        "stderr": "Interactive commands are not allowed in orchestrator execution.",
-                        "ok": False,
-                        "cwd_after": effective_cwd,
-                    }
-                )
-                try:
-                    self.logger.write(
-                        "WARN",
-                        "TASK_COMMAND_DONE",
-                        extra=json.dumps(
-                            {
-                                "req_id": trace_id,
-                                "stage": stage,
-                                "index": idx,
-                                "command": cmd,
-                                "exit_code": -2,
-                                "stdout": "",
-                                "stderr": "Interactive commands are not allowed in orchestrator execution.",
-                                "cwd_after": effective_cwd,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-                except Exception:
-                    pass
-                if on_signal is not None:
-                    try:
-                        await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": -2})
-                    except Exception:
-                        pass
-                continue
-            started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            proc = await asyncio.create_subprocess_exec(
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                cmd,
-                cwd=effective_cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            timed_out = False
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-            except asyncio.TimeoutError:
-                timed_out = True
-                proc.kill()
-                await proc.communicate()
-                stdout_b, stderr_b = b"", b"Command timed out"
-            code = int(proc.returncode or 0)
-            if timed_out:
-                code = -1
-            stdout = stdout_b.decode("utf-8", errors="replace").strip()
-            stderr = stderr_b.decode("utf-8", errors="replace").strip()
-            combined_error = f"{stdout}\n{stderr}".lower()
-            benign_already_exists = (
-                "already exists" in combined_error
-                or "уже существует" in combined_error
-            )
-            if code != 0 and benign_already_exists:
-                code = 0
-                stderr = ""
-            if code != 0:
-                all_ok = False
-            runs.append(
-                {
-                    "index": idx,
-                    "command": cmd,
-                    "started_at": started,
-                    "exit_code": code,
-                    "stdout": stdout[-4000:],
-                    "stderr": stderr[-4000:],
-                    "ok": code == 0,
-                    "cwd_after": effective_cwd,
-                }
-            )
-            try:
-                self.logger.write(
-                    "INFO" if code == 0 else "WARN",
-                    "TASK_COMMAND_DONE",
-                    extra=json.dumps(
-                        {
-                            "req_id": trace_id,
-                            "stage": stage,
-                            "index": idx,
-                                "command": cmd,
-                                "exit_code": code,
-                                "stdout": stdout[-1200:],
-                                "stderr": stderr[-1200:],
-                                "cwd_after": effective_cwd,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-            except Exception:
-                pass
-            if on_signal is not None:
-                try:
-                    await on_signal({"event": "command_done", "index": idx, "command": cmd, "exit_code": code})
-                except Exception:
-                    pass
-        return {"ok": all_ok and bool(runs), "runs": runs, "final_cwd": effective_cwd}
-
-    def _task_log_snapshot(self, task_state: Dict[str, Any]) -> Dict[str, Any]:
-        state = str(task_state.get("state") or "planning")
-        step = int(task_state.get("step") or 0)
-        total = int(task_state.get("total") or 0)
-        paused = bool(task_state.get("is_paused", False))
-        current = str(task_state.get("current") or "").strip()
-        return {
-            "state": state,
-            "step": step,
-            "total": total,
-            "paused": paused,
-            "current": current,
-        }
-
-    def _log_task_action(
-        self,
-        *,
-        action: str,
-        before: Dict[str, Any],
-        after: Optional[Dict[str, Any]] = None,
-        error: str = "",
-    ) -> None:
-        payload: Dict[str, Any] = {
-            "action": action,
-            "before": self._task_log_snapshot(before if isinstance(before, dict) else {}),
-        }
-        if isinstance(after, dict):
-            payload["after"] = self._task_log_snapshot(after)
-            payload["transition"] = f"{payload['before']['state']} -> {payload['after']['state']}"
-        if error:
-            payload["error"] = error
-        self.logger.write("INFO" if not error else "WARN", "TASK_FSM_ACTION", extra=json.dumps(payload, ensure_ascii=False))
-
-    def _log_task_payload(self, *, name: str, req_id: str, payload: Any) -> None:
+    async def _get_mcp_tools(self) -> Tuple[List[Any], Dict[str, Any]]:
         try:
-            self.logger.write(
-                "INFO",
-                name,
-                extra=json.dumps({"req_id": req_id, "payload": payload}, ensure_ascii=False),
-            )
-        except Exception:
-            pass
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _merge_system_text(self, *chunks: Optional[str]) -> Optional[str]:
-        parts = [str(c).strip() for c in chunks if isinstance(c, str) and str(c).strip()]
-        if not parts:
-            return None
-        return "\n\n".join(parts)
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _stringify_history_for_summary(self, messages: List[Dict[str, str]]) -> str:
-        lines: List[str] = []
-        for m in messages or []:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "").strip().lower()
-            content = str(m.get("content") or "").strip()
-            if not role or not content:
-                continue
-            lines.append(f"{role}: {content}")
-        return "\n".join(lines).strip()
-
-    # Сжимает старую часть истории через отдельный LLM-вызов, чтобы сохранить долгосрочный контекст и уменьшить объём токенов в рабочих запросах.
-
-    async def _summarize_history_with_llm(
-        self,
-        *,
-        older_history: List[Dict[str, str]],
-        model: str,
-        endpoint: str,
-        temperature: Optional[float],
-        max_tokens: int,
-        trace_id: str,
-    ) -> str:
-        transcript = self._stringify_history_for_summary(older_history)
-        if not transcript:
-            return ""
-
-        summary_system = (
-            "You summarize dialogue history in Russian.\n"
-            "Keep only durable facts, constraints, decisions, and open tasks.\n"
-            "Do not include greetings, filler, or repeated details.\n"
-            "Output compact bullet points."
-        )
-
-        summary_text, _, _ = await self._llm_generate_text(
-            user_text=f"Суммаризуй историю диалога:\n\n{transcript}",
-            system_text=summary_system,
-            history=[],
-            max_tokens=max_tokens,
-            model=model,
-            endpoint=endpoint,
-            temperature=temperature,
-            trace_id=f"{trace_id}-summary",
-            stage="summary",
-            max_retries=1,
-            validate_invariants=True,
-        )
-        return str(summary_text or "").strip()
-
-    # Сохраняет или фиксирует данные в целевом хранилище с базовой валидацией входных параметров.
-
-    def _save_memory_item(self, memory_layers: Dict[str, Any], layer: str, key: str, value: str) -> bool:
-        layer_key = (layer or "").strip().lower()
-        memory_layers = memory_layers if isinstance(memory_layers, dict) else {}
-        if layer_key == "short_term":
-            short_term = memory_layers.get("short_term")
-            if not isinstance(short_term, list):
-                short_term = []
-            short_term.append(
-                {
-                    "key": key or "note",
-                    "value": value,
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-            if len(short_term) > 50:
-                short_term = short_term[-50:]
-            memory_layers["short_term"] = short_term
-            return True
-        if layer_key in ("working", "long_term"):
-            bucket = memory_layers.get(layer_key)
-            if not isinstance(bucket, dict):
-                bucket = {}
-            clean_key = (key or "").strip() or "note"
-            bucket[clean_key] = value
-            memory_layers[layer_key] = bucket
-            return True
-        return False
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, str]], max_items: int = 20) -> None:
-        if not isinstance(memory_layers, dict):
-            return
-        synced: List[Dict[str, str]] = []
-        for msg in history[-max_items:]:
-            if not isinstance(msg, dict):
-                continue
-            role = str(msg.get("role") or "").strip()
-            content = str(msg.get("content") or "").strip()
-            if role and content:
-                synced.append({"key": role, "value": content})
-        memory_layers["short_term"] = synced
-
-    # Формирует расширенный SERVER_API_REQUEST лог с оценкой токенов, режимом контекста и параметрами памяти для последующего анализа качества запросов.
-
-    def _log_api_request(
-        self,
-        *,
-        req_id: str,
-        session_id: str,
-        branch_id: str,
-        model: str,
-        endpoint: str,
-        max_tokens: int,
-        temperature: Optional[float],
-        keep_last_n: int,
-        strategy: str,
-        user_text: str,
-        history_for_llm: List[Dict[str, str]],
-        system_text: Optional[str],
-        explicit_memory: Any,
-    ) -> None:
-        try:
-            context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
-            user_tokens_est = self._estimate_tokens_text(user_text)
-            payload: Dict[str, Any] = {
-                "req_id": req_id,
-                "session_id": session_id,
-                "branch_id": branch_id,
-                "model": model,
-                "endpoint": endpoint,
-                "max_tokens": int(max_tokens),
-                "temperature": temperature,
-                "keep_last_n": int(keep_last_n),
-                "context_strategy": strategy,
-                "history_messages": int(len(history_for_llm)),
-                "system_text_len": int(len(system_text or "")),
-                "user_text_len": int(len(user_text or "")),
-                "context_tokens_est": int(context_tokens_est),
-                "user_tokens_est": int(user_tokens_est),
-                "include_usage": True,
-            }
-            if isinstance(explicit_memory, dict):
-                payload["memory_write"] = {
-                    "layer": str(explicit_memory.get("layer") or ""),
-                    "has_key": bool(str(explicit_memory.get("key") or "").strip()),
-                    "value_len": int(len(str(explicit_memory.get("value") or ""))),
-                }
-            payload["source"] = "SERVER"
-            self.logger.write("INFO", "SERVER_API_REQUEST", extra=json.dumps(payload, ensure_ascii=False, indent=2))
+            tools = await self.mcp.list_tools()
+            return tools, {"enabled": True, "connected": True, "tools_count": len(tools)}
         except Exception as e:
-            self.logger.write("WARN", "Не удалось сформировать API_REQUEST лог", extra=str(e))
+            return [], {"enabled": self.mcp.enabled, "connected": False, "error": str(e), "tools_count": 0}
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
-    def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> Optional[float]:
-        try:
-            price = self.pricing_cache.get((model_id or "").strip())
-            if not isinstance(price, dict):
-                return None
-
-            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-
-            return (
-                (float(prompt_tokens) / 1_000_000.0) * float(price.get("in", 0))
-                + (float(completion_tokens) / 1_000_000.0) * float(price.get("out", 0))
-            )
-        except Exception:
-            return None
-
-    def _log_mcp_event(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        extra = ""
-        if isinstance(payload, dict):
-            try:
-                extra = json.dumps(payload, ensure_ascii=False)
-            except Exception:
-                extra = str(payload)
-        self.logger.write("INFO", event, extra=extra)
-
-    async def _bootstrap_mcp(self) -> None:
-        if not self.mcp_enabled:
-            self._log_mcp_event(
-                "MCP_DISABLED",
-                {"enabled": False, "server_url": self.mcp_server_url, "transport": self.mcp_transport},
-            )
-            return
-        ok = await self.mcp_client.connect()
-        if ok:
-            self._log_mcp_event(
-                "MCP_CONNECTED",
-                {"enabled": True, "server_url": self.mcp_server_url, "transport": self.mcp_transport},
-            )
-            tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
-            tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
-            self._log_mcp_event(
-                "MCP_TOOLS_LIST",
+    def _extract_tool_calls(self, message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+        result: List[Dict[str, Any]] = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            result.append(
                 {
-                    "count": len(tools),
-                    "source": tools_state.get("source") or "live",
-                    "tools": [str(t.get("name") or "") for t in tools if isinstance(t, dict)],
-                },
+                    "id": str(item.get("id") or str(uuid.uuid4())),
+                    "type": "function",
+                    "function": {
+                        "name": str(function.get("name") or "").strip(),
+                        "arguments": str(function.get("arguments") or "{}"),
+                    },
+                }
             )
-            return
-        self._log_mcp_event(
-            "MCP_CONNECT_FAILED",
-            {
-                "enabled": True,
-                "server_url": self.mcp_server_url,
-                "transport": self.mcp_transport,
-                "error": self.mcp_client.last_error,
-            },
-        )
-
-    # === Обработчики команд клиента ===
-
-    # Реализует действия протокола: сессии, ветки, checkpoints, память, профили и основной chat-stream с сохранением результатов в стор.
-
-    # Обрабатывает действие 'ping' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        return result
 
     async def _handle_ping(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         await self._send_json(writer, {"type": "pong"})
 
-    async def _handle_mcp_status(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        if self.mcp_enabled and not self.mcp_client.connected:
-            await self.mcp_client.connect()
-        status = self.mcp_client.status()
-        status["enabled"] = bool(self.mcp_enabled)
-        status["transport"] = self.mcp_transport
-        if status.get("connected"):
-            self._log_mcp_event("MCP_CONNECTED", status)
-        elif self.mcp_enabled:
-            self._log_mcp_event("MCP_CONNECT_FAILED", status)
-        await self._send_json(writer, {"type": "mcp_status", "status": status})
-
-    async def _handle_mcp_list_tools(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        if not self.mcp_enabled:
-            await self._send_json(
-                writer,
-                {
-                    "type": "mcp_tools",
-                    "enabled": False,
-                    "connected": False,
-                    "tools": [],
-                    "source": "disabled",
-                    "error": "MCP disabled by MCP_ENABLED=false",
-                },
-            )
-            return
-
-        tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
-        tool_names: List[str] = []
-        tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
-        for tool in tools:
-            if isinstance(tool, dict):
-                tool_names.append(str(tool.get("name") or ""))
-
-        self._log_mcp_event(
-            "MCP_TOOLS_LIST",
-            {
-                "connected": bool(tools_state.get("connected")),
-                "source": tools_state.get("source") or "live",
-                "tools": tool_names,
-                "error": tools_state.get("error") or "",
-            },
-        )
-        await self._send_json(
-            writer,
-            {
-                "type": "mcp_tools",
-                "enabled": True,
-                "connected": bool(tools_state.get("connected")),
-                "tools": tools,
-                "source": tools_state.get("source") or "live",
-                "error": tools_state.get("error") or "",
-            },
-        )
-
-    async def _handle_mcp_call_tool(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        tool_name = str(request.get("tool_name") or "").strip()
-        arguments = request.get("arguments") if isinstance(request.get("arguments"), dict) else {}
-        if not self.mcp_enabled:
-            await self._send_error(writer, "MCP disabled by MCP_ENABLED=false")
-            return
-        if not tool_name:
-            await self._send_error(writer, "tool_name is required")
-            return
-
-        # Перед вызовом инструмента запрашиваем актуальный список и логируем его.
-        tools_state = await self.mcp_client.list_tools(use_cached_fallback=True)
-        tools = tools_state.get("tools") if isinstance(tools_state.get("tools"), list) else []
-        tool_names = [str(t.get("name") or "") for t in tools if isinstance(t, dict)]
-        self._log_mcp_event(
-            "MCP_TOOLS_LIST",
-            {
-                "connected": bool(tools_state.get("connected")),
-                "source": tools_state.get("source") or "live",
-                "tools": tool_names,
-                "error": tools_state.get("error") or "",
-            },
-        )
-        if tool_names and tool_name not in tool_names:
-            await self._send_error(writer, f"Tool not found: {tool_name}")
-            return
-
-        self._log_mcp_event(
-            "MCP_TOOL_CALL_START",
-            {"tool_name": tool_name, "arguments": arguments},
-        )
-        try:
-            result = await self.mcp_client.call_tool(tool_name, arguments)
-            self._log_mcp_event("MCP_TOOL_CALL_RESULT", {"tool_name": tool_name, "result": result})
-            await self._send_json(
-                writer,
-                {
-                    "type": "mcp_tool_result",
-                    "tool_name": tool_name,
-                    "result": result,
-                },
-            )
-        except Exception as e:
-            self._log_mcp_event(
-                "MCP_TOOL_CALL_ERROR",
-                {"tool_name": tool_name, "error": str(e)},
-            )
-            await self._send_error(writer, str(e))
-
-    # Обрабатывает действие 'list_sessions' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
-
     async def _handle_list_sessions(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        sessions = self.memory_store.list_sessions()
-        await self._send_json(
-            writer,
+        sessions = [
             {
-                "type": "sessions",
-                "sessions": [
-                    {
-                        "session_id": s.session_id,
-                        "title": s.title,
-                        "created_at": s.created_at,
-                        "updated_at": s.updated_at,
-                    }
-                    for s in sessions
-                ],
-            },
-        )
-
-    # Обрабатывает действие 'get_session' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+                "session_id": item.session_id,
+                "title": item.title,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+            }
+            for item in self.memory_store.list_sessions()
+        ]
+        await self._send_json(writer, {"type": "sessions", "sessions": sessions})
 
     async def _handle_get_session(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
+        session_id = str(request.get("session_id") or "").strip()
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
         session = self.memory_store.load_session(session_id)
-        branches = session.get("branches")
-        if isinstance(branches, dict):
-            for _, branch in branches.items():
-                if isinstance(branch, dict):
-                    self._ensure_branch_memory_model(branch)
         await self._send_json_maybe_chunked(writer, {"type": "session", "session": session})
 
-    # Обрабатывает действие 'reset_session' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
-
     async def _handle_reset_session(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
+        session_id = str(request.get("session_id") or "").strip()
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
-        self.memory_store.delete_session_file(session_id)
-        await self._send_json(writer, {"type": "ok"})
-
-    # Обрабатывает действие 'list_branches' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        ok = self.memory_store.delete_session_file(session_id)
+        await self._send_json(writer, {"type": "ok" if ok else "error", "message": "" if ok else "session not found"})
 
     async def _handle_list_branches(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
+        session_id = str(request.get("session_id") or "").strip()
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
-
         session = self.memory_store.load_session(session_id)
         branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-
-        out = []
-        for bid, b in branches.items():
-            if not isinstance(b, dict):
+        items = []
+        for bid, branch in branches.items():
+            if not isinstance(branch, dict):
                 continue
-            out.append({"id": bid, "title": b.get("title") or b.get("name") or bid})
-
-        await self._send_json(writer, {"type": "branches", "branches": out, "active_branch": active})
-
-    # Обрабатывает действие 'switch_branch' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+            items.append(
+                {
+                    "branch_id": bid,
+                    "title": str(branch.get("title") or bid),
+                    "created_at": str(branch.get("created_at") or ""),
+                    "updated_at": str(branch.get("updated_at") or ""),
+                }
+            )
+        await self._send_json(writer, {"type": "branches", "branches": items, "active_branch": session.get("active_branch") or "main"})
 
     async def _handle_switch_branch(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip()
+        session_id = str(request.get("session_id") or "").strip()
+        branch_id = str(request.get("branch_id") or "").strip()
         if not session_id or not branch_id:
             await self._send_error(writer, "session_id and branch_id are required")
             return
-
         session = self.memory_store.load_session(session_id)
-        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        if branch_id not in branches:
-            await self._send_error(writer, "branch not found")
-            return
-
-        session["active_branch"] = branch_id
-        session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bid, _ = self._ensure_branch(session, branch_id)
         self.memory_store.save_session(session)
-        await self._send_json(writer, {"type": "ok", "ok": True, "active_branch": branch_id})
-
-    # Обрабатывает действие 'list_checkpoints' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        await self._send_json(writer, {"type": "ok", "active_branch": bid})
 
     async def _handle_list_checkpoints(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip() or None
+        session_id = str(request.get("session_id") or "").strip()
+        branch_id = str(request.get("branch_id") or "").strip() or None
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
-
         session = self.memory_store.load_session(session_id)
-        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-        bid = branch_id or active
-        if bid not in branches:
-            bid = "main"
-
-        branch = branches.get(bid) if isinstance(branches.get(bid), dict) else {}
-        cps = branch.get("checkpoints")
-        if not isinstance(cps, list):
-            cps = []
-            branch["checkpoints"] = cps
-
-        await self._send_json(writer, {"type": "checkpoints", "checkpoints": cps, "active_branch": bid})
-
-    # Обрабатывает действие 'create_checkpoint' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        _, branch = self._ensure_branch(session, branch_id)
+        checkpoints = branch.get("checkpoints") if isinstance(branch.get("checkpoints"), list) else []
+        await self._send_json(writer, {"type": "checkpoints", "checkpoints": checkpoints, "active_branch": session.get("active_branch")})
 
     async def _handle_create_checkpoint(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip() or None
-        name = (request.get("name") or "").strip() or None
+        session_id = str(request.get("session_id") or "").strip()
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
-
         session = self.memory_store.load_session(session_id)
-        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        session["branches"] = branches
-
-        active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-        bid = branch_id or active
-        if bid not in branches:
-            bid, branch = self._get_branch(session, bid)
-            branches[bid] = branch
-
-        branch = branches.get(bid) if isinstance(branches.get(bid), dict) else {}
-        history = self._branch_history(branch)
-
-        cps = branch.get("checkpoints")
-        if not isinstance(cps, list):
-            cps = []
-            branch["checkpoints"] = cps
-
-        cp = self._make_checkpoint(history, name=name)
-        cps.append(cp)
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        branch["updated_at"] = now
-        session["updated_at"] = now
-        session["active_branch"] = bid
-        branches[bid] = branch
-        session["branches"] = branches
+        _, branch = self._ensure_branch(session, str(request.get("branch_id") or "").strip() or None)
+        checkpoint = self._make_checkpoint(branch.get("history") if isinstance(branch.get("history"), list) else [], str(request.get("name") or ""))
+        branch.setdefault("checkpoints", []).append(checkpoint)
         self.memory_store.save_session(session)
-
-        await self._send_json(
-            writer,
-            {"type": "ok", "ok": True, "checkpoint_id": cp.get("id"), "checkpoint": cp, "active_branch": bid},
-        )
-
-    # Обрабатывает действие 'create_branch' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        await self._send_json(writer, {"type": "checkpoint_created", "checkpoint": checkpoint})
 
     async def _handle_create_branch(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        from_branch_id = (request.get("from_branch_id") or request.get("branch_id") or "").strip() or None
-        checkpoint_id = (request.get("checkpoint_id") or "").strip()
-        new_branch_name = (request.get("new_branch_name") or request.get("name") or "").strip() or None
-
-        if not session_id or not checkpoint_id:
-            await self._send_error(writer, "session_id and checkpoint_id are required")
+        session_id = str(request.get("session_id") or "").strip()
+        from_branch_id = str(request.get("from_branch_id") or "").strip()
+        checkpoint_id = str(request.get("checkpoint_id") or "").strip()
+        if not session_id or not from_branch_id or not checkpoint_id:
+            await self._send_error(writer, "session_id, from_branch_id and checkpoint_id are required")
             return
-
         session = self.memory_store.load_session(session_id)
-        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        session["branches"] = branches
-
-        active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-        base_bid = (from_branch_id or active).strip() or "main"
-        if base_bid not in branches:
-            base_bid, base_branch = self._get_branch(session, base_bid)
-            branches[base_bid] = base_branch
-
-        base_branch = branches.get(base_bid) if isinstance(branches.get(base_bid), dict) else {}
-        cps = base_branch.get("checkpoints")
-        if not isinstance(cps, list):
-            cps = []
-            base_branch["checkpoints"] = cps
-
-        cp = None
-        for c in cps:
-            if isinstance(c, dict) and str(c.get("id")) == checkpoint_id:
-                cp = c
-                break
-
-        if not cp:
-            await self._send_error(writer, "checkpoint not found")
+        try:
+            new_bid = self._create_branch_from_checkpoint(session, from_branch_id, checkpoint_id, str(request.get("new_branch_name") or ""))
+        except Exception as e:
+            await self._send_error(writer, str(e))
             return
-
-        new_bid = self._create_branch_from_checkpoint(session, base_bid, cp, name=new_branch_name)
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        session["updated_at"] = now
-        session["active_branch"] = new_bid
         self.memory_store.save_session(session)
-
-        await self._send_json(writer, {"type": "ok", "ok": True, "branch_id": new_bid, "active_branch": new_bid})
-
-    # Обрабатывает действие 'get_memory' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        await self._send_json(writer, {"type": "branch_created", "branch_id": new_bid})
 
     async def _handle_get_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip() or None
+        session_id = str(request.get("session_id") or "").strip()
         if not session_id:
             await self._send_error(writer, "session_id is required")
             return
-
         session = self.memory_store.load_session(session_id)
-        bid, branch = self._get_branch(session, branch_id)
-        memory_layers = self._ensure_branch_memory_model(branch)
-
+        active_branch, branch = self._ensure_branch(session, str(request.get("branch_id") or "").strip() or None)
         await self._send_json(
             writer,
             {
                 "type": "memory",
-                "session_id": session_id,
-                "active_branch": bid,
-                "memory_layers": memory_layers,
+                "active_branch": active_branch,
+                "memory_layers": branch.get("memory_layers") or {},
+                "facts": branch.get("facts") or {},
             },
         )
-
-    # Обрабатывает действие 'save_memory' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_save_memory(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip() or None
-        layer = (request.get("layer") or "").strip()
-        key = str(request.get("key") or "").strip()
+        session_id = str(request.get("session_id") or "").strip()
+        layer = str(request.get("layer") or "").strip()
         value = str(request.get("value") or "").strip()
-        if not session_id:
-            await self._send_error(writer, "session_id is required")
+        key = str(request.get("key") or "").strip()
+        if not session_id or not layer or not value:
+            await self._send_error(writer, "session_id, layer and value are required")
             return
-        if not layer or not value:
-            await self._send_error(writer, "layer and value are required")
-            return
-
         session = self.memory_store.load_session(session_id)
-        bid, branch = self._get_branch(session, branch_id)
-        memory_layers = self._ensure_branch_memory_model(branch)
-        ok = self._save_memory_item(memory_layers, layer, key, value)
-        if not ok:
-            await self._send_error(writer, "layer must be one of: short_term, working, long_term")
-            return
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        active_branch, branch = self._ensure_branch(session, str(request.get("branch_id") or "").strip() or None)
+        memory_layers = self._copy_memory_layers(branch.get("memory_layers"))
+        self._save_memory_item(memory_layers, layer, key, value)
         branch["memory_layers"] = memory_layers
-        branch["updated_at"] = now
-        session["branches"][bid] = branch
-        session["active_branch"] = bid
-        session["updated_at"] = now
         self.memory_store.save_session(session)
-
-        await self._send_json(
-            writer,
-            {
-                "type": "ok",
-                "ok": True,
-                "active_branch": bid,
-                "memory_layers": memory_layers,
-            },
-        )
-
-    # Обрабатывает действие 'list_profiles' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
-
-    async def _handle_list_profiles(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        state = self.profile_store.get_state()
-        await self._send_json(
-            writer,
-            {
-                "type": "profiles",
-                "profiles": state.get("available_profiles") or [],
-                "active_profile": state.get("active_profile") or "",
-            },
-        )
-
-    # Обрабатывает действие 'get_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+        await self._send_json(writer, {"type": "ok", "active_branch": active_branch, "memory_layers": memory_layers})
 
     async def _handle_get_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         profile_name = str(request.get("profile_name") or "").strip()
-        if not profile_name:
-            await self._send_error(writer, "profile_name is required")
-            return
         profile = self.profile_store.get_profile(profile_name)
         if not isinstance(profile, dict):
             await self._send_error(writer, "profile not found")
             return
         await self._send_json(writer, {"type": "profile", "profile": profile})
 
-    # Обрабатывает действие 'save_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
-
     async def _handle_save_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        profile_name = str(request.get("profile_name") or "").strip()
-        description = str(request.get("description") or "")
-        if not profile_name:
-            await self._send_error(writer, "profile_name is required")
-            return
         try:
-            self.profile_store.save_profile(profile_name, description)
-            self.profile_store.set_active_profile(profile_name)
-            state = self.profile_store.get_state()
-            await self._send_json(
-                writer,
-                {
-                    "type": "ok",
-                    "ok": True,
-                    "active_profile": state.get("active_profile") or "",
-                    "profiles": state.get("available_profiles") or [],
-                },
-            )
+            saved = self.profile_store.save_profile(str(request.get("profile_name") or ""), str(request.get("description") or ""))
         except Exception as e:
             await self._send_error(writer, str(e))
-
-    # Обрабатывает действие 'delete_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
+            return
+        await self._send_json(
+            writer,
+            {
+                "type": "ok",
+                "profiles": sorted((saved.get("profiles") or {}).keys()),
+                "active_profile": saved.get("active_profile") or "",
+            },
+        )
 
     async def _handle_delete_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        profile_name = str(request.get("profile_name") or "").strip()
-        if not profile_name:
-            await self._send_error(writer, "profile_name is required")
-            return
-        self.profile_store.delete_profile(profile_name)
-        state = self.profile_store.get_state()
+        saved = self.profile_store.delete_profile(str(request.get("profile_name") or ""))
         await self._send_json(
             writer,
             {
                 "type": "ok",
-                "ok": True,
-                "active_profile": state.get("active_profile") or "",
-                "profiles": state.get("available_profiles") or [],
+                "profiles": sorted((saved.get("profiles") or {}).keys()),
+                "active_profile": saved.get("active_profile") or "",
             },
         )
-
-    # Обрабатывает действие 'set_active_profile' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_set_active_profile(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        profile_name = str(request.get("profile_name") or "").strip()
-        self.profile_store.set_active_profile(profile_name)
-        state = self.profile_store.get_state()
+        saved = self.profile_store.set_active_profile(str(request.get("profile_name") or ""))
         await self._send_json(
             writer,
             {
                 "type": "ok",
-                "ok": True,
-                "active_profile": state.get("active_profile") or "",
-                "profiles": state.get("available_profiles") or [],
+                "profiles": sorted((saved.get("profiles") or {}).keys()),
+                "active_profile": saved.get("active_profile") or "",
             },
         )
-
-    # Обрабатывает действие 'get_profile_state' из входящего JSON-запроса, валидирует параметры и формирует структурированный ответ клиенту.
 
     async def _handle_get_profile_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         state = self.profile_store.get_state()
@@ -2406,8 +623,8 @@ class LLMAgentServer:
             writer,
             {
                 "type": "profile_state",
-                "active_profile": state.get("active_profile") or "",
                 "profiles": state.get("available_profiles") or [],
+                "active_profile": state.get("active_profile") or "",
             },
         )
 
@@ -2417,1457 +634,295 @@ class LLMAgentServer:
             writer,
             {
                 "type": "invariants_state",
-                "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
-                "invariant_policy": state.get("invariant_policy")
-                if isinstance(state.get("invariant_policy"), dict)
-                else {},
+                "invariants": state.get("invariants") or {},
+                "invariant_policy": state.get("invariant_policy") or {},
             },
         )
 
     async def _handle_save_invariant(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        key = str(request.get("key") or "").strip()
-        value = str(request.get("value") or "").strip()
-        if key not in INVARIANT_KEYS:
-            await self._send_error(writer, "invalid invariant key")
-            return
         try:
-            state = self.profile_store.save_invariant_value(key=key, value=value)
-            await self._send_json(
-                writer,
-                {
-                    "type": "ok",
-                    "ok": True,
-                    "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
-                    "invariant_policy": state.get("invariant_policy")
-                    if isinstance(state.get("invariant_policy"), dict)
-                    else {},
-                },
-            )
+            state = self.profile_store.save_invariant_value(str(request.get("key") or ""), str(request.get("value") or ""))
         except Exception as e:
             await self._send_error(writer, str(e))
+            return
+        await self._send_json(writer, {"type": "ok", **state})
 
     async def _handle_set_invariant_policy(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        key = str(request.get("key") or "").strip()
-        policy = str(request.get("policy") or "").strip().lower()
-        if key not in INVARIANT_KEYS:
-            await self._send_error(writer, "invalid invariant key")
+        try:
+            state = self.profile_store.set_invariant_policy(str(request.get("key") or ""), str(request.get("policy") or ""))
+        except Exception as e:
+            await self._send_error(writer, str(e))
             return
-        if policy not in ("strict", "warn"):
-            await self._send_error(writer, "invalid invariant policy")
-            return
+        await self._send_json(writer, {"type": "ok", **state})
+
+    async def _handle_mcp_status(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        await self._send_json(writer, {"type": "mcp_status", "status": await self.mcp.status()})
+
+    async def _handle_mcp_list_tools(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         try:
-            state = self.profile_store.set_invariant_policy(key=key, policy=policy)
-            await self._send_json(
-                writer,
-                {
-                    "type": "ok",
-                    "ok": True,
-                    "invariants": state.get("invariants") if isinstance(state.get("invariants"), dict) else {},
-                    "invariant_policy": state.get("invariant_policy")
-                    if isinstance(state.get("invariant_policy"), dict)
-                    else {},
-                },
-            )
+            tools = await self.mcp.list_tools()
+            await self._send_json(writer, {"type": "mcp_tools", "connected": True, "tools": self._serialize_mcp_tools(tools)})
         except Exception as e:
-            await self._send_error(writer, str(e))
+            await self._send_json(writer, {"type": "mcp_tools", "connected": False, "tools": [], "error": str(e)})
 
-    async def _handle_get_task_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        task_state = self.task_store.get_state()
+    async def _handle_mcp_call_tool(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        tool_name = str(request.get("tool_name") or request.get("name") or "").strip()
+        arguments = request.get("arguments") if isinstance(request.get("arguments"), dict) else {}
         try:
-            sig = json.dumps(self._task_log_snapshot(task_state), ensure_ascii=False, sort_keys=True)
-        except Exception:
-            sig = ""
-        if sig and sig != self._last_task_state_log_sig:
-            self._last_task_state_log_sig = sig
-            self._log_task_action(action="get_task_state", before=task_state, after=task_state)
-        await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-
-    async def _handle_generate_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        task = str(request.get("task") or "").strip()
-        if not task:
-            await self._send_error(writer, "task is required")
-            return
-        before = self.task_store.get_state()
-        try:
-            plan = self._make_auto_plan(task)
-            task_state = self.task_store.generate_plan(task=task, plan=plan)
-            self._log_task_action(action="generate_task_plan", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
+            result = await self.mcp.call_tool(tool_name, arguments)
+            await self._send_json(writer, {"type": "mcp_tool_result", "ok": True, "tool_name": tool_name, "result": result})
         except Exception as e:
-            self.logger.write("WARN", "TASK_GENERATE_PLAN_FAILED", extra=str(e))
-            self._log_task_action(action="generate_task_plan", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_confirm_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.confirm_plan()
-            self._log_task_action(action="confirm_task_plan", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_CONFIRM_PLAN_FAILED", extra=str(e))
-            self._log_task_action(action="confirm_task_plan", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_pause_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.set_paused(True)
-            self._log_task_action(action="pause_task", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_PAUSE_FAILED", extra=str(e))
-            self._log_task_action(action="pause_task", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_resume_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.set_paused(False)
-            self._log_task_action(action="resume_task", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_RESUME_FAILED", extra=str(e))
-            self._log_task_action(action="resume_task", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_next_task_step(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.next_step()
-            self._log_task_action(action="next_task_step", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_NEXT_STEP_FAILED", extra=str(e))
-            self._log_task_action(action="next_task_step", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_update_task_progress(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        current = str(request.get("current") or "")
-        expected_action = str(request.get("expected_action") or "")
-        done_item = str(request.get("done_item") or "")
-        step_raw = request.get("step")
-        step = None
-        if step_raw is not None:
-            try:
-                step = int(step_raw)
-            except Exception:
-                step = None
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.update_progress(
-                current=current,
-                expected_action=expected_action,
-                done_item=done_item,
-                step=step,
-            )
-            self._log_task_action(action="update_task_progress", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_UPDATE_PROGRESS_FAILED", extra=str(e))
-            self._log_task_action(action="update_task_progress", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    async def _handle_delete_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        before = self.task_store.get_state()
-        try:
-            task_state = self.task_store.clear_task()
-            self._log_task_action(action="delete_task", before=before, after=task_state)
-            await self._send_json(writer, {"type": "task_state", "task_state": task_state})
-        except Exception as e:
-            self.logger.write("WARN", "TASK_DELETE_FAILED", extra=str(e))
-            self._log_task_action(action="delete_task", before=before, error=str(e))
-            await self._send_error(writer, str(e))
-
-    # Основной сценарий запроса: читает параметры стратегии, готовит контекст, запускает стрим к модели, обновляет ветку/память и возвращает done с полной телеметрией.
+            await self._send_json(writer, {"type": "mcp_tool_result", "ok": False, "tool_name": tool_name, "error": str(e)})
 
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
-        req_id = str(uuid.uuid4())[:8]
-        user_text = (request.get("user_text") or "").strip()
-        session_id = (request.get("session_id") or "").strip()
-        branch_id = (request.get("branch_id") or "").strip() or None
-
-        if not session_id:
-            await self._send_error(writer, "session_id is required")
-            return
-        if not user_text:
-            await self._send_error(writer, "Empty user_text")
-            return
-
-        model = (request.get("model") or "").strip() or self.gpt.model
-        endpoint = (request.get("endpoint") or "chat").strip() or "chat"
-        max_tokens = int(request.get("max_tokens") or 512)
-
-        temperature = request.get("temperature", None)
-        if temperature is not None:
-            try:
-                temperature = float(temperature)
-            except Exception:
-                temperature = None
-
-        try:
-            keep_last_n = int(request.get("keep_last_n") or 10)
-        except Exception:
-            keep_last_n = 10
-        keep_last_n = max(1, keep_last_n)
-
-        summary_cfg = request.get("summary_config") if isinstance(request.get("summary_config"), dict) else {}
-        summary_model = str(summary_cfg.get("model") or model).strip() or model
-        summary_endpoint = str(summary_cfg.get("endpoint") or endpoint).strip() or endpoint
-        summary_max_tokens = int(summary_cfg.get("max_tokens") or 600)
-        summary_max_tokens = max(32, summary_max_tokens)
-        summary_temperature = summary_cfg.get("temperature", temperature)
-        if summary_temperature is not None:
-            try:
-                summary_temperature = float(summary_temperature)
-            except Exception:
-                summary_temperature = None
-
-        strategy = (request.get("context_strategy") or "sliding").strip().lower()
+        req_id = str(uuid.uuid4())
+        session_id = str(request.get("session_id") or "").strip() or str(uuid.uuid4())
+        model = str(request.get("model") or self.gpt.model).strip()
+        max_tokens = int(request.get("max_tokens") or 800)
+        temperature = request.get("temperature")
+        keep_last_n = int(request.get("keep_last_n") or 10)
+        strategy = str(request.get("context_strategy") or "sliding").strip().lower()
+        user_text = str(request.get("user_text") or "").strip()
         use_profile = bool(request.get("use_profile", False))
-
-        strategy_for_context = strategy if strategy in ("sliding", "facts", "summary", "branching") else "sliding"
-        strategy_display = strategy_for_context
+        if not user_text:
+            await self._send_error(writer, "user_text is required")
+            return
 
         session = self.memory_store.load_session(session_id)
-        self._ensure_title(session, user_text)
-        session["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.memory_store.save_session(session)
-        title = str(session.get("title") or "")
+        self.memory_store.set_title_if_empty(session, user_text)
+        branch_key = str(request.get("branch_id") or "").strip() or None
+        active_branch, branch = self._ensure_branch(session, branch_key if strategy == "branching" else "main")
+        history = branch.get("history") if isinstance(branch.get("history"), list) else []
+        facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
+        memory_layers = self._copy_memory_layers(branch.get("memory_layers"))
 
-        async def _send_orchestrator_done(
-            *,
-            answer_text: str,
-            usage_data: Dict[str, Any],
-            final_task_state: Dict[str, Any],
-            strategy_name: str = "task_orchestrator",
-            error_text: str = "",
-        ) -> None:
-            if answer_text.strip():
-                await self._send_json(writer, {"type": "chunk", "chunk": answer_text.strip() + "\n"})
-            task_state_now = final_task_state if isinstance(final_task_state, dict) else self.task_store.get_state()
-            prompt_tokens = int(usage_data.get("prompt_tokens") or usage_data.get("input_tokens") or 0)
-            completion_tokens = int(usage_data.get("completion_tokens") or usage_data.get("output_tokens") or 0)
-            total_tokens_call = int(usage_data.get("total_tokens") or (prompt_tokens + completion_tokens))
-            token_stats = {
-                "user_text_tokens_est": int(self._estimate_tokens_text(user_text)),
-                "context_tokens_est": 0,
-                "assistant_tokens": int(completion_tokens),
-                "total_tokens_call": int(total_tokens_call),
-                "dialog_tokens_est": 0,
-                "model_context_limit": int(self._resolve_context_limit(model)),
-                "may_exceed_context": False,
-            }
-            message_stats = {
-                "strategy": strategy_name,
-                "branch_id": "main",
-                "use_profile": False,
-                "active_profile": "Без профиля",
-                "profile_description_len": 0,
-                "profile_applied": False,
-                "keep_last_n": int(keep_last_n),
-                "sent_messages": 1,
-                "facts_count": None,
-                "memory_layers_counts": {"short_term": 0, "working": 0, "long_term": 0},
-                "task_state": str(task_state_now.get("state") or "planning"),
-                "task_step": int(task_state_now.get("step") or 0),
-                "task_total": int(task_state_now.get("total") or 0),
-                "task_paused": bool(task_state_now.get("is_paused", False)),
-                "task_injected": True,
-                "token_stats": token_stats,
-                "invariants_applied": True,
-                "invariants_conflict_key": "",
-                "invariants_decision": "pass",
-                "validation_retries": 0,
-            }
-            if error_text:
-                message_stats["error"] = error_text
-            await self._send_json(
-                writer,
-                {
-                    "type": "done",
-                    "model": model,
-                    "endpoint": endpoint,
-                    "usage": usage_data,
-                    "cost_rub": self._calc_cost_rub(model_id=model, usage=usage_data),
-                    "session_id": session_id,
-                    "title": title,
-                    "active_branch": "main",
-                    "message_stats": message_stats,
-                    "facts": {},
-                    "memory_layers": {},
-                    "token_stats": token_stats,
-                    "task_state": task_state_now,
-                    "profile_info": {
-                        "use_profile": False,
-                        "active_profile": "",
-                        "profile_description_len": 0,
-                        "profile_applied": False,
-                    },
-                },
+        explicit_memory = request.get("memory_write") if isinstance(request.get("memory_write"), dict) else None
+        if isinstance(explicit_memory, dict):
+            self._save_memory_item(
+                memory_layers,
+                str(explicit_memory.get("layer") or ""),
+                str(explicit_memory.get("key") or ""),
+                str(explicit_memory.get("value") or ""),
             )
-
-        async def _signal(stage: str, message: str, **extra: Any) -> None:
-            payload = {k: v for k, v in extra.items() if v is not None}
-            await self._send_task_signal(writer, message=message, stage=stage, extra=payload if payload else None)
-
-        task_state = self.task_store.get_state()
-        if bool(task_state.get("is_paused", False)):
-            before_resume = task_state
-            try:
-                task_state = self.task_store.set_paused(False)
-                self._log_task_action(action="auto_resume_on_message", before=before_resume, after=task_state)
-            except Exception as e:
-                self._log_task_action(action="auto_resume_on_message", before=before_resume, error=str(e))
-                task_state = self.task_store.get_state()
-
-        state_now = str(task_state.get("state") or "planning").strip().lower()
-        has_task = bool(str(task_state.get("task") or "").strip()) and int(task_state.get("total") or 0) > 0
-        ignore_current_user_payload_in_execution = False
-
-        if has_task and state_now in ("planning", "execution", "validation"):
-            control_intent = await self._classify_task_control_intent(
-                user_text=user_text,
-                current_state=state_now,
-                model=model,
-                endpoint=endpoint,
-                max_tokens=max_tokens,
-                trace_id=f"{req_id}-control-intent",
-            )
-            if str(control_intent.get("intent") or "none") == "state_transition":
-                target_state = str(control_intent.get("target_state") or "").strip().lower()
-                reason = str(control_intent.get("reason") or "").strip()
-                before_transition = self.task_store.get_state()
-                try:
-                    task_state = self.task_store.transition(target_state)
-                    self._log_task_action(action="auto_user_state_transition_request", before=before_transition, after=task_state)
-                    await _send_orchestrator_done(
-                        answer_text=f"Запрос на смену статуса выполнен: {state_now} -> {target_state}.",
-                        usage_data={},
-                        final_task_state=task_state,
-                        strategy_name="task_state_transition_applied",
-                    )
-                    return
-                except Exception:
-                    allowed = sorted(list(self.task_store.ALLOWED_TRANSITIONS.get(state_now, set())))
-                    allowed_text = ", ".join(allowed) if allowed else "нет"
-                    fail_state = self.task_store.update_progress(
-                        expected_action=f"Запрошен недопустимый переход состояния: {state_now} -> {target_state}."
-                    )
-                    if state_now == "execution":
-                        current_step = str(fail_state.get("current") or "").strip()
-                        if self._step_requires_user_input(current_step):
-                            fail_state = self.task_store.set_paused(True)
-                    self._log_task_action(
-                        action="auto_user_state_transition_rejected",
-                        before=before_transition,
-                        after=fail_state,
-                    )
-                    await _send_orchestrator_done(
-                        answer_text=(
-                            f"Переход состояния запрещен: {state_now} -> {target_state}. "
-                            f"Разрешены только: {allowed_text}. "
-                            f"{reason}".strip()
-                        ),
-                        usage_data={},
-                        final_task_state=fail_state,
-                        strategy_name="task_state_transition_rejected",
-                    )
-                    return
-
-        # Шаг 1-3: новая задача -> LLM планирование -> показать план на подтверждение.
-        if (not has_task) or state_now == "done":
-            await _signal("planning", "Проверяю входную задачу на инварианты")
-            request_validation = await self._validate_candidate_with_invariants(
-                candidate_text=user_text,
-                stage="planning",
-                model=model,
-                endpoint=endpoint,
-                trace_id=f"{req_id}-task-input-invariants",
-            )
-            request_validation_decision = str(request_validation.get("decision") or "fail").strip().lower()
-            try:
-                self.logger.write(
-                    "INFO" if request_validation_decision != "fail" else "WARN",
-                    "TASK_INPUT_INVARIANTS_VALIDATION",
-                    extra=json.dumps(
-                        {
-                            "req_id": req_id,
-                            "stage": "planning",
-                            "decision": request_validation_decision,
-                            "validation": request_validation,
-                            "text": str(user_text or "")[:2000],
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            except Exception:
-                pass
-            if request_validation_decision == "fail":
-                reason = self._format_invariant_fail_message(
-                    request_validation,
-                    "Задача отклонена strict-инвариантами.",
-                )
-                await _send_orchestrator_done(
-                    answer_text=reason,
-                    usage_data={},
-                    final_task_state=task_state,
-                    strategy_name="task_request_rejected_by_invariants",
-                    error_text="invariants_block_task_request",
-                )
-                return
-            if request_validation_decision == "warn":
-                warnings = request_validation.get("warnings") if isinstance(request_validation.get("warnings"), list) else []
-                if warnings:
-                    await _signal("planning", f"Предупреждение инвариантов: {str(warnings[0])}")
-            await _signal("planning", "Формирую план задачи через LLM")
-            plan_prompt_system = (
-                "Ты task-orchestrator. Составь короткий, исполнимый план в 3-6 шагов.\n"
-                "Не добавляй отдельные шаги навигации по директориям (например, 'перейти в папку').\n"
-                "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
-                "Без markdown и пояснений."
-            )
-            plan_raw, usage, _ = await self._llm_generate_text(
-                user_text=(
-                    "TASK_REQUEST:\n"
-                    f"{user_text}\n\n"
-                    "OUTPUT_SCHEMA:\n"
-                    "{\"plan\": [\"step 1\", \"step 2\"]}"
-                ),
-                system_text=plan_prompt_system,
-                model=model,
-                endpoint=endpoint,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                trace_id=f"{req_id}-plan",
-                stage="planning",
-                validate_invariants=False,
-            )
-            plan = self._extract_plan_items(plan_raw)
-            self._log_task_payload(name="TASK_PLAN_PARSED", req_id=f"{req_id}-plan", payload=plan)
-            before_generate = self.task_store.get_state()
-            task_state = self.task_store.generate_plan(task=user_text, plan=plan)
-            self._log_task_action(action="auto_generate_task_plan_llm", before=before_generate, after=task_state)
-            await _signal("planning", "План сформирован, ожидается подтверждение пользователя", steps=len(plan))
-            plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(plan, start=1))
-            answer = (
-                "План сформирован. Подтверди план сообщением (например: \"да\"), "
-                "или отклони и дай правки.\n\n"
-                f"[PLAN]\n{plan_lines}"
-            )
-            await _send_orchestrator_done(answer_text=answer, usage_data=usage, final_task_state=task_state, strategy_name="task_plan")
-            return
-
-        # Шаг 4: planning -> approve/reject (reject = replanning loop).
-        if state_now == "planning":
-            if self._is_plan_confirmation_signal(user_text):
-                before_confirm = task_state
-                task_state = self.task_store.confirm_plan()
-                self._log_task_action(action="auto_confirm_plan_on_message", before=before_confirm, after=task_state)
-                await _signal("execution", "План подтвержден, начинаю выполнение")
-                state_now = "execution"
-                ignore_current_user_payload_in_execution = True
-            else:
-                await _signal("planning", "Обновляю план по комментарию пользователя")
-                task_text = str(task_state.get("task") or "").strip() or user_text
-                replan_system = (
-                    "Ты task-orchestrator. Перепланируй задачу с учетом комментария пользователя.\n"
-                    "Не добавляй отдельные шаги навигации по директориям (например, 'перейти в папку').\n"
-                    "Ответ строго JSON: {\"plan\": [\"шаг 1\", \"шаг 2\", \"...\"]}\n"
-                    "Без markdown и пояснений."
-                )
-                replan_raw, usage, _ = await self._llm_generate_text(
-                    user_text=(
-                        "ORIGINAL_TASK:\n"
-                        f"{task_text}\n\n"
-                        "CURRENT_PLAN:\n"
-                        f"{json.dumps(task_state.get('plan') if isinstance(task_state.get('plan'), list) else [], ensure_ascii=False)}\n\n"
-                        "USER_FEEDBACK:\n"
-                        f"{user_text}\n\n"
-                        "OUTPUT_SCHEMA:\n"
-                        "{\"plan\": [\"step 1\", \"step 2\"]}"
-                    ),
-                    system_text=replan_system,
-                    model=model,
-                    endpoint=endpoint,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    trace_id=f"{req_id}-replan",
-                    stage="planning",
-                    validate_invariants=False,
-                )
-                new_plan = self._extract_plan_items(replan_raw)
-                self._log_task_payload(name="TASK_REPLAN_PARSED", req_id=f"{req_id}-replan", payload=new_plan)
-                before_replan = task_state
-                task_state = self.task_store.generate_plan(task=task_text, plan=new_plan)
-                log_action = "auto_replan_reject_signal" if self._is_plan_reject_signal(user_text) else "auto_replan_feedback"
-                self._log_task_action(action=log_action, before=before_replan, after=task_state)
-                await _signal("planning", "План обновлен, ожидается подтверждение", steps=len(new_plan))
-                plan_lines = "\n".join(f"{i}. {step}" for i, step in enumerate(new_plan, start=1))
-                answer = (
-                    "План обновлен по твоему комментарию. Подтверди его или снова отклони.\n\n"
-                    f"[PLAN]\n{plan_lines}"
-                )
-                await _send_orchestrator_done(answer_text=answer, usage_data=usage, final_task_state=task_state, strategy_name="task_replan")
-                return
-
-        # Шаги 5-6: execution + validation под управлением агента (полный проход за один цикл).
-        if state_now in ("execution", "validation"):
-            task_text = str(task_state.get("task") or "").strip()
-            usage_agg: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            progress_lines: List[str] = []
-            last_run_result: Dict[str, Any] = {}
-            execution_cwd = self.project_root
-
-            def _acc_usage(usage_piece: Dict[str, Any]) -> None:
-                usage_agg["prompt_tokens"] += int(usage_piece.get("prompt_tokens") or usage_piece.get("input_tokens") or 0)
-                usage_agg["completion_tokens"] += int(usage_piece.get("completion_tokens") or usage_piece.get("output_tokens") or 0)
-                usage_agg["total_tokens"] += int(
-                    usage_piece.get("total_tokens")
-                    or (
-                        int(usage_piece.get("prompt_tokens") or usage_piece.get("input_tokens") or 0)
-                        + int(usage_piece.get("completion_tokens") or usage_piece.get("output_tokens") or 0)
-                    )
-                )
-
-            def _format_runs_error(title: str, run_data: Dict[str, Any]) -> str:
-                lines = [title]
-                runs = run_data.get("runs") if isinstance(run_data.get("runs"), list) else []
-                for item in runs:
-                    if not isinstance(item, dict):
-                        continue
-                    lines.append(f"- cmd: {item.get('command')}")
-                    lines.append(f"  exit: {item.get('exit_code')}")
-                    stderr = str(item.get("stderr") or "").strip()
-                    if stderr:
-                        lines.append(f"  stderr: {stderr[:500]}")
-                return "\n".join(lines)
-
-            exec_system = (
-                "Ты исполнитель задач для локального Windows проекта.\n"
-                "Сформируй команды, которые агент должен выполнить автоматически для ТЕКУЩЕГО шага.\n"
-                "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
-                "Команды должны быть идемпотентными: повторный запуск не должен падать (используй `-Force`, `Test-Path`, `if (...) { ... }`).\n"
-                "В execution НЕ делай финальную проверку результата задачи и не проверяй артефакты будущих шагов.\n"
-                "Запрещены интерактивные команды (`Read-Host`, `pause`, любые prompt-команды): шаг выполняется без TTY-ввода.\n"
-                "Если шаг требует данные от пользователя, используй блок LATEST_USER_MESSAGE как уже полученный ввод.\n"
-                "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"note\": \"...\"}\n"
-                "Только безопасные и конкретные команды без поясняющего текста вне JSON."
-            )
-            validation_system = (
-                "Ты проверяющий агент. По результатам выполнения дай команды проверки.\n"
-                "Не добавляй команды смены директории (`cd`, `Set-Location`) без необходимости: агент уже запускает всё из корня проекта.\n"
-                "Команды проверки должны быть только read-only: `Test-Path`, `Get-ChildItem`, `Get-Content`, `if (...) { throw ... }`.\n"
-                "Запрещены мутационные команды (`New-Item`, `Set-Content`, `Add-Content`, `Remove-Item`, `Move-Item`, `Copy-Item`).\n"
-                "Команды проверки должны быть идемпотентными и явно проверять целевой результат задачи.\n"
-                "Ответ строго JSON: {\"commands\": [\"powershell command 1\", \"command 2\"], \"success_criteria\": \"...\"}\n"
-                "Без markdown и пояснений вне JSON."
-            )
-
-            safety_limit = max(3, int(task_state.get("total") or 0) + 3)
-            for _ in range(safety_limit):
-                cur_state = str(task_state.get("state") or "").strip().lower()
-                if cur_state == "execution":
-                    plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
-                    done_steps = task_state.get("done") if isinstance(task_state.get("done"), list) else []
-                    current_step = str(task_state.get("current") or "").strip()
-                    if ignore_current_user_payload_in_execution:
-                        latest_user_message = ""
-                    else:
-                        latest_user_message = str(user_text or "").strip()
-                    if self._step_requires_user_input(current_step) and (not latest_user_message):
-                        before_pause = self.task_store.get_state()
-                        _ = self.task_store.update_progress(
-                            expected_action="Требуется ввод пользователя для текущего шага. Пришлите данные сообщением."
-                        )
-                        task_state = self.task_store.set_paused(True)
-                        self._log_task_action(action="auto_pause_wait_user_input", before=before_pause, after=task_state)
-                        await _signal("execution", "Шаг требует ввода пользователя, выполнение приостановлено")
-                        await _send_orchestrator_done(
-                            answer_text=(
-                                "Для завершения текущего шага пришлите данные пользователя отдельным сообщением. "
-                                "После этого выполнение автоматически продолжится."
-                            ),
-                            usage_data=usage_agg,
-                            final_task_state=task_state,
-                            strategy_name="task_execution_wait_user_input",
-                        )
-                        return
-                    if self._step_requires_user_input(current_step) and latest_user_message:
-                        message_kind = await self._classify_user_message_for_step(
-                            current_step=current_step,
-                            user_message=latest_user_message,
-                            model=model,
-                            endpoint=endpoint,
-                            max_tokens=max_tokens,
-                            trace_id=f"{req_id}-step-message-kind",
-                        )
-                        msg_kind = str(message_kind.get("kind") or "").strip().lower()
-                        if msg_kind != "content_for_step":
-                            reason = str(message_kind.get("reason") or "Ожидается контент для текущего шага.").strip()
-                            before_pause = self.task_store.get_state()
-                            _ = self.task_store.update_progress(
-                                expected_action=f"Ожидается контент для шага. Причина отклонения текущего сообщения: {reason}"
-                            )
-                            task_state = self.task_store.set_paused(True)
-                            self._log_task_action(action="auto_pause_user_message_not_step_content", before=before_pause, after=task_state)
-                            await _signal("execution", "Сообщение не содержит контент для текущего шага")
-                            await _send_orchestrator_done(
-                                answer_text=(
-                                    "Сейчас от вас ожидается содержимое для текущего шага (например текст SQL-скрипта). "
-                                    f"Текущее сообщение отклонено: {reason}"
-                                ),
-                                usage_data=usage_agg,
-                                final_task_state=task_state,
-                                strategy_name="task_execution_wait_user_input",
-                            )
-                            return
-                        payload_assessment = await self._assess_user_payload_for_step(
-                            current_step=current_step,
-                            user_payload=latest_user_message,
-                            model=model,
-                            endpoint=endpoint,
-                            max_tokens=max_tokens,
-                            trace_id=f"{req_id}-step-payload-check",
-                        )
-                        if not bool(payload_assessment.get("suitable", False)):
-                            reason = str(payload_assessment.get("reason") or "Ввод не подходит для текущего шага.").strip()
-                            before_pause = self.task_store.get_state()
-                            _ = self.task_store.update_progress(
-                                expected_action=f"Текущий ввод не подходит для шага. Причина: {reason}"
-                            )
-                            task_state = self.task_store.set_paused(True)
-                            self._log_task_action(action="auto_pause_user_payload_rejected", before=before_pause, after=task_state)
-                            await _signal("execution", "Ввод пользователя отклонен для текущего шага")
-                            await _send_orchestrator_done(
-                                answer_text=f"Данные не подходят для текущего шага. Причина: {reason}",
-                                usage_data=usage_agg,
-                                final_task_state=task_state,
-                                strategy_name="task_execution_user_payload_rejected",
-                            )
-                            return
-                        latest_user_message = str(payload_assessment.get("normalized_payload") or latest_user_message).strip()
-                    exec_user = (
-                        "TASK:\n"
-                        f"{task_text}\n\n"
-                        "PLAN:\n"
-                        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
-                        "DONE:\n"
-                        f"{json.dumps(done_steps, ensure_ascii=False)}\n\n"
-                        "CURRENT_STEP:\n"
-                        f"{current_step}\n\n"
-                        "LATEST_USER_MESSAGE:\n"
-                        f"{latest_user_message}\n\n"
-                        "WORKDIR_ROOT:\n"
-                        f"{self.project_root}\n\n"
-                        "WORKDIR_CURRENT:\n"
-                        f"{execution_cwd}\n\n"
-                        "OUTPUT_SCHEMA:\n"
-                        "{\"commands\": [\"powershell command 1\", \"powershell command 2\"], \"note\": \"...\"}"
-                    )
-                    exec_raw, usage_exec, _ = await self._llm_generate_text(
-                        user_text=exec_user,
-                        system_text=exec_system,
-                        model=model,
-                        endpoint=endpoint,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        trace_id=f"{req_id}-exec-plan",
-                        stage="execution",
-                        validate_invariants=False,
-                    )
-                    _acc_usage(usage_exec)
-                    commands = self._extract_commands(exec_raw)
-                    self._log_task_payload(name="TASK_EXEC_COMMANDS_PARSED", req_id=f"{req_id}-exec-plan", payload=commands)
-                    if not commands:
-                        step_lc = current_step.lower()
-                        if (
-                            "перейти" in step_lc
-                            or "директори" in step_lc
-                            or "папк" in step_lc
-                            or "root" in step_lc
-                            or "корнев" in step_lc
-                        ):
-                            commands = ["Write-Output 'navigation no-op: cwd already set by agent'"]
-                        else:
-                            self.logger.write(
-                                "WARN",
-                                "TASK_EXEC_EMPTY_COMMANDS_RAW",
-                                extra=exec_raw[:800],
-                            )
-                    else:
-                        covers_step, missing_tokens = self._commands_cover_current_step(current_step, commands)
-                        if not covers_step:
-                            self.logger.write(
-                                "WARN",
-                                "TASK_EXEC_COMMANDS_MISMATCH_STEP",
-                                extra=json.dumps(
-                                    {
-                                        "req_id": f"{req_id}-exec-plan",
-                                        "current_step": current_step,
-                                        "missing_tokens": missing_tokens,
-                                        "commands": commands,
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                            )
-                            commands = []
-                    if not commands:
-                        err_state = self.task_store.update_progress(
-                            expected_action="Ошибка: LLM не вернул исполняемые команды. Ожидается уточнение пользователя."
-                        )
-                        await _signal("execution", "Получены нерелевантные команды, запрашиваю корректировку")
-                        repair_system = (
-                            "Ты исправляешь неудачный execution-шаг.\n"
-                            "На входе: текущий шаг, команды и причина отклонения.\n"
-                            "Верни только исправленные команды для ЭТОГО шага.\n"
-                            "Формат строго JSON: {\"commands\": [\"...\"]}"
-                        )
-                        repair_user = (
-                            "TASK:\n"
-                            f"{task_text}\n\n"
-                            "CURRENT_STEP:\n"
-                            f"{current_step}\n\n"
-                            "PREVIOUS_COMMANDS:\n"
-                            f"{json.dumps(self._extract_commands(exec_raw), ensure_ascii=False)}\n\n"
-                            "REJECTION_REASON:\n"
-                            "Команды не покрывают текущий шаг или не содержат целевые артефакты шага.\n\n"
-                            "WORKDIR_ROOT:\n"
-                            f"{self.project_root}\n\n"
-                            "WORKDIR_CURRENT:\n"
-                            f"{execution_cwd}\n\n"
-                            "OUTPUT_SCHEMA:\n"
-                            "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
-                        )
-                        repair_raw, usage_repair, _ = await self._llm_generate_text(
-                            user_text=repair_user,
-                            system_text=repair_system,
-                            model=model,
-                            endpoint=endpoint,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            trace_id=f"{req_id}-exec-repair-mismatch",
-                            stage="execution",
-                            validate_invariants=False,
-                        )
-                        _acc_usage(usage_repair)
-                        repair_commands = self._extract_commands(repair_raw)
-                        covers_step, _ = self._commands_cover_current_step(current_step, repair_commands)
-                        if repair_commands and covers_step:
-                            commands = repair_commands
-                            self._log_task_payload(
-                                name="TASK_EXEC_REPAIR_COMMANDS_PARSED",
-                                req_id=f"{req_id}-exec-repair-mismatch",
-                                payload=repair_commands,
-                            )
-                        else:
-                            await _send_orchestrator_done(
-                                answer_text="Ошибка оркестратора: не удалось получить корректные команды выполнения для текущего шага.",
-                                usage_data=usage_agg,
-                                final_task_state=err_state,
-                                strategy_name="task_execution_failed",
-                                error_text="empty_or_mismatch_execution_commands",
-                            )
-                            return
-
-                    interactive_commands = [c for c in commands if self._is_interactive_command(c)]
-                    if interactive_commands:
-                        before_pause = self.task_store.get_state()
-                        if self._step_requires_user_input(current_step) and latest_user_message:
-                            commands = self._materialize_user_payload_in_commands(commands, latest_user_message)
-                            interactive_commands = [c for c in commands if self._is_interactive_command(c)]
-                        if interactive_commands:
-                            repair_interactive_system = (
-                                "Ты исправляешь execution-команды, чтобы они были неинтерактивными.\n"
-                                "Удали Read-Host/pause/prompt-команды.\n"
-                                "Если нужен пользовательский контент, используй LATEST_USER_MESSAGE как уже полученный ввод.\n"
-                                "Верни строго JSON: {\"commands\": [\"...\"]}"
-                            )
-                            repair_interactive_user = (
-                                "CURRENT_STEP:\n"
-                                f"{current_step}\n\n"
-                                "LATEST_USER_MESSAGE:\n"
-                                f"{latest_user_message}\n\n"
-                                "INTERACTIVE_COMMANDS:\n"
-                                f"{json.dumps(commands, ensure_ascii=False)}\n\n"
-                                "OUTPUT_SCHEMA:\n"
-                                "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
-                            )
-                            fix_raw, usage_fix, _ = await self._llm_generate_text(
-                                user_text=repair_interactive_user,
-                                system_text=repair_interactive_system,
-                                model=model,
-                                endpoint=endpoint,
-                                temperature=temperature,
-                                max_tokens=max_tokens,
-                                trace_id=f"{req_id}-exec-repair-interactive",
-                                stage="execution",
-                                validate_invariants=False,
-                            )
-                            _acc_usage(usage_fix)
-                            fixed_commands = self._extract_commands(fix_raw)
-                            if fixed_commands:
-                                commands = fixed_commands
-                                if self._step_requires_user_input(current_step) and latest_user_message:
-                                    commands = self._materialize_user_payload_in_commands(commands, latest_user_message)
-                                interactive_commands = [c for c in commands if self._is_interactive_command(c)]
-                        if self._step_requires_user_input(current_step) and not interactive_commands:
-                            await _signal("execution", "Заменяю интерактивный ввод на данные из последнего сообщения пользователя")
-                        elif self._step_requires_user_input(current_step):
-                            _ = self.task_store.update_progress(
-                                expected_action="Пришлите содержимое для текущего шага сообщением (без изменения плана)."
-                            )
-                            task_state = self.task_store.set_paused(True)
-                            self._log_task_action(action="auto_pause_interactive_command_blocked", before=before_pause, after=task_state)
-                            await _signal("execution", "Интерактивные команды отклонены, ожидаю данные пользователя сообщением")
-                            await _send_orchestrator_done(
-                                answer_text=(
-                                    "Нужен ваш ввод для текущего шага, но интерактивный ввод в консоли отключен. "
-                                    "Пришлите содержимое (например SQL-скрипт) отдельным сообщением, и выполнение продолжится автоматически."
-                                ),
-                                usage_data=usage_agg,
-                                final_task_state=task_state,
-                                strategy_name="task_execution_wait_user_input",
-                            )
-                            return
-                        if interactive_commands:
-                            expected = str((before_pause or {}).get("expected_action") or "").strip()
-                            fail_state = self.task_store.update_progress(
-                                expected_action=expected or "Ожидается уточнение пользователя для текущего шага."
-                            )
-                            await _send_orchestrator_done(
-                                answer_text=(
-                                    "Не удалось продолжить автоматически: модель снова вернула интерактивные команды. "
-                                    f"Текущий шаг: {current_step}. "
-                                    f"Ожидаемое действие: {str(fail_state.get('expected_action') or '').strip() or 'уточните входные данные для шага'}."
-                                ),
-                                usage_data=usage_agg,
-                                final_task_state=fail_state,
-                                strategy_name="task_execution_wait_clarification",
-                                error_text="interactive_commands_blocked",
-                            )
-                            return
-
-                    commands_validation = await self._validate_commands_with_invariants(
-                        commands=commands,
-                        stage="execution",
-                        model=model,
-                        endpoint=endpoint,
-                        trace_id=f"{req_id}-exec-cmd-invariants",
-                    )
-                    if str(commands_validation.get("decision") or "pass") == "fail":
-                        fail_state = self.task_store.update_progress(
-                            expected_action="Команды выполнения отклонены strict-инвариантами."
-                        )
-                        if self._step_requires_user_input(current_step):
-                            fail_state = self.task_store.set_paused(True)
-                        await _send_orchestrator_done(
-                            answer_text=self._format_invariant_fail_message(
-                                commands_validation,
-                                "Команды отклонены инвариантами.",
-                            ),
-                            usage_data=usage_agg,
-                            final_task_state=fail_state,
-                            strategy_name="task_execution_failed",
-                            error_text="invariants_block_execution_commands",
-                        )
-                        return
-                    if str(commands_validation.get("decision") or "pass") == "warn":
-                        warnings = commands_validation.get("warnings") if isinstance(commands_validation.get("warnings"), list) else []
-                        if warnings:
-                            await _signal("execution", f"Предупреждение инвариантов: {warnings[0]}")
-
-                    await _signal("execution", f"Выполняю шаг: {current_step}", step=task_state.get("step"), total=task_state.get("total"))
-
-                    async def _on_exec_signal(payload: Dict[str, Any]) -> None:
-                        event = str(payload.get("event") or "")
-                        idx = payload.get("index")
-                        cmd = str(payload.get("command") or "")
-                        exit_code = payload.get("exit_code")
-                        if event == "command_start":
-                            await _signal("execution", f"Команда {idx}: {cmd}", command_index=idx)
-                        elif event == "command_done":
-                            await _signal("execution", f"Команда {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
-
-                    run_result = await self._run_powershell_commands(
-                        commands,
-                        on_signal=_on_exec_signal,
-                        trace_id=f"{req_id}-exec-run",
-                        stage="execution",
-                        cwd=execution_cwd,
-                    )
-                    execution_cwd = str(run_result.get("final_cwd") or execution_cwd)
-                    last_run_result = run_result
-                    if not bool(run_result.get("ok", False)):
-                        await _signal("execution", "Шаг завершился ошибкой, запрашиваю корректировку команд")
-                        repair_system = (
-                            "Ты исправляешь неудачный execution-шаг.\n"
-                            "На входе: текущий шаг, команды и ошибка выполнения.\n"
-                            "Верни только исправленные команды для ЭТОГО шага.\n"
-                            "Формат строго JSON: {\"commands\": [\"...\"]}"
-                        )
-                        repair_user = (
-                            "TASK:\n"
-                            f"{task_text}\n\n"
-                            "CURRENT_STEP:\n"
-                            f"{current_step}\n\n"
-                            "FAILED_COMMANDS:\n"
-                            f"{json.dumps(commands, ensure_ascii=False)}\n\n"
-                            "FAILED_RESULT:\n"
-                            f"{json.dumps(run_result, ensure_ascii=False)}\n\n"
-                            "WORKDIR_ROOT:\n"
-                            f"{self.project_root}\n\n"
-                            "WORKDIR_CURRENT:\n"
-                            f"{execution_cwd}\n\n"
-                            "OUTPUT_SCHEMA:\n"
-                            "{\"commands\": [\"powershell command 1\", \"powershell command 2\"]}"
-                        )
-                        repair_raw, usage_repair, _ = await self._llm_generate_text(
-                            user_text=repair_user,
-                            system_text=repair_system,
-                            model=model,
-                            endpoint=endpoint,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            trace_id=f"{req_id}-exec-repair",
-                            stage="execution",
-                            validate_invariants=False,
-                        )
-                        _acc_usage(usage_repair)
-                        repair_commands = self._extract_commands(repair_raw)
-                        self._log_task_payload(name="TASK_EXEC_REPAIR_COMMANDS_PARSED", req_id=f"{req_id}-exec-repair", payload=repair_commands)
-                        if repair_commands:
-                            await _signal("execution", "Выполняю исправленные команды шага")
-                            repair_result = await self._run_powershell_commands(
-                                repair_commands,
-                                on_signal=_on_exec_signal,
-                                trace_id=f"{req_id}-exec-repair-run",
-                                stage="execution_repair",
-                                cwd=execution_cwd,
-                            )
-                            execution_cwd = str(repair_result.get("final_cwd") or execution_cwd)
-                            last_run_result = repair_result
-                            if bool(repair_result.get("ok", False)):
-                                run_result = repair_result
-                            else:
-                                run_result = repair_result
-                        if not bool(run_result.get("ok", False)):
-                            fail_state = self.task_store.update_progress(
-                                expected_action="Выполнение шага завершилось ошибкой. Нужна корректировка команды/плана."
-                            )
-                            await _send_orchestrator_done(
-                                answer_text=_format_runs_error("Ошибка выполнения шага. Логи:", run_result),
-                                usage_data=usage_agg,
-                                final_task_state=fail_state,
-                                strategy_name="task_execution_failed",
-                                error_text="command_execution_failed",
-                            )
-                            return
-
-                    progress_lines.append(f"Шаг выполнен: {current_step}")
-                    before_next = self.task_store.get_state()
-                    task_state = self.task_store.next_step()
-                    self._log_task_action(action="auto_advance_execution_after_run", before=before_next, after=task_state)
-                    continue
-
-                if cur_state == "validation":
-                    await _signal("validation", "Запрашиваю команды проверки результата")
-                    plan = task_state.get("plan") if isinstance(task_state.get("plan"), list) else []
-                    validation_user = (
-                        "TASK:\n"
-                        f"{task_text}\n\n"
-                        "PLAN:\n"
-                        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
-                        "EXECUTION_RESULT:\n"
-                        f"{json.dumps(last_run_result, ensure_ascii=False)}\n\n"
-                        "WORKDIR_ROOT:\n"
-                        f"{self.project_root}\n\n"
-                        "WORKDIR_CURRENT:\n"
-                        f"{execution_cwd}\n\n"
-                        "OUTPUT_SCHEMA:\n"
-                        "{\"commands\": [\"powershell check 1\", \"powershell check 2\"], \"success_criteria\": \"...\"}"
-                    )
-                    val_raw, usage_val, _ = await self._llm_generate_text(
-                        user_text=validation_user,
-                        system_text=validation_system,
-                        model=model,
-                        endpoint=endpoint,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        trace_id=f"{req_id}-validate-plan",
-                        stage="validation",
-                        validate_invariants=False,
-                    )
-                    _acc_usage(usage_val)
-                    validation_commands = self._extract_commands(val_raw)
-                    validation_commands = [c for c in validation_commands if not self._is_mutating_command(c)]
-                    self._log_task_payload(name="TASK_VALIDATION_COMMANDS_PARSED", req_id=f"{req_id}-validate-plan", payload=validation_commands)
-                    if not validation_commands:
-                        fail_state = self.task_store.update_progress(
-                            expected_action="Ошибка: LLM не вернул команды проверки. Требуется повтор валидации."
-                        )
-                        await _send_orchestrator_done(
-                            answer_text="Ошибка валидации: LLM не вернул команды проверки результата.",
-                            usage_data=usage_agg,
-                            final_task_state=fail_state,
-                            strategy_name="task_validation_failed",
-                            error_text="empty_validation_commands",
-                        )
-                        return
-                    validation_commands_check = await self._validate_commands_with_invariants(
-                        commands=validation_commands,
-                        stage="validation",
-                        model=model,
-                        endpoint=endpoint,
-                        trace_id=f"{req_id}-validate-cmd-invariants",
-                    )
-                    if str(validation_commands_check.get("decision") or "pass") == "fail":
-                        fail_state = self.task_store.update_progress(
-                            expected_action="Команды проверки отклонены strict-инвариантами."
-                        )
-                        await _send_orchestrator_done(
-                            answer_text=self._format_invariant_fail_message(
-                                validation_commands_check,
-                                "Команды проверки отклонены инвариантами.",
-                            ),
-                            usage_data=usage_agg,
-                            final_task_state=fail_state,
-                            strategy_name="task_validation_failed",
-                            error_text="invariants_block_validation_commands",
-                        )
-                        return
-
-                    async def _on_val_signal(payload: Dict[str, Any]) -> None:
-                        event = str(payload.get("event") or "")
-                        idx = payload.get("index")
-                        cmd = str(payload.get("command") or "")
-                        exit_code = payload.get("exit_code")
-                        if event == "command_start":
-                            await _signal("validation", f"Проверка {idx}: {cmd}", command_index=idx)
-                        elif event == "command_done":
-                            await _signal("validation", f"Проверка {idx} завершена (code={exit_code})", command_index=idx, exit_code=exit_code)
-
-                    validation_result = await self._run_powershell_commands(
-                        validation_commands,
-                        on_signal=_on_val_signal,
-                        trace_id=f"{req_id}-validation-run",
-                        stage="validation",
-                        cwd=execution_cwd,
-                    )
-                    execution_cwd = str(validation_result.get("final_cwd") or execution_cwd)
-                    if bool(validation_result.get("ok", False)):
-                        before_done = task_state
-                        task_state = self.task_store.transition("done")
-                        self._log_task_action(action="auto_validation_to_done", before=before_done, after=task_state)
-                        done_snapshot = task_state
-                        task_state = self.task_store.clear_task()
-                        self._log_task_action(action="auto_clear_done_task", before=done_snapshot, after=task_state)
-                        answer_lines = progress_lines + ["Проверка пройдена. Задача завершена и автоматически удалена."]
-                        await _send_orchestrator_done(
-                            answer_text="\n".join(answer_lines),
-                            usage_data=usage_agg,
-                            final_task_state=task_state,
-                            strategy_name="task_validation_done",
-                        )
-                        return
-
-                    before_back = task_state
-                    task_state = self.task_store.transition("execution")
-                    task_state = self.task_store.update_progress(
-                        expected_action="Проверка не пройдена. Агент сообщил об ошибке, требуется доработка шага."
-                    )
-                    self._log_task_action(action="auto_validation_to_execution", before=before_back, after=task_state)
-                    answer_lines = progress_lines + [_format_runs_error("Проверка не пройдена. Логи:", validation_result)]
-                    await _send_orchestrator_done(
-                        answer_text="\n".join(answer_lines),
-                        usage_data=usage_agg,
-                        final_task_state=task_state,
-                        strategy_name="task_validation_failed",
-                        error_text="validation_failed",
-                    )
-                    return
-
-                if cur_state == "done":
-                    await _send_orchestrator_done(
-                        answer_text="Задача уже завершена.",
-                        usage_data=usage_agg,
-                        final_task_state=task_state,
-                        strategy_name="task_done",
-                    )
-                    return
-
-                break
-
-            fail_safe_state = self.task_store.update_progress(
-                expected_action="Оркестратор прервал цикл выполнения по safety-limit. Требуется диагностика."
-            )
-            await _send_orchestrator_done(
-                answer_text="Оркестратор остановлен по safety-limit. Проверь логи.",
-                usage_data=usage_agg,
-                final_task_state=fail_safe_state,
-                strategy_name="task_execution_failed",
-                error_text="safety_limit_reached",
-            )
-            return
-
-        branches = session.get("branches") if isinstance(session.get("branches"), dict) else {}
-        session["branches"] = branches
-
-        if strategy_for_context == "branching":
-            active = session.get("active_branch") if isinstance(session.get("active_branch"), str) else "main"
-            bid = (branch_id or active).strip() or "main"
-        else:
-            bid = "main"
-
-        if bid not in branches:
-            bid, branch = self._get_branch(session, bid)
-            branches[bid] = branch
-
-        session["active_branch"] = bid
-
-        branch = branches.get(bid) if isinstance(branches.get(bid), dict) else {"title": bid, "history": [], "facts": {}, "checkpoints": []}
-        history = self._branch_history(branch)
-        memory_layers = self._ensure_branch_memory_model(branch)
+            branch["memory_layers"] = memory_layers
 
         user_text_for_api = user_text
-        facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
-        if strategy_for_context == "facts":
+        system_text = None
+        if strategy == "facts":
             facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=facts)
             branch["facts"] = facts
             user_text_for_api = cleaned_user_text or "Учти обновленные факты и продолжай."
-
-        system_text = None
-        history_for_llm: List[Dict[str, str]] = []
-
-        if strategy_for_context == "facts":
-            system_text, history_for_llm = build_facts_strategy(history, facts, keep_last_n)
-        elif strategy_for_context == "summary":
-            older_history = history[:-keep_last_n] if len(history) > keep_last_n else []
-            tail_history = history[-keep_last_n:] if keep_last_n > 0 else []
-            summary_text = ""
-            if older_history:
-                try:
-                    summary_text = await self._summarize_history_with_llm(
-                        older_history=older_history,
-                        model=summary_model,
-                        endpoint=summary_endpoint,
-                        temperature=summary_temperature,
-                        max_tokens=summary_max_tokens,
-                        trace_id=req_id,
-                    )
-                except Exception as e:
-                    self.logger.write("WARN", "SUMMARY_LLM_FAILED", extra=str(e))
-                    previous_summary = str(branch.get("summary") or "")
-                    fallback_system, _, fallback_summary = build_summary_strategy(
-                        history=history,
-                        keep_last_n=keep_last_n,
-                        previous_summary=previous_summary,
-                    )
-                    summary_text = str(fallback_summary or "")
-                    if not summary_text and isinstance(fallback_system, str):
-                        summary_text = fallback_system.replace("SUMMARY OF PREVIOUS DIALOG:\n", "", 1).strip()
-
+            facts_system_text, history_for_llm = build_facts_strategy(history, facts, keep_last_n)
+            system_text = facts_system_text
+        elif strategy == "summary":
+            system_text, history_for_llm, summary_text = build_summary_strategy(history, keep_last_n, previous_summary=str(branch.get("summary") or ""))
             branch["summary"] = summary_text
-            system_text = f"SUMMARY OF PREVIOUS DIALOG:\n{summary_text}" if summary_text else None
-            history_for_llm = tail_history
         else:
             history_for_llm = build_sliding_window(history, keep_last_n)
 
         memory_system_text = self._build_memory_system_text(memory_layers)
-        system_text = self._merge_system_text(memory_system_text, system_text)
-
         profile_state = self.profile_store.get_state()
         active_profile = str(profile_state.get("active_profile") or "").strip()
         profile_description = ""
-        profile_applied = False
         if active_profile:
             profile = self.profile_store.get_profile(active_profile)
             if isinstance(profile, dict):
                 profile_description = str(profile.get("description") or "")
-        if use_profile and active_profile and profile_description.strip():
-            profile_system_text = self._build_profile_system_text(active_profile, profile_description)
-            system_text = self._merge_system_text(profile_system_text, system_text)
-            profile_applied = True
+        profile_system_text = self._build_profile_system_text(active_profile, profile_description) if use_profile else None
+        invariants_state = normalize_invariants_state(self.profile_store.get_invariants_state())
+        invariants_text = build_invariants_system_text(
+            invariants_state.get("invariants") or {},
+            invariants_state.get("invariant_policy") or {},
+        )
+        mcp_tools, mcp_info = await self._get_mcp_tools()
+        tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
+        system_text = self._merge_system_text(memory_system_text, profile_system_text, system_text, invariants_text, tools_policy_text)
+        working_messages = self._build_messages_for_llm(system_text=system_text, history_for_llm=history_for_llm, user_text=user_text_for_api)
+        self._log(
+            "INFO",
+            "CHAT_CONTEXT",
+            {
+                "req_id": req_id,
+                "session_id": session_id,
+                "branch_id": active_branch,
+                "strategy": strategy,
+                "system_text": system_text or "",
+                "messages": working_messages,
+            },
+        )
 
-        task_system_text = self._build_task_system_text(task_state)
-        task_injected = bool(task_system_text)
-        system_text = self._merge_system_text(task_system_text, system_text)
+        invariants_check = await self._validate_invariants(
+            req_id=req_id,
+            messages=working_messages,
+            invariants_text=invariants_text,
+            model=model,
+        )
+        self._log("INFO", "INVARIANTS_VALIDATION", invariants_check)
 
-        task_state_for_call = str(task_state.get("state") or "planning")
-        if task_state_for_call == "execution":
-            execution_instruction = (
-                "TASK ORCHESTRATOR MODE (execution):\n"
-                "- Выполняй текущий шаг самостоятельно и выдай конкретный результат этого шага.\n"
-                "- Не проси пользователя выполнить шаг вместо тебя.\n"
-                "- Если шаг завершен в этом ответе, добавь в конце отдельной строкой маркер [STEP_DONE].\n"
-                "- Если шаг не завершен, не добавляй маркер."
-            )
-            system_text = self._merge_system_text(execution_instruction, system_text)
-        elif task_state_for_call == "validation":
-            validation_instruction = (
-                "TASK ORCHESTRATOR MODE (validation):\n"
-                "- Проверь результат и дай короткий вердикт.\n"
-                "- Если валидация успешна, добавь в конце отдельной строкой [VALIDATION_OK].\n"
-                "- Если нужна доработка, добавь в конце отдельной строкой [VALIDATION_NEEDS_WORK]."
-            )
-            system_text = self._merge_system_text(validation_instruction, system_text)
+        openai_tools = [tool.to_openai_tool() for tool in mcp_tools]
+        self._log("INFO", "MCP_TOOLS_FOR_LLM", {"req_id": req_id, "mcp_info": mcp_info, "tools": openai_tools})
 
-        explicit_memory = request.get("memory_write")
-        if isinstance(explicit_memory, dict):
-            layer = str(explicit_memory.get("layer") or "").strip()
-            key = str(explicit_memory.get("key") or "").strip()
-            value = str(explicit_memory.get("value") or "").strip()
-            if layer and value:
-                self._save_memory_item(memory_layers, layer, key, value)
-                branch["memory_layers"] = memory_layers
-
+        usage_agg: Dict[str, Any] = {}
+        final_answer = ""
+        tool_events: List[Dict[str, Any]] = []
+        loop_guard = 0
+        max_tool_iterations = 8
         history.append({"role": "user", "content": user_text})
 
-        assistant_answer = ""
-        invariants_decision = "pass"
-        invariants_conflict_key = ""
+        while loop_guard < max_tool_iterations:
+            loop_guard += 1
+            llm_result = await self.gpt.chat_completion(
+                messages=working_messages,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=float(temperature) if temperature is not None else None,
+                tools=openai_tools if openai_tools else None,
+                tool_choice="auto",
+                trace_id=f"{req_id}:loop:{loop_guard}",
+            )
+            usage_agg = self._merge_usage(usage_agg, llm_result.get("usage") if isinstance(llm_result.get("usage"), dict) else {})
+            assistant_message = llm_result.get("message") if isinstance(llm_result.get("message"), dict) else {}
+            tool_calls = self._extract_tool_calls(assistant_message)
+            self._log("INFO", "LLM_ASSISTANT_MESSAGE", assistant_message)
 
-        self._log_api_request(
-            req_id=req_id,
-            session_id=session_id,
-            branch_id=bid,
-            model=model,
-            endpoint=endpoint,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            keep_last_n=keep_last_n,
-            strategy=strategy_for_context,
-            user_text=user_text_for_api,
-            history_for_llm=history_for_llm,
-            system_text=system_text,
-            explicit_memory=explicit_memory,
-        )
-        self.logger.write(
-            "INFO",
-            "SERVER_PROFILE_CONTEXT",
-            extra=json.dumps(
-                {
-                    "req_id": req_id,
-                    "use_profile": use_profile,
-                    "active_profile": active_profile,
-                    "profile_description_len": len(profile_description),
-                    "profile_applied": profile_applied,
-                },
-                ensure_ascii=False,
-            ),
-        )
-        self.logger.write(
-            "INFO",
-            "SERVER_TASK_CONTEXT",
-            extra=json.dumps(
-                {
-                    "req_id": req_id,
-                    "task_state": str(task_state.get("state") or "planning"),
-                    "task_step": int(task_state.get("step") or 0),
-                    "task_total": int(task_state.get("total") or 0),
-                    "task_paused": bool(task_state.get("is_paused", False)),
-                    "task_injected": task_injected,
-                },
-                ensure_ascii=False,
-            ),
-        )
-        assistant_answer, usage, validation_snapshot = await self._llm_generate_text(
-            user_text=user_text_for_api,
-            system_text=system_text,
-            history=history_for_llm,
-            max_tokens=max_tokens,
-            model=model,
-            endpoint=endpoint,
-            temperature=temperature,
-            trace_id=req_id,
-            stage="chat",
-            max_retries=2,
-            validate_invariants=True,
-        )
-        usage = usage if isinstance(usage, dict) else {}
-        cost_rub = self._calc_cost_rub(model_id=model, usage=usage)
-        invariants_decision = str(validation_snapshot.get("decision") or "pass")
-        invariants_conflict_key = str(validation_snapshot.get("conflict_key") or "")
-        if assistant_answer:
-            await self._send_json(writer, {"type": "chunk", "chunk": assistant_answer})
+            if tool_calls:
+                assistant_entry = {"role": "assistant", "content": assistant_message.get("content"), "tool_calls": tool_calls}
+                working_messages.append(assistant_entry)
+                history.append(assistant_entry)
+                for tool_call in tool_calls:
+                    tool_name = str((tool_call.get("function") or {}).get("name") or "").strip()
+                    raw_args = str((tool_call.get("function") or {}).get("arguments") or "{}")
+                    try:
+                        tool_args = json.loads(raw_args) if raw_args.strip() else {}
+                        if not isinstance(tool_args, dict):
+                            tool_args = {"value": tool_args}
+                    except Exception as e:
+                        tool_args = {"_raw_arguments": raw_args, "_parse_error": str(e)}
+                    validation_error = self._validate_tool_arguments(tool_name, tool_args, mcp_tools)
+                    try:
+                        if validation_error is not None:
+                            raise MCPClientError(validation_error.get("message") or "Invalid tool arguments")
+                        tool_result = await self.mcp.call_tool(tool_name, tool_args)
+                    except MCPClientError as e:
+                        if validation_error is not None:
+                            tool_result = dict(validation_error)
+                        else:
+                            tool_result = {"is_error": True, "error": str(e), "tool_name": tool_name, "arguments": tool_args}
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id"),
+                        "content": self._normalize_tool_result_for_history(tool_result),
+                    }
+                    working_messages.append(tool_message)
+                    history.append(tool_message)
+                    event = {"tool_call": tool_call, "tool_result": tool_result}
+                    tool_events.append(event)
+                    self._log("INFO", "LLM_TOOL_ROUNDTRIP", event)
+                continue
 
-        history.append({"role": "assistant", "content": assistant_answer})
+            final_answer = str(assistant_message.get("content") or "")
+            history.append({"role": "assistant", "content": final_answer})
+            break
+
+        if not final_answer:
+            final_answer = "LLM не вернула финальный текстовый ответ."
+
         self._sync_short_term_from_history(memory_layers, history)
-        branch["memory_layers"] = memory_layers
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         branch["history"] = history
-        branch["updated_at"] = now
-        branches[bid] = branch
-        session["branches"] = branches
-        session["updated_at"] = now
-        session["active_branch"] = bid
+        branch["memory_layers"] = memory_layers
+        branch["facts"] = facts
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
         self.memory_store.save_session(session)
 
-        task_before_auto_step = self.task_store.get_state()
-        current_task_state = task_before_auto_step
-        try:
-            cur_state = str(task_before_auto_step.get("state") or "planning")
-            if (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "execution":
-                if self._has_step_done_marker(assistant_answer):
-                    current_task_state = self.task_store.next_step()
-                    self._log_task_action(
-                        action="auto_advance_execution_after_response",
-                        before=task_before_auto_step,
-                        after=current_task_state,
-                    )
-                else:
-                    self._log_task_action(
-                        action="auto_hold_execution_wait_step_done",
-                        before=task_before_auto_step,
-                        after=task_before_auto_step,
-                    )
-            elif (not bool(task_before_auto_step.get("is_paused", False))) and cur_state == "validation":
-                if self._has_validation_fail_marker(assistant_answer) or self._is_validation_failed_signal(assistant_answer):
-                    current_task_state = self.task_store.transition("execution")
-                    self._log_task_action(
-                        action="auto_validation_to_execution",
-                        before=task_before_auto_step,
-                        after=current_task_state,
-                    )
-                elif self._has_validation_pass_marker(assistant_answer):
-                    current_task_state = self.task_store.transition("done")
-                    self._log_task_action(
-                        action="auto_validation_to_done",
-                        before=task_before_auto_step,
-                        after=current_task_state,
-                    )
-                else:
-                    self._log_task_action(
-                        action="auto_hold_validation_wait_marker",
-                        before=task_before_auto_step,
-                        after=task_before_auto_step,
-                    )
-        except Exception as e:
-            self._log_task_action(
-                action="auto_advance_after_response",
-                before=task_before_auto_step,
-                error=str(e),
-            )
-            current_task_state = self.task_store.get_state()
-
-        assistant_answer = self._strip_control_markers(assistant_answer)
-        if history and isinstance(history[-1], dict) and str(history[-1].get("role") or "") == "assistant":
-            history[-1]["content"] = assistant_answer
-
-        sent_messages = int(len(history_for_llm) + (1 if system_text else 0) + 1)
-        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-        total_tokens_call = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-
-        full_history_tokens_est = self._estimate_tokens_messages(history)
-        context_tokens_est = self._estimate_tokens_messages(history_for_llm) + self._estimate_tokens_text(system_text or "")
-        user_tokens_est = self._estimate_tokens_text(user_text_for_api)
-        assistant_tokens_est = completion_tokens if completion_tokens > 0 else self._estimate_tokens_text(assistant_answer)
-        model_context_limit = self._resolve_context_limit(model)
-        may_exceed_context = bool((context_tokens_est + user_tokens_est) > model_context_limit)
+        if final_answer:
+            await self._send_json(writer, {"type": "chunk", "chunk": final_answer})
 
         token_stats = {
-            "user_text_tokens_est": int(user_tokens_est),
-            "context_tokens_est": int(context_tokens_est),
-            "assistant_tokens": int(assistant_tokens_est),
-            "total_tokens_call": int(total_tokens_call),
-            "dialog_tokens_est": int(full_history_tokens_est),
-            "model_context_limit": int(model_context_limit),
-            "may_exceed_context": may_exceed_context,
+            "user_text_tokens_est": self._estimate_tokens_text(user_text_for_api),
+            "context_tokens_est": self._estimate_tokens_messages(working_messages[:-1]) if working_messages else 0,
+            "assistant_tokens": int(usage_agg.get("completion_tokens") or usage_agg.get("output_tokens") or self._estimate_tokens_text(final_answer)),
+            "total_tokens_call": int(usage_agg.get("total_tokens") or 0),
+            "dialog_tokens_est": self._estimate_tokens_messages(history),
+            "model_context_limit": self._resolve_context_limit(model),
+            "may_exceed_context": False,
         }
-        facts_count = int(len(facts) if isinstance(facts, dict) else 0) if strategy_for_context == "facts" else None
-        message_stats = {
-            "strategy": strategy_display,
-            "branch_id": bid,
-            "use_profile": use_profile,
-            "active_profile": active_profile or "Без профиля",
-            "profile_description_len": int(len(profile_description)),
-            "profile_applied": profile_applied,
-            "keep_last_n": int(keep_last_n),
-            "sent_messages": int(sent_messages),
-            "facts_count": facts_count,
-            "memory_layers_counts": {
-                "short_term": int(len(memory_layers.get("short_term") or [])) if isinstance(memory_layers.get("short_term"), list) else 0,
-                "working": int(len(memory_layers.get("working") or {})) if isinstance(memory_layers.get("working"), dict) else 0,
-                "long_term": int(len(memory_layers.get("long_term") or {})) if isinstance(memory_layers.get("long_term"), dict) else 0,
-            },
-            "task_state": str(current_task_state.get("state") or "planning"),
-            "task_step": int(current_task_state.get("step") or 0),
-            "task_total": int(current_task_state.get("total") or 0),
-            "task_paused": bool(current_task_state.get("is_paused", False)),
-            "task_injected": task_injected,
-            "token_stats": token_stats,
-            "invariants_applied": True,
-            "invariants_conflict_key": invariants_conflict_key,
-            "invariants_decision": invariants_decision,
-            "validation_retries": 2,
-        }
-
-        await self._send_json(
-            writer,
-            {
-                "type": "done",
-                "model": model,
-                "endpoint": endpoint,
-                "usage": usage,
-                "cost_rub": cost_rub,
-                "session_id": session_id,
-                "title": session.get("title") or "",
-                "active_branch": bid,
-                "message_stats": message_stats,
-                "facts": (facts if strategy_for_context == "facts" and isinstance(facts, dict) else {}),
-                "memory_layers": memory_layers,
-                "token_stats": token_stats,
-                "task_state": current_task_state,
-                "profile_info": {
-                    "use_profile": use_profile,
-                    "active_profile": active_profile,
-                    "profile_description_len": int(len(profile_description)),
-                    "profile_applied": profile_applied,
-                },
-            },
+        token_stats["may_exceed_context"] = bool(
+            token_stats["context_tokens_est"] + token_stats["user_text_tokens_est"] > token_stats["model_context_limit"]
         )
-
-    # === Цикл обслуживания сокета ===
-
-    # Читает входящий JSONL, роутит его в нужный handler и поддерживает сервер в режиме постоянного прослушивания.
-
-    # Запускает основной рабочий цикл и управляет потоком входящих/исходящих данных в рамках текущей роли компонента.
+        message_stats = {
+            "strategy": strategy,
+            "branch_id": active_branch,
+            "use_profile": use_profile,
+            "active_profile": active_profile,
+            "profile_description_len": len(profile_description),
+            "profile_applied": bool(profile_system_text),
+            "keep_last_n": keep_last_n,
+            "sent_messages": len(working_messages),
+            "facts_count": len(facts) if isinstance(facts, dict) else 0,
+            "memory_layers_counts": {
+                "short_term": len(memory_layers.get("short_term") or []),
+                "working": len(memory_layers.get("working") or {}),
+                "long_term": len(memory_layers.get("long_term") or {}),
+            },
+            "invariants_decision": invariants_check.get("decision") or "pass",
+            "invariants_reason": invariants_check.get("reason") or "",
+            "tool_iterations": loop_guard,
+            "tools_available": len(mcp_tools),
+        }
+        cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
+        done_payload = {
+            "type": "done",
+            "model": model,
+            "endpoint": "chat",
+            "usage": usage_agg,
+            "cost_rub": cost_rub,
+            "session_id": session_id,
+            "title": session.get("title") or "",
+            "active_branch": active_branch,
+            "message_stats": message_stats,
+            "facts": facts if isinstance(facts, dict) else {},
+            "memory_layers": memory_layers,
+            "token_stats": token_stats,
+            "profile_info": {
+                "use_profile": use_profile,
+                "active_profile": active_profile,
+                "profile_description_len": len(profile_description),
+                "profile_applied": bool(profile_system_text),
+            },
+            "mcp_info": {**mcp_info, "tools": self._serialize_mcp_tools(mcp_tools)},
+            "tool_events": tool_events,
+        }
+        self._log("INFO", "CHAT_DONE", done_payload)
+        await self._send_json(writer, done_payload)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         self.logger.write("INFO", "Клиент подключился", extra=str(peer))
-
         try:
             while True:
                 line = await reader.readline()
                 if not line:
                     break
-
                 try:
                     request = json.loads(line.decode("utf-8", errors="replace"))
                 except Exception:
                     await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
                     continue
-
-                action = (request.get("action") or "").strip()
+                action = str(request.get("action") or "").strip()
                 handler = self._action_handlers.get(action)
                 if handler is None:
                     await self._send_error(writer, "Unknown action")
                     continue
                 await handler(request, writer)
-
         except Exception as e:
-            tb = traceback.format_exc()
-            msg = str(e) or "Unknown error"
-            self.logger.write("ERROR", "handle_client", extra=msg)
-            self.logger.write("ERROR", "TRACEBACK", extra=tb)
+            self.logger.write("ERROR", "handle_client", extra=str(e))
+            self.logger.write("ERROR", "TRACEBACK", extra=traceback.format_exc())
             try:
-                await self._send_json(writer, {"type": "error", "message": msg})
+                await self._send_json(writer, {"type": "error", "message": str(e) or "Unknown error"})
             except Exception:
                 pass
-
         finally:
             try:
                 writer.close()
@@ -3876,16 +931,13 @@ class LLMAgentServer:
                 pass
             self.logger.write("INFO", "Клиент отключился", extra=str(peer))
 
-    # Запускает основной рабочий цикл и управляет потоком входящих/исходящих данных в рамках текущей роли компонента.
-
     async def run(self) -> None:
         await self.preload_pricing()
-        await self._bootstrap_mcp()
-
+        status = await self.mcp.status()
+        self._log("INFO", "MCP_STATUS_AT_STARTUP", status)
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
         self.logger.write("INFO", "Агент запущен и слушает", extra=addrs)
-
         async with server:
             await server.serve_forever()
 

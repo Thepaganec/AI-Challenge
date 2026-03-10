@@ -1,19 +1,14 @@
-import os
 import json
-import aiohttp
+import os
 import re
 import time
 from html import unescape
-from typing import AsyncIterator, List, Dict, Optional, Literal, Any
+from typing import Any, AsyncIterator, Dict, List, Optional
+
+import aiohttp
+
 
 class GPTModel:
-
-    # === Инициализация и базовая диагностика ===
-
-    # Читает API-ключ, фиксирует базовые параметры модели и готовит безопасный структурный лог запросов.
-
-    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
-
     def __init__(
         self,
         api_key_env: str = "PROXYAPI_KEY",
@@ -28,16 +23,11 @@ class GPTModel:
                 f"Не найден API ключ в env переменной {api_key_env}. "
                 f"Добавь в .env: {api_key_env}=..."
             )
-
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_sec = timeout_sec
         self.logger = logger
-
-        # Последняя статистика usage по стриму (токены и т.п.)
-        self.last_usage: Optional[Dict[str, Any]] = None
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        self.last_usage: Dict[str, Any] = {}
 
     def _mask_api_key(self, value: str) -> str:
         token = str(value or "")
@@ -45,12 +35,10 @@ class GPTModel:
             return "***"
         return token[:6] + "***" + token[-4:]
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     def _log_struct(self, level: str, message: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if self.logger is None:
             return
-        extra: Optional[str] = None
+        extra = None
         if isinstance(payload, dict):
             extra = json.dumps(payload, ensure_ascii=False, indent=2)
         try:
@@ -58,133 +46,316 @@ class GPTModel:
         except Exception:
             pass
 
-    # === Тарифы и стоимость ===
-
-    # Получает/кэширует таблицу цен ProxyAPI и возвращает цену конкретной модели в формате RUB за 1M токенов.
-
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
-
     async def get_pricing_rub_per_1m(self) -> Dict[str, Dict[str, float]]:
-        """
-        Парсит https://proxyapi.ru/pricing/list по таблице (<tr>/<td>) и возвращает:
-        {
-            "model_id": {"in": <руб за 1M>, "out": <руб за 1M>},
-            ...
-        }
-
-        Загружается ОДИН раз и кэшируется до перезапуска приложения.
-        """
         if not hasattr(self, "_pricing_cache"):
             self._pricing_cache = None
-
         if isinstance(self._pricing_cache, dict) and self._pricing_cache:
             return self._pricing_cache
 
         url = "https://proxyapi.ru/pricing/list"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml"}
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as resp:
                 if resp.status < 200 or resp.status >= 300:
-                    body_text = await resp.text()
-                    raise RuntimeError(f"ProxyAPI pricing fetch error: HTTP {resp.status}\n{body_text}")
-
+                    raise RuntimeError(f"ProxyAPI pricing fetch error: HTTP {resp.status}\n{await resp.text()}")
                 html = await resp.text()
 
-        # Убираем script/style чтобы не мешали
         html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
         html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
 
         def _strip_tags(s: str) -> str:
             s = re.sub(r"(?is)<[^>]+>", " ", s)
-            s = unescape(s)
-            s = s.replace("\xa0", " ")
+            s = unescape(s).replace("\xa0", " ")
             return re.sub(r"\s+", " ", s).strip()
 
         def _parse_rub_number(s: str) -> Optional[float]:
-            """
-            Вытаскивает число перед ₽, поддерживает пробелы и запятую:
-            'Ввод: 129 ₽ за 1M токенов' -> 129.0
-            '2 577 ₽' -> 2577.0
-            '7 895,00 ₽' -> 7895.0
-            """
             m = re.search(r"([0-9][0-9\s]*([.,][0-9]+)?)\s*₽", s)
             if not m:
                 return None
-            num = m.group(1).replace(" ", "").replace("\xa0", "")
-            num = num.replace(",", ".")
+            num = m.group(1).replace(" ", "").replace("\xa0", "").replace(",", ".")
             try:
                 return float(num)
             except Exception:
                 return None
 
         pricing: Dict[str, Dict[str, float]] = {}
-
-        # Находим строки таблицы
         rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", html)
-
         for row_html in rows:
-            # Берём ячейки
             tds = re.findall(r"(?is)<td\b[^>]*>.*?</td>", row_html)
             if len(tds) < 3:
                 continue
-
             cells = [_strip_tags(td) for td in tds]
-            if not cells:
+            if len(cells) < 3:
                 continue
-
-            # По факту у ProxyAPI в строке обычно:
-            # 0: Provider (OpenAI)
-            # 1: Model (gpt-3.5-turbo)
-            # 2..: Тарифы (ввод/вывод) текстом
-            provider = cells[0]
-            model_id = cells[1] if len(cells) > 1 else ""
-
-            if not provider or not model_id:
-                continue
-
-            # Склеим остальные колонки (там и "Ввод", и "Вывод")
+            model_id = cells[1]
             prices_blob = " | ".join(cells[2:])
-
-            # Ищем "Ввод:" и "Вывод:" (иногда они в разных td, но мы уже склеили)
-            in_price = None
-            out_price = None
-
             m_in = re.search(r"Ввод\s*:\s*([^|]+)", prices_blob)
-            if m_in:
-                in_price = _parse_rub_number(m_in.group(1))
-
             m_out = re.search(r"Вывод\s*:\s*([^|]+)", prices_blob)
-            if m_out:
-                out_price = _parse_rub_number(m_out.group(1))
-
-            # Иногда "Ввод" / "Вывод" могут быть без двоеточия, подстрахуемся:
-            if in_price is None:
-                m_in2 = re.search(r"Ввод\s*([0-9][0-9\s]*([.,][0-9]+)?)\s*₽", prices_blob)
-                if m_in2:
-                    in_price = _parse_rub_number(m_in2.group(0))
-
-            if out_price is None:
-                m_out2 = re.search(r"Вывод\s*([0-9][0-9\s]*([.,][0-9]+)?)\s*₽", prices_blob)
-                if m_out2:
-                    out_price = _parse_rub_number(m_out2.group(0))
-
+            in_price = _parse_rub_number(m_in.group(1)) if m_in else None
+            out_price = _parse_rub_number(m_out.group(1)) if m_out else None
             if in_price is not None and out_price is not None:
                 pricing[model_id] = {"in": float(in_price), "out": float(out_price)}
-
         self._pricing_cache = pricing
         return pricing
 
-    # === Стриминг через ProxyAPI ===
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    # Собирает messages из system/history/user, открывает SSE-стрим и отдаёт чанки текста с обновлением usage-статистики.
+    def _sanitize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sanitized: List[Dict[str, Any]] = []
+        for item in messages or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if not role:
+                continue
+            entry: Dict[str, Any] = {"role": role}
+            if "content" in item:
+                entry["content"] = item.get("content")
+            if role == "assistant" and isinstance(item.get("tool_calls"), list):
+                entry["tool_calls"] = item.get("tool_calls")
+            if role == "tool":
+                tool_call_id = str(item.get("tool_call_id") or "").strip()
+                if tool_call_id:
+                    entry["tool_call_id"] = tool_call_id
+            sanitized.append(entry)
+        return sanitized
 
-    # Унифицирует стриминг chat/responses endpoint: собирает payload, обрабатывает SSE-события, извлекает usage и отдаёт текст по мере генерации.
+    async def chat_completion(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        selected_model = model or self.model
+        url = f"{self.base_url}/chat/completions"
+        payload: Dict[str, Any] = {
+            "model": selected_model,
+            "messages": self._sanitize_messages(messages),
+            "stream": False,
+            "max_completion_tokens": int(max_tokens),
+        }
+        if temperature is not None and float(temperature) != 1.0:
+            payload["temperature"] = float(temperature)
+        if isinstance(tools, list) and tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        t0 = time.perf_counter()
+        self._log_struct(
+            "INFO",
+            "GPTMODEL_API_REQUEST",
+            {
+                "req_id": trace_id,
+                "endpoint": "chat",
+                "url": url,
+                "headers": {
+                    "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
+                    "Content-Type": "application/json",
+                },
+                "payload": payload,
+            },
+        )
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=self._headers(), json=payload) as resp:
+                body_text = await resp.text()
+                self._log_struct(
+                    "INFO",
+                    "GPTMODEL_API_RESPONSE_META",
+                    {
+                        "req_id": trace_id,
+                        "endpoint": "chat",
+                        "status": int(resp.status),
+                        "ok": bool(200 <= int(resp.status) < 300),
+                    },
+                )
+                if resp.status < 200 or resp.status >= 300:
+                    self._log_struct(
+                        "ERROR",
+                        "GPTMODEL_API_RESPONSE_ERROR",
+                        {"req_id": trace_id, "endpoint": "chat", "status": int(resp.status), "body": body_text},
+                    )
+                    raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
+                data = json.loads(body_text)
+
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        self.last_usage = usage
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        message = {}
+        finish_reason = ""
+        if choices:
+            choice0 = choices[0] if isinstance(choices[0], dict) else {}
+            message = choice0.get("message") if isinstance(choice0.get("message"), dict) else {}
+            finish_reason = str(choice0.get("finish_reason") or "")
+
+        normalized_message = {
+            "role": str(message.get("role") or "assistant"),
+            "content": message.get("content"),
+        }
+        if isinstance(message.get("tool_calls"), list):
+            normalized_message["tool_calls"] = message.get("tool_calls")
+
+        self._log_struct(
+            "INFO",
+            "GPTMODEL_API_RESPONSE",
+            {
+                "req_id": trace_id,
+                "endpoint": "chat",
+                "duration_sec": round(time.perf_counter() - t0, 3),
+                "usage": usage,
+                "finish_reason": finish_reason,
+                "message": normalized_message,
+                "reasoning": data.get("reasoning"),
+            },
+        )
+        return {
+            "message": normalized_message,
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "raw": data,
+        }
+
+    async def complete_text(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: Optional[float] = None,
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result = await self.chat_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            trace_id=trace_id,
+        )
+        message = result.get("message") if isinstance(result.get("message"), dict) else {}
+        return {
+            "text": str(message.get("content") or ""),
+            "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
+            "raw": result.get("raw"),
+        }
+
+    async def stream_messages(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: Optional[float] = None,
+        trace_id: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        selected_model = model or self.model
+        payload: Dict[str, Any] = {
+            "model": selected_model,
+            "messages": self._sanitize_messages(messages),
+            "stream": True,
+            "max_completion_tokens": int(max_tokens),
+            "stream_options": {"include_usage": True},
+        }
+        if temperature is not None and float(temperature) != 1.0:
+            payload["temperature"] = float(temperature)
+
+        url = f"{self.base_url}/chat/completions"
+        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+        t0 = time.perf_counter()
+        chunks = 0
+        chars_out = 0
+        preview_parts: List[str] = []
+        self.last_usage = {}
+        self._log_struct(
+            "INFO",
+            "GPTMODEL_API_REQUEST",
+            {
+                "req_id": trace_id,
+                "endpoint": "chat_stream",
+                "url": url,
+                "headers": {
+                    "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
+                    "Content-Type": "application/json",
+                },
+                "payload": payload,
+            },
+        )
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=self._headers(), json=payload) as resp:
+                self._log_struct(
+                    "INFO",
+                    "GPTMODEL_API_RESPONSE_META",
+                    {
+                        "req_id": trace_id,
+                        "endpoint": "chat_stream",
+                        "status": int(resp.status),
+                        "ok": bool(200 <= int(resp.status) < 300),
+                    },
+                )
+                if resp.status < 200 or resp.status >= 300:
+                    body_text = await resp.text()
+                    self._log_struct(
+                        "ERROR",
+                        "GPTMODEL_API_RESPONSE_ERROR",
+                        {"req_id": trace_id, "endpoint": "chat_stream", "status": int(resp.status), "body": body_text},
+                    )
+                    raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
+
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+
+                    if isinstance(obj.get("usage"), dict):
+                        self.last_usage = obj.get("usage") or {}
+
+                    choices = obj.get("choices") if isinstance(obj.get("choices"), list) else []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") if isinstance(choices[0], dict) else {}
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if not content:
+                        continue
+                    chunks += 1
+                    chars_out += len(content)
+                    if len("".join(preview_parts)) < 4000:
+                        preview_parts.append(content)
+                    yield content
+
+        self._log_struct(
+            "INFO",
+            "GPTMODEL_API_STREAM_DONE",
+            {
+                "req_id": trace_id,
+                "endpoint": "chat_stream",
+                "duration_sec": round(time.perf_counter() - t0, 3),
+                "chunks": chunks,
+                "chars_out": chars_out,
+                "usage": self.last_usage,
+                "response_preview": "".join(preview_parts)[:4000],
+            },
+        )
 
     async def stream_chat(
         self,
@@ -197,283 +368,19 @@ class GPTModel:
         temperature: Optional[float] = None,
         include_usage: bool = True,
         trace_id: Optional[str] = None,
-    ):
-        selected_model = model or self.model
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        messages: List[Dict[str, str]] = []
-
+    ) -> AsyncIterator[str]:
+        messages: List[Dict[str, Any]] = []
         if system_text:
             messages.append({"role": "system", "content": system_text})
-
-        if history:
-            for msg in history:
-                role = msg.get("role")
-                content = msg.get("content")
-                if role and content is not None:
-                    messages.append({"role": role, "content": str(content)})
-
+        for item in history or []:
+            if isinstance(item, dict):
+                messages.append(dict(item))
         messages.append({"role": "user", "content": user_text})
-
-        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
-        self.last_usage = {}
-
-        async def _post_chat(payload: Dict[str, object]) -> AsyncIterator[str]:
-            url = f"{self.base_url}/chat/completions"
-            t0 = time.perf_counter()
-            chunks = 0
-            chars_out = 0
-            response_preview_parts: List[str] = []
-            self._log_struct(
-                "INFO",
-                "GPTMODEL_API_REQUEST",
-                {
-                    "req_id": trace_id,
-                    "source": "GPTMODEL",
-                    "endpoint": "chat",
-                    "url": url,
-                    "headers": {
-                        "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
-                        "Content-Type": "application/json",
-                    },
-                    "payload": payload,
-                },
-            )
-
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    self._log_struct(
-                        "INFO",
-                        "GPTMODEL_API_RESPONSE_META",
-                        {
-                            "req_id": trace_id,
-                            "source": "GPTMODEL",
-                            "endpoint": "chat",
-                            "status": int(resp.status),
-                            "ok": bool(200 <= int(resp.status) < 300),
-                        },
-                    )
-
-                    if resp.status < 200 or resp.status >= 300:
-                        body_text = await resp.text()
-                        self._log_struct(
-                            "ERROR",
-                            "GPTMODEL_API_RESPONSE_ERROR",
-                            {
-                                "req_id": trace_id,
-                                "source": "GPTMODEL",
-                                "endpoint": "chat",
-                                "status": int(resp.status),
-                                "body": body_text,
-                            },
-                        )
-                        raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
-
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="ignore").strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            continue
-
-                        try:
-                            if include_usage and isinstance(obj.get("usage"), dict):
-                                self.last_usage = obj.get("usage")
-                        except Exception:
-                            pass
-
-                        try:
-                            choices = obj.get("choices")
-                            if isinstance(choices, list) and choices:
-                                delta = choices[0].get("delta")
-                                if isinstance(delta, dict):
-                                    content = delta.get("content")
-                                    if content:
-                                        chunks += 1
-                                        chars_out += len(content)
-                                        if len("".join(response_preview_parts)) < 4000:
-                                            response_preview_parts.append(content)
-                                        yield content
-                        except Exception:
-                            continue
-            self._log_struct(
-                "INFO",
-                "GPTMODEL_API_STREAM_DONE",
-                {
-                    "req_id": trace_id,
-                    "source": "GPTMODEL",
-                    "endpoint": "chat",
-                    "duration_sec": round(time.perf_counter() - t0, 3),
-                    "chunks": int(chunks),
-                    "chars_out": int(chars_out),
-                    "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
-                    "response_preview": "".join(response_preview_parts)[:4000],
-                },
-            )
-
-        if endpoint == "chat":
-            # --- 1) Сначала пробуем max_completion_tokens (нужно для gpt-5.2-chat-latest)
-            payload_c: Dict[str, object] = {
-                "model": selected_model,
-                "messages": messages,
-                "stream": True,
-                "max_completion_tokens": int(max_tokens),
-            }
-
-            # usage в chat-стриме придёт только если это попросить явно
-            if include_usage:
-                payload_c["stream_options"] = {"include_usage": True}
-
-            if temperature is not None and float(temperature) != 1.0:
-                payload_c["temperature"] = float(temperature)
-
-            try:
-                async for chunk in _post_chat(payload_c):
-                    yield chunk
-                return
-
-            except RuntimeError as e:
-                # --- 2) Fallback: если модель/прокси не поддерживает max_completion_tokens, повторяем с max_tokens
-                msg = str(e)
-                if "max_completion_tokens" not in msg:
-                    raise
-
-                payload_c2: Dict[str, object] = {
-                    "model": selected_model,
-                    "messages": messages,
-                    "stream": True,
-                    "max_tokens": int(max_tokens),
-                }
-
-                if include_usage:
-                    payload_c2["stream_options"] = {"include_usage": True}
-
-                if temperature is not None and float(temperature) != 1.0:
-                    payload_c2["temperature"] = float(temperature)
-
-                async for chunk in _post_chat(payload_c2):
-                    yield chunk
-
-        else:
-            url = f"{self.base_url}/responses"
-
-            payload_r: Dict[str, object] = {
-                "model": selected_model,
-                "input": messages,
-                "stream": True,
-                "max_output_tokens": int(max_tokens),
-            }
-
-            if temperature is not None and float(temperature) != 1.0:
-                payload_r["temperature"] = float(temperature)
-
-            t0 = time.perf_counter()
-            chunks = 0
-            chars_out = 0
-            response_preview_parts: List[str] = []
-            self._log_struct(
-                "INFO",
-                "GPTMODEL_API_REQUEST",
-                {
-                    "req_id": trace_id,
-                    "source": "GPTMODEL",
-                    "endpoint": "responses",
-                    "url": url,
-                    "headers": {
-                        "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
-                        "Content-Type": "application/json",
-                    },
-                    "payload": payload_r,
-                },
-            )
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload_r) as resp:
-                    self._log_struct(
-                        "INFO",
-                        "GPTMODEL_API_RESPONSE_META",
-                        {
-                            "req_id": trace_id,
-                            "source": "GPTMODEL",
-                            "endpoint": "responses",
-                            "status": int(resp.status),
-                            "ok": bool(200 <= int(resp.status) < 300),
-                        },
-                    )
-
-                    if resp.status < 200 or resp.status >= 300:
-                        body_text = await resp.text()
-                        self._log_struct(
-                            "ERROR",
-                            "GPTMODEL_API_RESPONSE_ERROR",
-                            {
-                                "req_id": trace_id,
-                                "source": "GPTMODEL",
-                                "endpoint": "responses",
-                                "status": int(resp.status),
-                                "body": body_text,
-                            },
-                        )
-                        raise RuntimeError(
-                            f"ProxyAPI error: HTTP {resp.status}\n{body_text}"
-                        )
-
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="ignore").strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            continue
-
-                        try:
-                            if include_usage and isinstance(obj.get("usage"), dict):
-                                self.last_usage = obj.get("usage")
-
-                            resp_obj = obj.get("response")
-                            if include_usage and isinstance(resp_obj, dict) and isinstance(resp_obj.get("usage"), dict):
-                                self.last_usage = resp_obj.get("usage")
-                        except Exception:
-                            pass
-
-                        try:
-                            if obj.get("type") == "response.output_text.delta":
-                                delta_text = obj.get("delta")
-                                if delta_text:
-                                    chunks += 1
-                                    chars_out += len(delta_text)
-                                    if len("".join(response_preview_parts)) < 4000:
-                                        response_preview_parts.append(delta_text)
-                                    yield delta_text
-                        except Exception:
-                            continue
-            self._log_struct(
-                "INFO",
-                "GPTMODEL_API_STREAM_DONE",
-                {
-                    "req_id": trace_id,
-                    "source": "GPTMODEL",
-                    "endpoint": "responses",
-                    "duration_sec": round(time.perf_counter() - t0, 3),
-                    "chunks": int(chunks),
-                    "chars_out": int(chars_out),
-                    "usage": self.last_usage if isinstance(self.last_usage, dict) else {},
-                    "response_preview": "".join(response_preview_parts)[:4000],
-                },
-            )
+        async for chunk in self.stream_messages(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            trace_id=trace_id,
+        ):
+            yield chunk

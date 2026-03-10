@@ -7,13 +7,6 @@ sys.dont_write_bytecode = True
 
 
 class AgentClient:
-
-    # === Инициализация и состояние клиента ===
-
-    # Создаёт транспортные поля клиента и кеши последнего ответа, чтобы UI мог читать метрики после любого RPC/стрима.
-
-    # Инициализирует внутреннее состояние объекта и связывает зависимости, которые будут использоваться остальными методами класса.
-
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, timeout_sec: int = 10):
         self.host = host
         self.port = port
@@ -36,28 +29,17 @@ class AgentClient:
         self.last_invariants_state: Dict[str, Any] = {}
         self.last_task_state: Dict[str, Any] = {}
         self.last_task_signal: Dict[str, Any] = {}
+        self.last_mcp_info: Dict[str, Any] = {}
+        self.last_tool_events: List[Dict[str, Any]] = []
         self.on_task_signal = None
-        self.last_mcp_status: Dict[str, Any] = {}
-        self.last_mcp_tools: List[Dict[str, Any]] = []
-        self.last_mcp_tool_result: Dict[str, Any] = {}
-
-    # === Управление TCP-соединением ===
-
-    # Проверяет живость сокета, открывает/закрывает подключение и классифицирует сетевые ошибки для повторной попытки запроса.
-
-    # Вычисляет булев признак состояния, который используется для ветвления дальнейшей логики.
 
     def _is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing() and self._reader is not None
-
-    # Проверяет обязательные инварианты структуры данных и при необходимости достраивает недостающие поля до корректного состояния.
 
     async def _ensure_connection(self) -> None:
         if self._is_connected():
             return
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port, limit=20_000_000)
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def _close_connection(self) -> None:
         writer = self._writer
@@ -71,16 +53,8 @@ class AgentClient:
         except Exception:
             pass
 
-    # Вычисляет булев признак состояния, который используется для ветвления дальнейшей логики.
-
     def _is_connection_error(self, e: Exception) -> bool:
         return isinstance(e, (ConnectionError, BrokenPipeError, ConnectionResetError, OSError, asyncio.IncompleteReadError))
-
-    # === Базовый RPC-протокол ===
-
-    # Отправляет JSONL-запрос, собирает обычный или chunked-ответ и поднимает исключение, если сервер вернул ошибку.
-
-    # Базовый клиентский transport: сериализует JSONL-запрос, читает line-based ответ и прозрачно склеивает chunked-ответ в единый объект.
 
     async def _rpc(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         async with self._conn_lock:
@@ -89,7 +63,6 @@ class AgentClient:
                 try:
                     await self._ensure_connection()
                     assert self._reader is not None and self._writer is not None
-
                     self._writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
                     await self._writer.drain()
 
@@ -98,7 +71,6 @@ class AgentClient:
                         if not line:
                             raise ConnectionError("Connection closed by server")
                         msg = json.loads(line.decode("utf-8", errors="replace"))
-                        # Защита от "хвостов" stream-сигналов в обычном RPC канале.
                         if msg.get("type") == "task_signal":
                             continue
                         break
@@ -107,30 +79,21 @@ class AgentClient:
                         orig = msg.get("orig_type")
                         chunks = int(msg.get("chunks") or 0)
                         parts = [""] * chunks
-
                         while True:
                             line2 = await asyncio.wait_for(self._reader.readline(), timeout=self.timeout_sec)
                             if not line2:
                                 raise ConnectionError("Connection closed during chunked response")
                             m2 = json.loads(line2.decode("utf-8", errors="replace"))
-                            t = m2.get("type")
-
-                            if t == "chunked_part" and m2.get("orig_type") == orig:
-                                i = int(m2.get("i") or 0)
-                                data = m2.get("data") or ""
-                                if 0 <= i < chunks:
-                                    parts[i] = data
+                            if m2.get("type") == "chunked_part" and m2.get("orig_type") == orig:
+                                idx = int(m2.get("i") or 0)
+                                if 0 <= idx < chunks:
+                                    parts[idx] = str(m2.get("data") or "")
                                 continue
-
-                            if t == "chunked_end" and m2.get("orig_type") == orig:
+                            if m2.get("type") == "chunked_end" and m2.get("orig_type") == orig:
                                 break
-
-                            if t == "error":
+                            if m2.get("type") == "error":
                                 return m2
-
-                        full_text = "".join(parts)
-                        return json.loads(full_text)
-
+                        return json.loads("".join(parts))
                     return msg
                 except Exception as e:
                     last_error = e
@@ -142,17 +105,9 @@ class AgentClient:
                 raise last_error
             raise RuntimeError("RPC failed")
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     def _raise_if_error(self, msg: Dict[str, Any]) -> None:
         if msg.get("type") == "error":
             raise RuntimeError(msg.get("message") or "Agent error")
-
-    # === Операции с сессиями и ветками ===
-
-    # Обёртки над server-actions для списка сессий, загрузки конкретной сессии и навигации по веткам/чекпоинтам.
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
 
     async def ping(self) -> bool:
         try:
@@ -161,55 +116,9 @@ class AgentClient:
         except Exception:
             return False
 
-    async def mcp_status(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "mcp_status"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "mcp_status":
-            status = msg.get("status") if isinstance(msg.get("status"), dict) else {}
-            self.last_mcp_status = status
-            return status
-        return {}
-
-    async def mcp_list_tools(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "mcp_list_tools"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "mcp_tools":
-            tools = msg.get("tools") if isinstance(msg.get("tools"), list) else []
-            payload = {
-                "enabled": bool(msg.get("enabled")),
-                "connected": bool(msg.get("connected")),
-                "source": str(msg.get("source") or "live"),
-                "error": str(msg.get("error") or ""),
-                "tools": tools,
-            }
-            self.last_mcp_tools = tools
-            return payload
-        return {"enabled": False, "connected": False, "source": "live", "error": "", "tools": []}
-
-    async def mcp_call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = {
-            "action": "mcp_call_tool",
-            "tool_name": str(tool_name or "").strip(),
-            "arguments": arguments if isinstance(arguments, dict) else {},
-        }
-        msg = await self._rpc(payload)
-        self._raise_if_error(msg)
-        if msg.get("type") == "mcp_tool_result":
-            result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
-            out = {"tool_name": str(msg.get("tool_name") or ""), "result": result}
-            self.last_mcp_tool_result = out
-            return out
-        return {"tool_name": str(tool_name or ""), "result": {}}
-
-    # Возвращает агрегированный список сущностей в упорядоченном виде для отображения в UI или дальнейшей логики.
-
     async def list_sessions(self) -> List[dict]:
         msg = await self._rpc({"action": "list_sessions"})
-        if msg.get("type") == "sessions":
-            return msg.get("sessions") or []
-        return []
-
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+        return msg.get("sessions") or [] if msg.get("type") == "sessions" else []
 
     async def get_session(self, session_id: str) -> Optional[dict]:
         msg = await self._rpc({"action": "get_session", "session_id": session_id})
@@ -218,46 +127,23 @@ class AgentClient:
         self._raise_if_error(msg)
         return None
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     async def reset_session(self, session_id: str) -> bool:
         msg = await self._rpc({"action": "reset_session", "session_id": session_id})
         self._raise_if_error(msg)
         return msg.get("type") == "ok"
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
-
     async def switch_branch(self, session_id: str, branch_id: str) -> str:
-        msg = await self._rpc(
-            {
-                "action": "switch_branch",
-                "session_id": session_id,
-                "branch_id": branch_id,
-            }
-        )
+        msg = await self._rpc({"action": "switch_branch", "session_id": session_id, "branch_id": branch_id})
         self._raise_if_error(msg)
-        if msg.get("type") == "ok":
-            return (msg.get("active_branch") or branch_id or "main").strip() or "main"
-        raise RuntimeError(msg.get("message") or "Agent error")
+        return str(msg.get("active_branch") or branch_id or "main").strip() or "main"
 
     async def create_checkpoint(self, session_id: str, branch_id: str, name: str = "") -> str:
-        msg = await self._rpc(
-            {
-                "action": "create_checkpoint",
-                "session_id": session_id,
-                "branch_id": branch_id,
-                "name": name,
-            }
-        )
-        t = msg.get("type")
-        if t == "ok":
-            return msg.get("checkpoint_id") or ""
-        if t == "checkpoint_created":
-            cp = msg.get("checkpoint") if isinstance(msg.get("checkpoint"), dict) else {}
-            return str(cp.get("id") or "")
-        raise RuntimeError(msg.get("message") or "Agent error")
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        msg = await self._rpc({"action": "create_checkpoint", "session_id": session_id, "branch_id": branch_id, "name": name})
+        if msg.get("type") == "checkpoint_created":
+            checkpoint = msg.get("checkpoint") if isinstance(msg.get("checkpoint"), dict) else {}
+            return str(checkpoint.get("id") or "")
+        self._raise_if_error(msg)
+        return ""
 
     async def create_branch(self, session_id: str, from_branch_id: str, checkpoint_id: str, new_branch_name: str = "") -> str:
         msg = await self._rpc(
@@ -269,79 +155,35 @@ class AgentClient:
                 "new_branch_name": new_branch_name,
             }
         )
-
-        t = msg.get("type")
-        if t == "ok":
-            return msg.get("branch_id") or ""
-        if t == "branch_created":
-            return msg.get("branch_id") or ""
-        raise RuntimeError(msg.get("message") or "Agent error")
-
-    # === Операции с профилями ===
-
-    # CRUD-операции профилей пользователя и переключение активного профиля, который влияет на системный контекст запроса.
-
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+        if msg.get("type") == "branch_created":
+            return str(msg.get("branch_id") or "")
+        self._raise_if_error(msg)
+        return ""
 
     async def get_profile(self, profile_name: str) -> Optional[Dict[str, Any]]:
         msg = await self._rpc({"action": "get_profile", "profile_name": profile_name})
         self._raise_if_error(msg)
-        if msg.get("type") == "profile":
-            profile = msg.get("profile")
-            if isinstance(profile, dict):
-                return profile
-        return None
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        return msg.get("profile") if msg.get("type") == "profile" else None
 
     async def save_profile(self, profile_name: str, description: str) -> Dict[str, Any]:
-        msg = await self._rpc(
-            {
-                "action": "save_profile",
-                "profile_name": profile_name,
-                "description": description,
-            }
-        )
+        msg = await self._rpc({"action": "save_profile", "profile_name": profile_name, "description": description})
         self._raise_if_error(msg)
-        return {
-            "ok": msg.get("type") == "ok",
-            "profiles": msg.get("profiles") or [],
-            "active_profile": msg.get("active_profile") or "",
-        }
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        return {"ok": msg.get("type") == "ok", "profiles": msg.get("profiles") or [], "active_profile": msg.get("active_profile") or ""}
 
     async def delete_profile(self, profile_name: str) -> Dict[str, Any]:
         msg = await self._rpc({"action": "delete_profile", "profile_name": profile_name})
         self._raise_if_error(msg)
-        return {
-            "ok": msg.get("type") == "ok",
-            "profiles": msg.get("profiles") or [],
-            "active_profile": msg.get("active_profile") or "",
-        }
-
-    # Обновляет внутреннее состояние объекта и синхронизирует связанные элементы интерфейса или данные.
+        return {"ok": msg.get("type") == "ok", "profiles": msg.get("profiles") or [], "active_profile": msg.get("active_profile") or ""}
 
     async def set_active_profile(self, profile_name: str) -> Dict[str, Any]:
         msg = await self._rpc({"action": "set_active_profile", "profile_name": profile_name})
         self._raise_if_error(msg)
-        return {
-            "ok": msg.get("type") == "ok",
-            "profiles": msg.get("profiles") or [],
-            "active_profile": msg.get("active_profile") or "",
-        }
-
-    # Извлекает целевые данные по ключу/идентификатору и возвращает результат в нормализованном формате.
+        return {"ok": msg.get("type") == "ok", "profiles": msg.get("profiles") or [], "active_profile": msg.get("active_profile") or ""}
 
     async def get_profile_state(self) -> Dict[str, Any]:
         msg = await self._rpc({"action": "get_profile_state"})
         self._raise_if_error(msg)
-        if msg.get("type") == "profile_state":
-            return {
-                "profiles": msg.get("profiles") or [],
-                "active_profile": msg.get("active_profile") or "",
-            }
-        return {"profiles": [], "active_profile": ""}
+        return {"profiles": msg.get("profiles") or [], "active_profile": msg.get("active_profile") or ""} if msg.get("type") == "profile_state" else {"profiles": [], "active_profile": ""}
 
     async def get_invariants_state(self) -> Dict[str, Any]:
         msg = await self._rpc({"action": "get_invariants_state"})
@@ -375,99 +217,17 @@ class AgentClient:
         self.last_invariants_state = state
         return state
 
-    async def get_task_state(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "get_task_state"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def generate_task_plan(self, task: str) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "generate_task_plan", "task": task})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def confirm_task_plan(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "confirm_task_plan"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def pause_task(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "pause_task"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def resume_task(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "resume_task"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def next_task_step(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "next_task_step"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def update_task_progress(
-        self,
-        *,
-        current: str = "",
-        expected_action: str = "",
-        done_item: str = "",
-        step: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"action": "update_task_progress"}
-        if current:
-            payload["current"] = current
-        if expected_action:
-            payload["expected_action"] = expected_action
-        if done_item:
-            payload["done_item"] = done_item
-        if step is not None:
-            payload["step"] = int(step)
+    async def get_memory(self, session_id: str, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"action": "get_memory", "session_id": session_id}
+        if branch_id:
+            payload["branch_id"] = branch_id
         msg = await self._rpc(payload)
         self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    async def delete_task(self) -> Dict[str, Any]:
-        msg = await self._rpc({"action": "delete_task"})
-        self._raise_if_error(msg)
-        if msg.get("type") == "task_state":
-            state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
-            self.last_task_state = state
-            return state
-        return {}
-
-    # === Стриминг ответов модели ===
-
-    # Запускает stream_chat на сервере, отдаёт чанки в UI и сохраняет итоговые usage/token/profile метрики в полях клиента.
-
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+        if msg.get("type") == "memory":
+            layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
+            self.last_memory_layers = layers
+            return {"active_branch": msg.get("active_branch"), "memory_layers": layers, "facts": msg.get("facts") or {}}
+        return {"active_branch": branch_id or "main", "memory_layers": {}, "facts": {}}
 
     async def save_memory(self, session_id: str, branch_id: str, layer: str, value: str, key: str = "") -> Dict[str, Any]:
         msg = await self._rpc(
@@ -481,13 +241,29 @@ class AgentClient:
             }
         )
         self._raise_if_error(msg)
-        if msg.get("type") == "ok":
-            layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
-            self.last_memory_layers = layers
-            return {"ok": True, "active_branch": msg.get("active_branch"), "memory_layers": layers}
-        return {"ok": False, "active_branch": branch_id, "memory_layers": {}}
+        layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else {}
+        self.last_memory_layers = layers
+        return {"ok": msg.get("type") == "ok", "active_branch": msg.get("active_branch"), "memory_layers": layers}
 
-    # Инкапсулирует завершённый шаг сценария класса и возвращает результат в форме, ожидаемой следующими этапами логики.
+    async def mcp_status(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "mcp_status"})
+        self._raise_if_error(msg)
+        return msg.get("status") if isinstance(msg.get("status"), dict) else {}
+
+    async def mcp_list_tools(self) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "mcp_list_tools"})
+        self._raise_if_error(msg)
+        return {"connected": bool(msg.get("connected")), "tools": msg.get("tools") or [], "error": msg.get("error") or ""}
+
+    async def mcp_call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        msg = await self._rpc({"action": "mcp_call_tool", "tool_name": tool_name, "arguments": arguments or {}})
+        self._raise_if_error(msg)
+        return {
+            "ok": bool(msg.get("ok")),
+            "tool_name": msg.get("tool_name") or tool_name,
+            "result": msg.get("result"),
+            "error": msg.get("error") or "",
+        }
 
     async def stream_chat(
         self,
@@ -518,6 +294,8 @@ class AgentClient:
         self.last_invariants_state = {}
         self.last_task_state = {}
         self.last_task_signal = {}
+        self.last_mcp_info = {}
+        self.last_tool_events = []
 
         request: Dict[str, Any] = {
             "action": "stream_chat",
@@ -543,7 +321,6 @@ class AgentClient:
             try:
                 await self._ensure_connection()
                 assert self._reader is not None and self._writer is not None
-
                 self._writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
                 await self._writer.drain()
 
@@ -551,31 +328,22 @@ class AgentClient:
                     line = await self._reader.readline()
                     if not line:
                         raise ConnectionError("Connection closed by server during stream")
-
                     msg = json.loads(line.decode("utf-8", errors="replace"))
                     msg_type = msg.get("type")
-
                     if msg_type == "chunk":
                         chunk = msg.get("chunk") or ""
                         if chunk:
                             yield chunk
                         continue
-
                     if msg_type == "task_signal":
-                        signal_payload = {
-                            "stage": msg.get("stage") or "",
-                            "message": msg.get("message") or "",
-                            "extra": msg.get("extra") if isinstance(msg.get("extra"), dict) else {},
-                        }
-                        self.last_task_signal = signal_payload
+                        self.last_task_signal = msg
                         cb = self.on_task_signal
                         if callable(cb):
                             try:
-                                cb(signal_payload)
+                                cb(msg)
                             except Exception:
                                 pass
                         continue
-
                     if msg_type == "done":
                         self.last_model = msg.get("model")
                         self.last_endpoint = msg.get("endpoint")
@@ -588,11 +356,35 @@ class AgentClient:
                         self.last_memory_layers = msg.get("memory_layers") if isinstance(msg.get("memory_layers"), dict) else None
                         self.last_token_stats = msg.get("token_stats") if isinstance(msg.get("token_stats"), dict) else {}
                         self.last_profile_info = msg.get("profile_info") if isinstance(msg.get("profile_info"), dict) else {}
-                        self.last_task_state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+                        self.last_mcp_info = msg.get("mcp_info") if isinstance(msg.get("mcp_info"), dict) else {}
+                        self.last_tool_events = msg.get("tool_events") if isinstance(msg.get("tool_events"), list) else []
                         break
-
                     if msg_type == "error":
                         raise RuntimeError(msg.get("message") or "Agent error")
             except Exception:
                 await self._close_connection()
                 raise
+
+    async def get_task_state(self) -> Dict[str, Any]:
+        return {}
+
+    async def generate_task_plan(self, task: str) -> Dict[str, Any]:
+        return {}
+
+    async def confirm_task_plan(self) -> Dict[str, Any]:
+        return {}
+
+    async def pause_task(self) -> Dict[str, Any]:
+        return {}
+
+    async def resume_task(self) -> Dict[str, Any]:
+        return {}
+
+    async def next_task_step(self) -> Dict[str, Any]:
+        return {}
+
+    async def update_task_progress(self, *, current: str = "", expected_action: str = "", done_item: str = "", step: Optional[int] = None) -> Dict[str, Any]:
+        return {}
+
+    async def delete_task(self) -> Dict[str, Any]:
+        return {}
