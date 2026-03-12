@@ -1,5 +1,4 @@
 import os
-from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -22,24 +21,14 @@ def create_mcp_server() -> FastMCP:
     telegram_client = TelegramClient()
     runtime = SchedulerRuntime(storage=storage, telegram_client=telegram_client, logger=logger)
 
-    @asynccontextmanager
-    async def lifespan(_: FastMCP):
-        logger.info("Scheduler MCP server starting")
-        await runtime.start()
-        try:
-            yield
-        finally:
-            await runtime.stop()
-            logger.info("Scheduler MCP server stopped")
-
     mcp = FastMCP(
         name="local-scheduler-mcp",
         instructions=(
             "Provides tools for Telegram recipient binding and scheduled background tasks. "
             "For personal Telegram delivery, the user must first send any message to the bot, "
-            "then telegram_bind_recipient should be called before scheduler_create_task."
+            "then telegram_bind_recipient should be called before scheduler_create_task. "
+            "Always provide concrete schedule and job_payload fields when creating tasks."
         ),
-        lifespan=lifespan,
         log_level="INFO",
     )
 
@@ -62,6 +51,10 @@ def create_mcp_server() -> FastMCP:
             "For interval use schedule.every with schedule.unit='minutes' or 'hours'. "
             "For daily use schedule.time_points=[{hour, minute}]. "
             "For weekly use schedule.days plus schedule.time_points. "
+            "You must always include job_payload and schedule. "
+            "For weather_summary, job_payload should include city and may include period and requested_by. "
+            "Example interval task: schedule_type='interval', schedule={'every':10,'unit':'minutes'}, "
+            "job_payload={'city':'Moscow','period':'now','requested_by':'agent'}. "
             "The telegram recipient must already be bound with telegram_bind_recipient. "
             "Current supported job_type is weather_summary and it sends a fixed stub weather message."
         ),
@@ -69,17 +62,22 @@ def create_mcp_server() -> FastMCP:
     async def scheduler_create_task(
         title: str,
         job_type: str,
-        job_payload: Dict[str, Any],
         schedule_type: str,
-        schedule: Dict[str, Any],
         telegram_username: str,
+        job_payload: Dict[str, Any] | None = None,
+        schedule: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        normalized_job_payload = dict(job_payload or {})
+        normalized_schedule = dict(schedule or {})
+        if str(job_type or "").strip().lower() == "weather_summary" and normalized_job_payload:
+            normalized_job_payload.setdefault("period", "now")
+            normalized_job_payload.setdefault("requested_by", "agent")
         task = await runtime.create_task(
             title=title,
             job_type=job_type,
-            job_payload=job_payload,
+            job_payload=normalized_job_payload,
             schedule_type=schedule_type,
-            schedule=schedule,
+            schedule=normalized_schedule,
             telegram_username=telegram_username,
         )
         return {

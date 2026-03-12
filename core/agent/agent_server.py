@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import signal
+import sys
 import traceback
 import uuid
 from datetime import datetime
@@ -45,6 +47,7 @@ class LLMAgentServer:
         self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
         self.mcp = MCPClient(logger=self.logger)
+        self.scheduler_worker_process: Optional[asyncio.subprocess.Process] = None
 
         self.pricing_cache: Dict[str, Dict[str, float]] = {}
         self._model_context_limit: Dict[str, int] = {
@@ -81,6 +84,53 @@ class LLMAgentServer:
             "mcp_call_tool": self._handle_mcp_call_tool,
             "stream_chat": self._handle_stream_chat,
         }
+
+    async def _ensure_scheduler_worker(self) -> None:
+        enabled = str(os.getenv("SCHEDULER_WORKER_AUTOSTART", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            self._log("INFO", "SCHEDULER_WORKER_AUTOSTART_DISABLED")
+            return
+        if self.scheduler_worker_process is not None and self.scheduler_worker_process.returncode is None:
+            return
+
+        worker_command = str(os.getenv("SCHEDULER_WORKER_COMMAND") or sys.executable).strip() or sys.executable
+        worker_script = str(os.getenv("SCHEDULER_WORKER_SCRIPT") or os.path.join(self.project_root, "run_scheduler_worker.py")).strip()
+        worker_args = [worker_script]
+        self._log("INFO", "SCHEDULER_WORKER_START", {"command": worker_command, "args": worker_args})
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = int(getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0))
+        self.scheduler_worker_process = await asyncio.create_subprocess_exec(
+            worker_command,
+            *worker_args,
+            cwd=self.project_root,
+            env=dict(os.environ),
+            creationflags=creationflags,
+        )
+        await asyncio.sleep(0.5)
+        if self.scheduler_worker_process.returncode is not None:
+            raise RuntimeError(f"Scheduler worker exited immediately with code {self.scheduler_worker_process.returncode}")
+        self._log("SUCCESS", "SCHEDULER_WORKER_STARTED", {"pid": self.scheduler_worker_process.pid})
+
+    async def _stop_scheduler_worker(self) -> None:
+        proc = self.scheduler_worker_process
+        self.scheduler_worker_process = None
+        if proc is None or proc.returncode is not None:
+            return
+        self._log("INFO", "SCHEDULER_WORKER_STOP", {"pid": proc.pid})
+        try:
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                proc.send_signal(signal.SIGTERM)
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+        self._log("INFO", "SCHEDULER_WORKER_STOPPED", {"returncode": proc.returncode})
 
     async def preload_pricing(self) -> None:
         try:
@@ -343,14 +393,40 @@ class LLMAgentServer:
     def _build_tool_usage_instruction(self, tools: List[Any]) -> Optional[str]:
         if not tools:
             return None
-        return (
+        lines = [
             "[TOOLS_POLICY]\n"
             "- Use a tool only when it materially helps answer the user.\n"
             "- Never invent required arguments.\n"
             "- If a required argument is missing, ask a clarifying question instead of calling the tool.\n"
             "- Never send placeholder values like owner, repo, username, branch, tag, query, path.\n"
             "- If a tool returns an error, explain the error briefly and ask only for the missing concrete data."
+        ]
+        tool_names = {str(getattr(tool, "name", "") or "").strip() for tool in tools}
+        if "scheduler_create_task" in tool_names:
+            lines.append(
+                "[SCHEDULER_TOOL_HINTS]\n"
+                "- For scheduler_create_task always send both schedule and job_payload.\n"
+                "- For schedule_type='interval', schedule must be like {'every': 10, 'unit': 'minutes'} or {'every': 2, 'unit': 'hours'}.\n"
+                "- For schedule_type='once', schedule must be like {'run_at': '2026-03-12 18:30'}.\n"
+                "- For weather_summary, job_payload must contain at least {'city': '...'} and may include period/requested_by.\n"
+                "- If the city or schedule details are unknown, ask the user before calling the tool."
+            )
+        return "\n".join(lines)
+
+    def _augment_validation_error(self, tool_name: str, error_payload: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(tool_name or "").strip()
+        if name != "scheduler_create_task":
+            return error_payload
+        message = str(error_payload.get("message") or "").strip()
+        hint = (
+            " scheduler_create_task requires schedule and job_payload. "
+            "Examples: schedule={'every':10,'unit':'minutes'} for interval, "
+            "schedule={'run_at':'2026-03-12 18:30'} for once, "
+            "job_payload={'city':'Moscow','period':'now','requested_by':'agent'} for weather_summary."
         )
+        error_payload = dict(error_payload)
+        error_payload["message"] = message + hint
+        return error_payload
 
     def _validate_tool_arguments(self, tool_name: str, tool_args: Dict[str, Any], tools: List[Any]) -> Optional[Dict[str, Any]]:
         name = str(tool_name or "").strip()
@@ -369,14 +445,14 @@ class LLMAgentServer:
         properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         missing = [key for key in required if str(tool_args.get(key) or "").strip() == ""]
         if missing:
-            return {
+            return self._augment_validation_error(name, {
                 "is_error": True,
                 "error_type": "missing_required_arguments",
                 "message": f"Missing required tool arguments: {', '.join(missing)}.",
                 "tool_name": name,
                 "arguments": tool_args,
                 "required": required,
-            }
+            })
 
         placeholders = {
             "owner", "repo", "username", "organization", "org", "branch", "tag", "query", "path", "sha",
@@ -933,13 +1009,17 @@ class LLMAgentServer:
 
     async def run(self) -> None:
         await self.preload_pricing()
+        await self._ensure_scheduler_worker()
         status = await self.mcp.status()
         self._log("INFO", "MCP_STATUS_AT_STARTUP", status)
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
         self.logger.write("INFO", "Агент запущен и слушает", extra=addrs)
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            await self._stop_scheduler_worker()
 
 
 async def main() -> None:

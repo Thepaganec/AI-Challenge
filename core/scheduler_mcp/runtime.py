@@ -163,6 +163,27 @@ class SchedulerRuntime:
         telegram_username: str,
     ) -> Dict[str, Any]:
         clean_username = str(telegram_username or "").strip().lstrip("@").lower()
+        clean_job_type = str(job_type or "").strip().lower()
+        clean_schedule_type = str(schedule_type or "").strip().lower()
+        if not clean_schedule_type:
+            raise ValueError("schedule_type is required")
+        if not isinstance(schedule, dict) or not schedule:
+            if clean_schedule_type == "interval":
+                raise ValueError(
+                    "schedule is required. For interval tasks send schedule={'every':10,'unit':'minutes'} or schedule={'every':2,'unit':'hours'}."
+                )
+            if clean_schedule_type == "once":
+                raise ValueError("schedule is required. For one-time tasks send schedule={'run_at':'YYYY-MM-DD HH:MM'}.")
+            if clean_schedule_type == "daily":
+                raise ValueError("schedule is required. For daily tasks send schedule={'time_points':[{'hour':9,'minute':0}]}.")
+            if clean_schedule_type == "weekly":
+                raise ValueError(
+                    "schedule is required. For weekly tasks send schedule={'days':['monday'],'time_points':[{'hour':9,'minute':0}]}."
+                )
+            raise ValueError("schedule is required")
+        if clean_job_type == "weather_summary" and (not isinstance(job_payload, dict) or not str(job_payload.get('city') or '').strip()):
+            raise ValueError("job_payload.city is required for weather_summary")
+
         binding = self.storage.get_binding(clean_username)
         if binding is None:
             raise ValueError(
@@ -178,10 +199,10 @@ class SchedulerRuntime:
             "status": "active",
             "created_at": now_value,
             "updated_at": now_value,
-            "schedule_type": str(schedule_type or "").strip().lower(),
+            "schedule_type": clean_schedule_type,
             "schedule": normalized_schedule,
             "recipient": binding,
-            "job_type": str(job_type or "").strip().lower(),
+            "job_type": clean_job_type,
             "job_payload": dict(job_payload or {}),
             "next_run_at": None,
             "last_run_at": "",
