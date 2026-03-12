@@ -1,0 +1,47 @@
+2026-03-12 10:17:54,348 [INFO] Scheduler MCP server starting
+2026-03-12 10:17:54,348 [INFO] Scheduler runtime starting
+2026-03-12 10:17:54,360 [INFO] Scheduler runtime stopping
+2026-03-12 10:17:54,360 [INFO] Scheduler MCP server stopped
+2026-03-12 10:25:06,794 [INFO] Scheduler MCP server starting
+2026-03-12 10:25:06,794 [INFO] Scheduler runtime starting
+2026-03-12 10:25:06,799 [INFO] Scheduler runtime stopping
+2026-03-12 10:25:06,799 [INFO] Scheduler MCP server stopped
+2026-03-12 10:25:38,440 [INFO] Scheduler MCP server starting
+2026-03-12 10:25:38,440 [INFO] Scheduler runtime starting
+2026-03-12 10:25:38,447 [INFO] Scheduler runtime stopping
+2026-03-12 10:25:38,448 [INFO] Scheduler MCP server stopped
+2026-03-12 10:26:59,166 [INFO] Scheduler MCP server starting
+2026-03-12 10:26:59,166 [INFO] Scheduler runtime starting
+2026-03-12 10:26:59,171 [INFO] Scheduler runtime stopping
+2026-03-12 10:26:59,171 [INFO] Scheduler MCP server stopped
+2026-03-12 10:27:30,293 [INFO] Scheduler MCP server starting
+2026-03-12 10:27:30,293 [INFO] Scheduler runtime starting
+2026-03-12 10:27:30,298 [INFO] Scheduler runtime stopping
+2026-03-12 10:27:30,298 [INFO] Scheduler MCP server stopped
+2026-03-12 10:27:32,375 [INFO] Scheduler MCP server starting
+2026-03-12 10:27:32,375 [INFO] Scheduler runtime starting
+2026-03-12 10:27:33,181 [INFO] Telegram binding created for @thepaganec chat_id=555964088
+2026-03-12 10:27:33,193 [INFO] Scheduler runtime stopping
+2026-03-12 10:27:33,193 [INFO] Scheduler MCP server stopped
+2026-03-12 10:27:35,141 [INFO] Scheduler MCP server starting
+2026-03-12 10:27:35,142 [INFO] Scheduler runtime starting
+2026-03-12 10:27:35,153 [INFO] Scheduler runtime stopping
+2026-03-12 10:27:35,153 [INFO] Scheduler MCP server stopped
+2026-03-12 10:29:19,441 [INFO] Scheduler MCP server starting
+2026-03-12 10:29:19,442 [INFO] Scheduler runtime starting
+2026-03-12 10:29:19,447 [INFO] Scheduler runtime stopping
+2026-03-12 10:29:19,447 [INFO] Scheduler MCP server stopped
+2026-03-12 10:29:21,753 [INFO] Scheduler MCP server starting
+2026-03-12 10:29:21,753 [INFO] Scheduler runtime starting
+2026-03-12 10:29:22,350 [WARNING] Telegram binding not found for @username
+2026-03-12 10:29:22,354 [INFO] Scheduler runtime stopping
+2026-03-12 10:29:22,354 [INFO] Scheduler MCP server stopped
+2026-03-12 10:29:47,029 [INFO] Scheduler MCP server starting
+2026-03-12 10:29:47,029 [INFO] Scheduler runtime starting
+2026-03-12 10:29:47,035 [INFO] Scheduler runtime stopping
+2026-03-12 10:29:47,035 [INFO] Scheduler MCP server stopped
+2026-03-12 10:29:49,739 [INFO] Scheduler MCP server starting
+2026-03-12 10:29:49,740 [INFO] Scheduler runtime starting
+2026-03-12 10:29:49,746 [INFO] Telegram binding reused for @thepaganec
+2026-03-12 10:29:49,750 [INFO] Scheduler runtime stopping
+2026-03-12 10:29:49,750 [INFO] Scheduler MCP server stopped

@@ -15,9 +15,9 @@
   "invariants": {
     "architecture": "",
     "technical_decisions": "",
-    "stack_constraints": "можно использовать следующий набор технологий для задач выполняемых на моём устройстве:\nbat, sql, powershell, python",
+    "stack_constraints": "",
     "business_rules": "",
-    "safety_restrictions": "drop использовать нельзя",
+    "safety_restrictions": "",
     "response_style": ""
   },
   "invariant_policy": {
@@ -28,5 +28,5 @@
     "safety_restrictions": "strict",
     "response_style": "strict"
   },
-  "updated_at": "2026-03-11 00:06:23"
+  "updated_at": "2026-03-12 10:29:07"
 }
