@@ -43,7 +43,7 @@ def create_mcp_server() -> FastMCP:
     logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
     logger = build_service_logger("mcp_gismeteo", logs_root)
     service = GismeteoMCPService(
-        source_url=str(os.getenv("GISMETEO_URL", "https://www.gismeteo.ru/weather-tver-4327/")).strip(),
+        source_url=str(os.getenv("GISMETEO_URL", "https://www.gismeteo.ru/weather-tver-4327/now/")).strip(),
         logger=logger,
         timeout_sec=max(5, int(str(os.getenv("GISMETEO_TIMEOUT_SEC", "20")).strip() or "20")),
     )

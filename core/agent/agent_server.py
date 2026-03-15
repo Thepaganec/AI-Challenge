@@ -427,7 +427,8 @@ class LLMAgentServer:
             " scheduler__create_task requires schedule_type, schedule and steps. "
             "Example interval schedule: {'every':10,'unit':'minutes'}. "
             "Example once schedule: {'run_at':'2026-03-12 18:30'}. "
-            "steps must be a non-empty list like [{'tool':'gismeteo__get_current_weather','save_result_as':'weather'}]."
+            "steps must be a non-empty list like [{'tool':'gismeteo__get_current_weather','save_result_as':'weather'}]. "
+            "In scheduler steps, use the exact public MCP tool name without prefixes like 'functions.'."
         )
         error_payload = dict(error_payload)
         error_payload["message"] = message + hint

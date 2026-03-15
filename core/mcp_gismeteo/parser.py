@@ -1,6 +1,6 @@
 import re
 from html import unescape
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def _strip_tags(value: str) -> str:
@@ -23,30 +23,77 @@ def _search(patterns: list[str], html: str) -> str:
     return ""
 
 
+def _extract_widget_now_block(html: str) -> str:
+    marker = 'data-widget="weather-now"'
+    start = html.find(marker)
+    if start < 0:
+        return ""
+    div_start = html.rfind("<div", 0, start)
+    if div_start < 0:
+        return ""
+
+    pos = div_start
+    depth = 0
+    length = len(html)
+    while pos < length:
+        next_open = html.find("<div", pos)
+        next_close = html.find("</div>", pos)
+        if next_close < 0:
+            break
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            pos = next_open + 4
+            continue
+        depth -= 1
+        pos = next_close + len("</div>")
+        if depth <= 0:
+            return html[div_start:pos]
+    return ""
+
+
 def parse_current_weather(html: str, source_url: str) -> Dict[str, Any]:
     page_text = _strip_tags(html)
     title = _search([r"<title[^>]*>(.*?)</title>"], html)
     city = _search([r"Погода в\s+([^,]+)\s+сегодня"], title) or "Твери"
+    widget_now = _extract_widget_now_block(html)
+    widget_text = _strip_tags(widget_now) if widget_now else page_text
+
     temperature = _search(
-        [
-            r'data-widget="weather-now".*?class="unit unit_temperature_c".*?([-+]?\d+)',
-            r'class="temperature-air[^"]*".*?([-+]?\d+)',
-            r'([-+]?\d+)\s*(?:°|&deg;|C)',
-        ],
-        html,
+        [r'<div class="now-weather">.*?<temperature-value[^>]*value="([-+]?\d+)"'],
+        widget_now or html,
     )
     feels_like = _search(
-        [
-            r"По ощущению[^-+0-9]*([-+]?\d+)",
-            r"Ощущается как[^-+0-9]*([-+]?\d+)",
-        ],
-        page_text,
+        [r'<div class="now-feel">.*?<temperature-value[^>]*value="([-+]?\d+)"'],
+        widget_now or html,
     )
-    wind = _search([r"Ветер[^0-9]*([0-9.,]+\s*(?:м/с|m/s))"], page_text)
-    humidity = _search([r"Влажность[^0-9]*([0-9]{1,3}\s*%)"], page_text)
-    pressure = _search([r"Давление[^0-9]*([0-9]{2,4}\s*(?:мм|hPa)[^ ]*)"], page_text)
+    condition = _search([r'<div class="now-desc">\s*(.*?)\s*</div>'], widget_now or html) or "Актуальный прогноз"
+    wind_speed = _search(
+        [r'<div class="item-title">Ветер</div>.*?<div class="item-value">\s*<speed-value[^>]*value="([0-9.,]+)"'],
+        widget_now or html,
+    )
+    wind_direction = _search(
+        [r'<div class="item-title">Ветер</div>.*?<div class="item-measure"[^>]*>.*?<speed-value[^>]*>.*?</speed-value>\s*<br>\s*([^<]+)'],
+        widget_now or html,
+    )
+    pressure = _search(
+        [r'<div class="item-title">Давление</div>.*?<pressure-value[^>]*value="([0-9]{2,4})"'],
+        widget_now or html,
+    )
+    humidity = _search(
+        [r'<div class="item-title">Влажность</div>.*?<div class="item-value">([0-9]{1,3})</div>'],
+        widget_now or html,
+    )
 
-    condition = "Актуальный прогноз"
+    wind = ""
+    if wind_speed:
+        wind = f"{wind_speed} м/с"
+        if wind_direction:
+            wind += f", {wind_direction}"
+    if humidity:
+        humidity = f"{humidity} %"
+    if pressure:
+        pressure = f"{pressure} мм рт. ст."
+
     summary_parts = []
     if city:
         summary_parts.append(f"Погода в {city} сейчас")
@@ -54,6 +101,8 @@ def parse_current_weather(html: str, source_url: str) -> Dict[str, Any]:
         summary_parts.append(f"температура {temperature} C")
     if feels_like:
         summary_parts.append(f"ощущается как {feels_like} C")
+    if condition:
+        summary_parts.append(condition.lower())
     if wind:
         summary_parts.append(f"ветер {wind}")
     if humidity:
@@ -72,5 +121,5 @@ def parse_current_weather(html: str, source_url: str) -> Dict[str, Any]:
         "humidity": humidity,
         "pressure": pressure,
         "city": city,
-        "raw_text_excerpt": page_text[:1200],
+        "raw_text_excerpt": widget_text[:1200],
     }

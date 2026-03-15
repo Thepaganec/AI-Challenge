@@ -28,6 +28,19 @@ class SchedulerRuntime:
         )
         self.orchestrator_client = StdioMCPToolClient(logger=logger)
 
+    def _validate_steps(self, steps: List[Dict[str, Any]]) -> None:
+        for index, step in enumerate(steps or [], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Task step #{index} must be an object")
+            tool_name = str(step.get("tool") or "").strip()
+            if not tool_name:
+                raise ValueError(f"Task step #{index} missing tool")
+            if tool_name.startswith("functions."):
+                raise ValueError(
+                    f"Task step #{index} tool must use the public MCP name without prefixes. "
+                    f"Got '{tool_name}'. Use names like 'gismeteo__get_current_weather' or 'telegram__send_message'."
+                )
+
     def _resolve_command(self) -> str:
         configured = str(os.getenv("MCP_SERVER_COMMAND") or "").strip()
         if configured:
@@ -112,6 +125,15 @@ class SchedulerRuntime:
                     self.storage.save_task(task)
                 if is_due(next_run_at, now=now):
                     due_tasks.append(task)
+            if due_tasks:
+                self.logger.info(
+                    "SCHEDULER_RUNTIME_DUE_TASKS",
+                    {
+                        "count": len(due_tasks),
+                        "task_ids": [str(task.get("task_id") or "") for task in due_tasks],
+                        "checked_at": now_iso(),
+                    },
+                )
             for task in due_tasks:
                 await self._execute_task(task)
 
@@ -192,6 +214,7 @@ class SchedulerRuntime:
             raise ValueError("schedule is required")
         if not isinstance(steps, list) or not steps:
             raise ValueError("steps is required and must be a non-empty list")
+        self._validate_steps(steps)
         normalized_schedule = normalize_schedule(clean_schedule_type, schedule)
         task_id = str(uuid.uuid4())
         now_value = now_iso()
