@@ -46,7 +46,7 @@ def _parse_time_points(time_points: Any) -> List[Dict[str, int]]:
     return parsed
 
 
-def normalize_schedule(schedule_type: str, schedule: Dict[str, Any]) -> Dict[str, Any]:
+def validate_schedule_definition(schedule_type: str, schedule: Dict[str, Any]) -> Dict[str, Any]:
     clean_type = str(schedule_type or "").strip().lower()
     payload = dict(schedule or {})
 

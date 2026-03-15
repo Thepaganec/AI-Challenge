@@ -10,7 +10,7 @@ INVARIANT_KEYS: Tuple[str, ...] = (
     "response_style",
 )
 INVARIANT_POLICIES: Tuple[str, ...] = ("strict", "warn")
-def normalize_invariants_state(raw: Any) -> Dict[str, Dict[str, str]]:
+def build_invariants_state(raw: Any) -> Dict[str, Dict[str, str]]:
     invariants: Dict[str, str] = {k: "" for k in INVARIANT_KEYS}
     policy: Dict[str, str] = {k: "strict" for k in INVARIANT_KEYS}
     if isinstance(raw, dict):

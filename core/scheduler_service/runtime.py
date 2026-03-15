@@ -1,13 +1,16 @@
 import asyncio
 import os
 import sys
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from core.mcp_scheduler.schedule_utils import compute_next_run, is_due, normalize_schedule
+from core.mcp_scheduler.schedule_utils import compute_next_run, is_due, validate_schedule_definition
 from core.shared import RemoteMCPServer, StdioMCPToolClient
+from core.shared.schema_validation import validate_json_value
 
+from .contracts import validate_scheduler_create_task_payload
 from .storage import SchedulerTaskStore, now_iso
 from .template_utils import render_value
 
@@ -19,6 +22,8 @@ class SchedulerRuntime:
         self._loop_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._run_lock = asyncio.Lock()
+        self._tool_schema_cache: Dict[str, Dict[str, Any]] = {}
+        self._tool_schema_cache_at: float = 0.0
         self.orchestrator_server = RemoteMCPServer(
             server_name="mcp_orchestrator",
             command=self._resolve_command(),
@@ -27,19 +32,6 @@ class SchedulerRuntime:
             timeout_sec=max(1, int(str(os.getenv("MCP_TIMEOUT_SEC", "30")).strip() or "30")),
         )
         self.orchestrator_client = StdioMCPToolClient(logger=logger)
-
-    def _validate_steps(self, steps: List[Dict[str, Any]]) -> None:
-        for index, step in enumerate(steps or [], start=1):
-            if not isinstance(step, dict):
-                raise ValueError(f"Task step #{index} must be an object")
-            tool_name = str(step.get("tool") or "").strip()
-            if not tool_name:
-                raise ValueError(f"Task step #{index} missing tool")
-            if tool_name.startswith("functions."):
-                raise ValueError(
-                    f"Task step #{index} tool must use the public MCP name without prefixes. "
-                    f"Got '{tool_name}'. Use names like 'gismeteo__get_current_weather' or 'telegram__send_message'."
-                )
 
     def _resolve_command(self) -> str:
         configured = str(os.getenv("MCP_SERVER_COMMAND") or "").strip()
@@ -50,11 +42,13 @@ class SchedulerRuntime:
         if os.path.exists(venv_python):
             return venv_python
         return str(sys.executable).strip() or sys.executable
+
     def _resolve_args(self) -> List[str]:
         raw = str(os.getenv("MCP_SERVER_ARGS") or "").strip()
         if raw:
             import json
             import shlex
+
             if raw.startswith("["):
                 try:
                     parsed = json.loads(raw)
@@ -68,6 +62,85 @@ class SchedulerRuntime:
                 return [raw]
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         return [os.path.join(project_root, "run_mcp_orchestrator.py")]
+
+    async def _get_orchestrator_tool_schemas(self, *, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        if not force_refresh and self._tool_schema_cache and (time.monotonic() - self._tool_schema_cache_at) < 60:
+            return dict(self._tool_schema_cache)
+
+        tools = await self.orchestrator_client.list_tools(self.orchestrator_server)
+        schemas: Dict[str, Dict[str, Any]] = {}
+        for item in tools or []:
+            name = str(getattr(item, "name", "") or (item.get("name") if isinstance(item, dict) else "")).strip()
+            if not name:
+                continue
+            schema = getattr(item, "inputSchema", None)
+            if schema is None and isinstance(item, dict):
+                schema = item.get("inputSchema") or item.get("input_schema")
+            if schema is None:
+                schema = getattr(item, "input_schema", None)
+            schemas[name] = schema if isinstance(schema, dict) else {"type": "object", "properties": {}}
+        self._tool_schema_cache = dict(schemas)
+        self._tool_schema_cache_at = time.monotonic()
+        return schemas
+
+    def _schema_required_keys(self, schema: Dict[str, Any]) -> List[str]:
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        return [str(item) for item in required if str(item) and str(item) != "trace_id"]
+
+    def _validate_step_payload_against_schema(
+        self,
+        *,
+        step: Dict[str, Any],
+        step_index: int,
+        tool_schemas: Dict[str, Dict[str, Any]],
+        rendered_arguments: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        errors: List[str] = []
+        tool_name = str(step.get("tool") or "").strip()
+        step_path = f"steps[{step_index}]"
+        schema = tool_schemas.get(tool_name)
+        if schema is None:
+            return [f"{step_path}.tool: unknown orchestrator tool '{tool_name}'"]
+
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = self._schema_required_keys(schema)
+        payload = rendered_arguments if rendered_arguments is not None else (step.get("arguments") if isinstance(step.get("arguments"), dict) else {})
+        if rendered_arguments is not None:
+            effective_payload = dict(payload or {})
+            effective_payload["trace_id"] = "runtime-trace"
+            schema_errors = validate_json_value(effective_payload, schema, path=f"{step_path}.arguments")
+            return [error.replace("runtime-trace", "<trace_id>") for error in schema_errors if "unexpected field 'trace_id'" not in error]
+
+        if not isinstance(payload, dict):
+            payload = {}
+        template_payload = step.get("arguments_template") if isinstance(step.get("arguments_template"), dict) else {}
+        provided_keys = set(payload.keys()) | set(template_payload.keys())
+        missing = [key for key in required if key not in provided_keys]
+        if missing:
+            errors.append(f"{step_path}: missing required tool arguments {', '.join(missing)}")
+
+        if schema.get("additionalProperties") is False:
+            unknown = [key for key in provided_keys if key not in properties]
+            if unknown:
+                errors.append(f"{step_path}: unexpected tool argument keys {', '.join(sorted(unknown))}")
+
+        if payload:
+            schema_errors = validate_json_value({**payload, "trace_id": "runtime-trace"}, schema, path=f"{step_path}.arguments")
+            for error in schema_errors:
+                if "missing required field" in error and any(key in error for key in required):
+                    continue
+                if "unexpected field 'trace_id'" in error:
+                    continue
+                errors.append(error.replace("runtime-trace", "<trace_id>"))
+        return errors
+
+    async def _validate_task_route(self, steps: List[Dict[str, Any]]) -> None:
+        tool_schemas = await self._get_orchestrator_tool_schemas(force_refresh=True)
+        errors: List[str] = []
+        for index, step in enumerate(steps, start=1):
+            errors.extend(self._validate_step_payload_against_schema(step=step, step_index=index, tool_schemas=tool_schemas))
+        if errors:
+            raise ValueError("Invalid task route: " + " | ".join(errors))
 
     async def start(self) -> None:
         self.logger.info("SCHEDULER_RUNTIME_START")
@@ -143,6 +216,7 @@ class SchedulerRuntime:
         steps = task.get("steps") if isinstance(task.get("steps"), list) else []
         memory = task.get("execution_memory") if isinstance(task.get("execution_memory"), dict) else {}
         run_log: List[Dict[str, Any]] = []
+        tool_schemas = await self._get_orchestrator_tool_schemas(force_refresh=True)
         self.logger.info("SCHEDULER_TASK_RUN_START", {"task_id": task_id, "trace_id": trace_id, "steps": steps})
         try:
             for index, step in enumerate(steps, start=1):
@@ -153,12 +227,22 @@ class SchedulerRuntime:
                     raise ValueError(f"Task step #{index} missing tool")
                 raw_args = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
                 raw_template = step.get("arguments_template") if isinstance(step.get("arguments_template"), dict) else None
+                if raw_template is not None and raw_args:
+                    raise ValueError(f"Task step #{index} must not define both arguments and arguments_template")
                 arguments = dict(raw_args)
                 if raw_template is not None:
                     rendered = render_value(raw_template, memory)
                     if not isinstance(rendered, dict):
                         raise ValueError(f"Task step #{index} arguments_template must render to an object")
                     arguments = rendered
+                rendered_errors = self._validate_step_payload_against_schema(
+                    step=step,
+                    step_index=index,
+                    tool_schemas=tool_schemas,
+                    rendered_arguments=arguments,
+                )
+                if rendered_errors:
+                    raise ValueError(" | ".join(rendered_errors))
                 arguments["trace_id"] = trace_id
                 self.logger.info(
                     "SCHEDULER_TASK_STEP_REQUEST",
@@ -207,15 +291,22 @@ class SchedulerRuntime:
         template_text: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        task_payload = {
+            "title": title,
+            "schedule_type": schedule_type,
+            "schedule": schedule,
+            "steps": steps,
+            "template_text": template_text,
+            "metadata": metadata or {},
+        }
+        contract_errors = validate_scheduler_create_task_payload(task_payload)
+        if contract_errors:
+            raise ValueError("Invalid scheduler task payload: " + " | ".join(contract_errors))
+
         clean_schedule_type = str(schedule_type or "").strip().lower()
-        if not clean_schedule_type:
-            raise ValueError("schedule_type is required")
-        if not isinstance(schedule, dict) or not schedule:
-            raise ValueError("schedule is required")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("steps is required and must be a non-empty list")
-        self._validate_steps(steps)
-        normalized_schedule = normalize_schedule(clean_schedule_type, schedule)
+        validated_schedule = validate_schedule_definition(clean_schedule_type, schedule)
+        await self._validate_task_route(steps)
+
         task_id = str(uuid.uuid4())
         now_value = now_iso()
         task = {
@@ -225,7 +316,7 @@ class SchedulerRuntime:
             "created_at": now_value,
             "updated_at": now_value,
             "schedule_type": clean_schedule_type,
-            "schedule": normalized_schedule,
+            "schedule": validated_schedule,
             "steps": steps,
             "template_text": str(template_text or ""),
             "metadata": dict(metadata or {}),
@@ -260,5 +351,3 @@ class SchedulerRuntime:
         if not deleted:
             raise ValueError(f"Task '{task_id}' not found")
         return {"task_id": task_id, "status": "deleted"}
-
-

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from core.LLM_API.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
-from core.agent.invariants import build_invariants_system_text, normalize_invariants_state
+from core.agent.invariants import build_invariants_state, build_invariants_system_text
 from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
 from core.agent.strategies import (
@@ -22,6 +22,8 @@ from core.agent.strategies import (
     parse_facts_and_strip_user_text,
 )
 from core.mcp import MCPClient, MCPClientError
+from core.scheduler_service.contracts import scheduler_contract_examples, validate_scheduler_create_task_payload
+from core.shared.schema_validation import validate_json_value
 
 load_dotenv(override=True)
 
@@ -287,8 +289,10 @@ class LLMAgentServer:
         session["active_branch"] = bid
         return bid
 
-    def _normalize_tool_result_for_history(self, payload: Dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+    def _serialize_tool_result_for_history(self, payload: Dict[str, Any]) -> str:
+        if isinstance(payload, dict):
+            return json.dumps(payload, ensure_ascii=False)
+        return str(payload)
 
     def _sync_short_term_from_history(self, memory_layers: Dict[str, Any], history: List[Dict[str, Any]], keep_last_items: int = 12) -> None:
         recent: List[str] = []
@@ -408,34 +412,90 @@ class LLMAgentServer:
         lines = [
             "[TOOLS_POLICY]\n"
             "- Use a tool only when it materially helps answer the user.\n"
-            "- Never invent required arguments.\n"
+            "- Never invent required arguments or extra keys.\n"
             "- If a required argument is missing, ask a clarifying question instead of calling the tool.\n"
-            "- Use tool names exactly as provided.\n"
+            "- Use tool names exactly as published by MCP.\n"
+            "- Tool arguments must be a strict JSON object that matches the tool schema.\n"
             "- If a tool returns an error, explain the error briefly and ask only for the missing concrete data."
         ]
-        tool_names = {str(getattr(tool, "name", "") or "").strip() for tool in tools}
-        if "scheduler__get_scheduler_hints" in tool_names:
-            lines.append("- If you need the scheduler task payload format, call scheduler__get_scheduler_hints.")
+        if any(str(getattr(tool, "name", "") or "") == "scheduler__create_task" for tool in tools):
+            examples = scheduler_contract_examples()
+            lines.extend([
+                "[SCHEDULER_CREATE_TASK_CONTRACT]",
+                "- If you are not fully sure, call scheduler__get_scheduler_hints before scheduler__create_task.",
+                "- scheduler__create_task accepts only title, schedule_type, schedule, steps, optional template_text, metadata.",
+                "- Each steps item accepts only tool, arguments, arguments_template, save_result_as.",
+                "- Never send recipient_name, parameters, functions.* prefixes or strings like {result.steps.0.summary}.",
+                f"- Canonical interval example: {json.dumps(examples['interval'], ensure_ascii=False)}",
+            ])
         return "\n".join(lines)
 
     def _augment_validation_error(self, tool_name: str, error_payload: Dict[str, Any]) -> Dict[str, Any]:
-        name = str(tool_name or "").strip()
-        if name != "scheduler__create_task":
+        if str(tool_name or "").strip() != "scheduler__create_task":
             return error_payload
-        message = str(error_payload.get("message") or "").strip()
-        hint = (
-            " scheduler__create_task requires schedule_type, schedule and steps. "
-            "Example interval schedule: {'every':10,'unit':'minutes'}. "
-            "Example once schedule: {'run_at':'2026-03-12 18:30'}. "
-            "steps must be a non-empty list like [{'tool':'gismeteo__get_current_weather','save_result_as':'weather'}]. "
-            "In scheduler steps, use the exact public MCP tool name without prefixes like 'functions.'."
+        examples = scheduler_contract_examples()
+        payload = dict(error_payload)
+        payload["message"] = (
+            str(error_payload.get("message") or "Invalid scheduler payload.")
+            + " scheduler__create_task must use schedule_type + schedule + steps. "
+            + "steps must be a plain list of {tool, arguments|arguments_template, save_result_as}. "
+            + f"Canonical example: {json.dumps(examples['interval'], ensure_ascii=False)}"
         )
-        error_payload = dict(error_payload)
-        error_payload["message"] = message + hint
-        return error_payload
+        return payload
+
+    def _validate_scheduler_step_routes(self, scheduler_args: Dict[str, Any], tools: List[Any]) -> Optional[Dict[str, Any]]:
+        tool_map = {str(getattr(tool, "name", "") or ""): tool for tool in tools}
+        errors: List[str] = []
+        steps = scheduler_args.get("steps") if isinstance(scheduler_args.get("steps"), list) else []
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            step_tool_name = str(step.get("tool") or "").strip()
+            step_tool = tool_map.get(step_tool_name)
+            if step_tool is None:
+                errors.append(f"steps[{index}].tool unknown tool '{step_tool_name}'")
+                continue
+            schema = step_tool.input_schema if isinstance(step_tool.input_schema, dict) else {}
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+            required = [str(item) for item in (schema.get("required") if isinstance(schema.get("required"), list) else []) if str(item) != "trace_id"]
+            arguments = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
+            arguments_template = step.get("arguments_template") if isinstance(step.get("arguments_template"), dict) else {}
+            provided_keys = set(arguments.keys()) | set(arguments_template.keys())
+            missing = [key for key in required if key not in provided_keys]
+            if missing:
+                errors.append(f"steps[{index}] missing required nested tool arguments: {', '.join(missing)}")
+            if schema.get("additionalProperties") is False:
+                unknown_keys = [key for key in provided_keys if key not in properties]
+                if unknown_keys:
+                    errors.append(f"steps[{index}] unexpected nested tool arguments: {', '.join(sorted(unknown_keys))}")
+            if arguments:
+                schema_errors = validate_json_value({**arguments, "trace_id": "nested-trace"}, schema, path=f"$.steps[{index}].arguments")
+                for error in schema_errors:
+                    if "missing required field" in error and any(key in error for key in required):
+                        continue
+                    if "unexpected field 'trace_id'" in error:
+                        continue
+                    errors.append(error.replace("nested-trace", "<trace_id>"))
+        if errors:
+            return {
+                "is_error": True,
+                "error_type": "invalid_scheduler_step_route",
+                "message": " | ".join(errors),
+                "tool_name": "scheduler__create_task",
+                "arguments": scheduler_args,
+            }
+        return None
 
     def _validate_tool_arguments(self, tool_name: str, tool_args: Dict[str, Any], tools: List[Any]) -> Optional[Dict[str, Any]]:
         name = str(tool_name or "").strip()
+        if not isinstance(tool_args, dict):
+            return {
+                "is_error": True,
+                "error_type": "invalid_tool_arguments_type",
+                "message": f"Tool '{name}' arguments must be a JSON object.",
+                "tool_name": name,
+                "arguments": tool_args,
+            }
         match = next((tool for tool in tools if str(getattr(tool, "name", "") or "") == name), None)
         if match is None:
             return {
@@ -446,20 +506,33 @@ class LLMAgentServer:
                 "arguments": tool_args,
             }
 
+        if name == "scheduler__create_task":
+            scheduler_errors = validate_scheduler_create_task_payload(tool_args)
+            if scheduler_errors:
+                return self._augment_validation_error(name, {
+                    "is_error": True,
+                    "error_type": "invalid_scheduler_task_payload",
+                    "message": " | ".join(scheduler_errors),
+                    "tool_name": name,
+                    "arguments": tool_args,
+                })
+            nested_route_error = self._validate_scheduler_step_routes(tool_args, tools)
+            if nested_route_error is not None:
+                return self._augment_validation_error(name, nested_route_error)
+
         schema = match.input_schema if isinstance(match.input_schema, dict) else {}
-        required = schema.get("required") if isinstance(schema.get("required"), list) else []
-        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        missing = [key for key in required if str(tool_args.get(key) or "").strip() == ""]
-        if missing:
+        schema_errors = validate_json_value(tool_args, schema, path="$") if schema else []
+        if schema_errors:
             return self._augment_validation_error(name, {
                 "is_error": True,
-                "error_type": "missing_required_arguments",
-                "message": f"Missing required tool arguments: {', '.join(missing)}.",
+                "error_type": "schema_validation_error",
+                "message": " | ".join(schema_errors),
                 "tool_name": name,
                 "arguments": tool_args,
-                "required": required,
+                "required": schema.get("required") if isinstance(schema.get("required"), list) else [],
             })
 
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         placeholders = {
             "owner", "repo", "username", "organization", "org", "branch", "tag", "query", "path", "sha",
             "owner_name", "repo_name", "your_repo", "your_owner", "example", "value",
@@ -489,7 +562,7 @@ class LLMAgentServer:
                 "message": f"Tool arguments look like placeholders or invented values: {', '.join(descriptions)}.",
                 "tool_name": name,
                 "arguments": tool_args,
-                "required": required,
+                "required": schema.get("required") if isinstance(schema.get("required"), list) else [],
             }
         return None
 
@@ -811,7 +884,7 @@ class LLMAgentServer:
             if isinstance(profile, dict):
                 profile_description = str(profile.get("description") or "")
         profile_system_text = self._build_profile_system_text(active_profile, profile_description) if use_profile else None
-        invariants_state = normalize_invariants_state(self.profile_store.get_invariants_state())
+        invariants_state = build_invariants_state(self.profile_store.get_invariants_state())
         invariants_text = build_invariants_system_text(
             invariants_state.get("invariants") or {},
             invariants_state.get("invariant_policy") or {},
@@ -887,13 +960,31 @@ class LLMAgentServer:
                 for tool_call in tool_calls:
                     tool_name = str((tool_call.get("function") or {}).get("name") or "").strip()
                     raw_args = str((tool_call.get("function") or {}).get("arguments") or "{}")
+                    validation_error = None
                     try:
-                        tool_args = json.loads(raw_args) if raw_args.strip() else {}
-                        if not isinstance(tool_args, dict):
-                            tool_args = {"value": tool_args}
+                        parsed_args = json.loads(raw_args) if raw_args.strip() else {}
                     except Exception as e:
-                        tool_args = {"_raw_arguments": raw_args, "_parse_error": str(e)}
-                    validation_error = self._validate_tool_arguments(tool_name, tool_args, mcp_tools)
+                        tool_args = {}
+                        validation_error = {
+                            "is_error": True,
+                            "error_type": "invalid_tool_arguments_json",
+                            "message": f"Tool '{tool_name}' arguments must be valid JSON object: {e}",
+                            "tool_name": tool_name,
+                            "raw_arguments": raw_args,
+                        }
+                    else:
+                        if not isinstance(parsed_args, dict):
+                            tool_args = {}
+                            validation_error = {
+                                "is_error": True,
+                                "error_type": "invalid_tool_arguments_type",
+                                "message": f"Tool '{tool_name}' arguments must decode to a JSON object, got {type(parsed_args).__name__}.",
+                                "tool_name": tool_name,
+                                "raw_arguments": raw_args,
+                            }
+                        else:
+                            tool_args = parsed_args
+                            validation_error = self._validate_tool_arguments(tool_name, tool_args, mcp_tools)
                     await self._send_task_signal(writer, "tool_call", f"Вызов инструмента {tool_name}", {"tool_name": tool_name, "arguments": tool_args, "iteration": loop_guard})
                     try:
                         if validation_error is not None:
@@ -907,7 +998,7 @@ class LLMAgentServer:
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.get("id"),
-                        "content": self._normalize_tool_result_for_history(tool_result),
+                        "content": self._serialize_tool_result_for_history(tool_result),
                     }
                     working_messages.append(tool_message)
                     history.append(tool_message)

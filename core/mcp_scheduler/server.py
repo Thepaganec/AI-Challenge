@@ -49,6 +49,7 @@ def create_mcp_server() -> FastMCP:
         name="scheduler-mcp",
         instructions=(
             "Scheduler control MCP server. It manages scheduler tasks, routes, task memory and task status. "
+            "Use the exact create_task contract and never send recipient_name/parameters/functions.* step payloads. "
             "The runtime that executes schedules is a separate service."
         ),
         log_level="INFO",
@@ -106,8 +107,9 @@ def create_mcp_server() -> FastMCP:
             "summary": (
                 "Use this format when creating scheduler tasks. "
                 "A task stores schedule_type, schedule and a linear list of steps. "
-                "Each step calls an orchestrator-exposed tool by its public name, can save the result, "
-                "and later steps can use arguments_template with {{memory_key.field}} placeholders."
+                "Each step must use only tool, arguments, arguments_template, save_result_as. "
+                "Never send recipient_name, parameters or functions.* prefixes. "
+                "Later steps can use arguments_template with {{memory_key.field}} placeholders."
             ),
             "schedule_examples": {
                 "interval": {"every": 10, "unit": "minutes"},

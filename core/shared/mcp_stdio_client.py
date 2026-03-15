@@ -79,11 +79,11 @@ class StdioMCPToolClient:
             self._log("error", "REMOTE_MCP_CALL_ERROR", error_payload)
             raise RemoteMCPError(str(e)) from e
 
-        normalized = self._normalize_tool_result(response)
-        self._log("info", "REMOTE_MCP_CALL_RESPONSE", {"server": server.server_name, "tool": tool_name, "result": normalized})
-        return normalized
+        decoded = self._decode_tool_result(response)
+        self._log("info", "REMOTE_MCP_CALL_RESPONSE", {"server": server.server_name, "tool": tool_name, "result": decoded})
+        return decoded
 
-    def _normalize_tool_result(self, response: Any) -> Dict[str, Any]:
+    def _decode_tool_result(self, response: Any) -> Dict[str, Any]:
         if isinstance(response, dict):
             return response
 
@@ -119,11 +119,11 @@ class StdioMCPToolClient:
         if content is not None:
             return {
                 "is_error": is_error,
-                "content": self._normalize_content_blocks(content),
+                "content": self._decode_content_blocks(content),
             }
         return {"is_error": is_error, "content": str(response)}
 
-    def _normalize_content_blocks(self, content: Any) -> List[Dict[str, Any]]:
+    def _decode_content_blocks(self, content: Any) -> List[Dict[str, Any]]:
         blocks: List[Dict[str, Any]] = []
         if not isinstance(content, list):
             if content is None:

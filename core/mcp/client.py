@@ -5,6 +5,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from core.scheduler_service.contracts import scheduler_create_task_input_schema
 from core.shared import RemoteMCPError, RemoteMCPServer, StdioMCPToolClient
 
 
@@ -153,6 +154,8 @@ class MCPClient:
                 schema = item.get("inputSchema") or item.get("input_schema")
             if schema is None:
                 schema = getattr(item, "input_schema", None)
+            if name == "scheduler__create_task":
+                schema = scheduler_create_task_input_schema()
             tools.append(MCPTool(name=name, description=description, input_schema=schema if isinstance(schema, dict) else {}))
         self._log("info", "MCP_TOOLS_LIST", {"tools": [tool.name for tool in tools]})
         return tools
