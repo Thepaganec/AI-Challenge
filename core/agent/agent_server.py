@@ -406,6 +406,51 @@ class LLMAgentServer:
     def _serialize_mcp_tools(self, tools: List[Any]) -> List[Dict[str, Any]]:
         return [{"name": tool.name, "description": tool.description, "input_schema": tool.input_schema} for tool in tools]
 
+    def _is_scheduler_task_intent(self, user_text: str) -> bool:
+        clean = str(user_text or "").strip().lower()
+        if not clean:
+            return False
+        scheduler_markers = (
+            "кажд", "каждую", "каждый", "ежеднев", "еженед", "раз в", "по распис", "расписан",
+            "запланир", "планировщ", "создай зада", "создай напомин", "напомин", "автоматически",
+            "регулярно", "через кажды", "разово в", "выполняй",
+        )
+        action_markers = ("отправ", "присыл", "шли", "уведом", "погод")
+        return any(marker in clean for marker in scheduler_markers) and any(marker in clean for marker in action_markers)
+
+    def _build_scheduler_task_protocol(self, user_text: str, tools: List[Any]) -> Optional[str]:
+        if not self._is_scheduler_task_intent(user_text):
+            return None
+        if not any(str(getattr(tool, "name", "") or "") == "scheduler__create_task" for tool in tools):
+            return None
+        examples = scheduler_contract_examples()
+        return "\n".join([
+            "[ACTIVE_TASK_PROTOCOL]",
+            "Current user request is a scheduler/task-creation request.",
+            "Your primary goal is to create a scheduler task, not to satisfy the request with one-off tool calls.",
+            "Allowed next actions:",
+            "1. Ask a clarifying question if schedule or required delivery data is missing.",
+            "2. Call scheduler__get_scheduler_hints if you are unsure about payload shape.",
+            "3. Call scheduler__create_task with the exact canonical schema once payload is fully known.",
+            "Forbidden while handling this request:",
+            "- Do not call gismeteo__get_current_weather or telegram__send_message as a substitute for creating the scheduler task.",
+            "- Do not use functions.* prefixes in scheduler steps.",
+            "- Do not put message templates into top-level template_text.",
+            "- Put templated chat_id/text into steps[*].arguments_template only.",
+            f"Canonical interval example: {json.dumps(examples['interval'], ensure_ascii=False)}",
+        ])
+
+    def _build_scheduler_repair_instruction(self, error_payload: Dict[str, Any]) -> str:
+        examples = scheduler_contract_examples()
+        return "\n".join([
+            "[SCHEDULER_REPAIR_PROTOCOL]",
+            "Your previous scheduler__create_task call was rejected.",
+            f"Validation error: {str(error_payload.get('message') or '').strip()}",
+            "You must repair the scheduler payload and retry scheduler__create_task, or call scheduler__get_scheduler_hints if any field shape is still unclear.",
+            "Do not switch to one-off business tool calls.",
+            f"Canonical interval example: {json.dumps(examples['interval'], ensure_ascii=False)}",
+        ])
+
     def _build_tool_usage_instruction(self, tools: List[Any]) -> Optional[str]:
         if not tools:
             return None
@@ -892,7 +937,9 @@ class LLMAgentServer:
         await self._send_task_signal(writer, "tools", "Получаю список инструментов MCP")
         mcp_tools, mcp_info = await self._get_mcp_tools()
         tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
-        system_text = self._merge_system_text(memory_system_text, profile_system_text, system_text, invariants_text, tools_policy_text)
+        scheduler_task_protocol = self._build_scheduler_task_protocol(user_text, mcp_tools)
+        scheduler_task_mode = bool(scheduler_task_protocol)
+        system_text = self._merge_system_text(memory_system_text, profile_system_text, system_text, invariants_text, tools_policy_text, scheduler_task_protocol)
         working_messages = self._build_messages_for_llm(system_text=system_text, history_for_llm=history_for_llm, user_text=user_text_for_api)
         self._log(
             "INFO",
@@ -1002,6 +1049,12 @@ class LLMAgentServer:
                     }
                     working_messages.append(tool_message)
                     history.append(tool_message)
+                    if scheduler_task_mode and tool_name == "scheduler__create_task" and bool(tool_result.get("is_error")):
+                        repair_message = {
+                            "role": "system",
+                            "content": self._build_scheduler_repair_instruction(tool_result),
+                        }
+                        working_messages.append(repair_message)
                     await self._send_task_signal(writer, "tool_result", f"Инструмент {tool_name} завершён", {"tool_name": tool_name, "result": tool_result, "iteration": loop_guard})
                     event = {"tool_call": tool_call, "tool_result": tool_result}
                     tool_events.append(event)

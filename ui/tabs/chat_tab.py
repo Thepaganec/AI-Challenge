@@ -1694,7 +1694,18 @@ class ChatTab(BaseTab):
             self.metrics_box.append(line)
 
             tool_errors = []
-            for event in tool_events if isinstance(tool_events, list) else []:
+            successful_tools = set()
+            normalized_events = tool_events if isinstance(tool_events, list) else []
+            for event in normalized_events:
+                if not isinstance(event, dict):
+                    continue
+                tool_call = event.get("tool_call") if isinstance(event.get("tool_call"), dict) else {}
+                tool_result = event.get("tool_result") if isinstance(event.get("tool_result"), dict) else {}
+                tool_name = str((tool_call.get("function") or {}).get("name") or tool_result.get("tool_name") or "").strip()
+                if tool_name and not bool(tool_result.get("is_error")):
+                    successful_tools.add(tool_name)
+
+            for event in normalized_events:
                 if not isinstance(event, dict):
                     continue
                 tool_call = event.get("tool_call") if isinstance(event.get("tool_call"), dict) else {}
@@ -1702,6 +1713,8 @@ class ChatTab(BaseTab):
                 if not bool(tool_result.get("is_error")):
                     continue
                 tool_name = str((tool_call.get("function") or {}).get("name") or tool_result.get("tool_name") or "").strip()
+                if tool_name and tool_name in successful_tools:
+                    continue
                 tool_message = str(tool_result.get("message") or tool_result.get("error") or "tool error").strip()
                 tool_errors.append(f"{tool_name}: {tool_message}" if tool_name else tool_message)
 
