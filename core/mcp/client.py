@@ -171,4 +171,3 @@ class MCPClient:
             raise MCPClientError(str(e)) from e
         self._log("info", "MCP_TOOL_CALL_RESULT", {"name": tool_name, "result": result})
         return result
-

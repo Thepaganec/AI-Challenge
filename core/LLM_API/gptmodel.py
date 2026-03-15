@@ -1,9 +1,11 @@
+import asyncio
 import json
 import os
 import re
 import time
+import inspect
 from html import unescape
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 
@@ -28,6 +30,8 @@ class GPTModel:
         self.timeout_sec = timeout_sec
         self.logger = logger
         self.last_usage: Dict[str, Any] = {}
+        self.last_message: Dict[str, Any] = {}
+        self.last_finish_reason: str = ""
 
     def _mask_api_key(self, value: str) -> str:
         token = str(value or "")
@@ -126,7 +130,7 @@ class GPTModel:
             sanitized.append(entry)
         return sanitized
 
-    async def chat_completion(
+    async def _stream_chat_completion(
         self,
         *,
         messages: List[Dict[str, Any]],
@@ -136,129 +140,8 @@ class GPTModel:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: str = "auto",
         trace_id: Optional[str] = None,
+        on_text_chunk: Optional[Callable[[str], Any]] = None,
     ) -> Dict[str, Any]:
-        selected_model = model or self.model
-        url = f"{self.base_url}/chat/completions"
-        payload: Dict[str, Any] = {
-            "model": selected_model,
-            "messages": self._sanitize_messages(messages),
-            "stream": False,
-            "max_completion_tokens": int(max_tokens),
-        }
-        if temperature is not None and float(temperature) != 1.0:
-            payload["temperature"] = float(temperature)
-        if isinstance(tools, list) and tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = tool_choice or "auto"
-
-        timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
-        t0 = time.perf_counter()
-        self._log_struct(
-            "INFO",
-            "GPTMODEL_API_REQUEST",
-            {
-                "req_id": trace_id,
-                "endpoint": "chat",
-                "url": url,
-                "headers": {
-                    "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
-                    "Content-Type": "application/json",
-                },
-                "payload": payload,
-            },
-        )
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=self._headers(), json=payload) as resp:
-                body_text = await resp.text()
-                self._log_struct(
-                    "INFO",
-                    "GPTMODEL_API_RESPONSE_META",
-                    {
-                        "req_id": trace_id,
-                        "endpoint": "chat",
-                        "status": int(resp.status),
-                        "ok": bool(200 <= int(resp.status) < 300),
-                    },
-                )
-                if resp.status < 200 or resp.status >= 300:
-                    self._log_struct(
-                        "ERROR",
-                        "GPTMODEL_API_RESPONSE_ERROR",
-                        {"req_id": trace_id, "endpoint": "chat", "status": int(resp.status), "body": body_text},
-                    )
-                    raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
-                data = json.loads(body_text)
-
-        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        self.last_usage = usage
-        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-        message = {}
-        finish_reason = ""
-        if choices:
-            choice0 = choices[0] if isinstance(choices[0], dict) else {}
-            message = choice0.get("message") if isinstance(choice0.get("message"), dict) else {}
-            finish_reason = str(choice0.get("finish_reason") or "")
-
-        normalized_message = {
-            "role": str(message.get("role") or "assistant"),
-            "content": message.get("content"),
-        }
-        if isinstance(message.get("tool_calls"), list):
-            normalized_message["tool_calls"] = message.get("tool_calls")
-
-        self._log_struct(
-            "INFO",
-            "GPTMODEL_API_RESPONSE",
-            {
-                "req_id": trace_id,
-                "endpoint": "chat",
-                "duration_sec": round(time.perf_counter() - t0, 3),
-                "usage": usage,
-                "finish_reason": finish_reason,
-                "message": normalized_message,
-                "reasoning": data.get("reasoning"),
-            },
-        )
-        return {
-            "message": normalized_message,
-            "usage": usage,
-            "finish_reason": finish_reason,
-            "raw": data,
-        }
-
-    async def complete_text(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        max_tokens: int = 512,
-        temperature: Optional[float] = None,
-        trace_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        result = await self.chat_completion(
-            messages=messages,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            trace_id=trace_id,
-        )
-        message = result.get("message") if isinstance(result.get("message"), dict) else {}
-        return {
-            "text": str(message.get("content") or ""),
-            "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
-            "raw": result.get("raw"),
-        }
-
-    async def stream_messages(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        max_tokens: int = 512,
-        temperature: Optional[float] = None,
-        trace_id: Optional[str] = None,
-    ) -> AsyncIterator[str]:
         selected_model = model or self.model
         payload: Dict[str, Any] = {
             "model": selected_model,
@@ -269,14 +152,21 @@ class GPTModel:
         }
         if temperature is not None and float(temperature) != 1.0:
             payload["temperature"] = float(temperature)
+        if isinstance(tools, list) and tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
 
         url = f"{self.base_url}/chat/completions"
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
         t0 = time.perf_counter()
-        chunks = 0
         chars_out = 0
+        content_parts: List[str] = []
         preview_parts: List[str] = []
         self.last_usage = {}
+        finish_reason = ""
+        role = "assistant"
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+
         self._log_struct(
             "INFO",
             "GPTMODEL_API_REQUEST",
@@ -331,17 +221,61 @@ class GPTModel:
                     choices = obj.get("choices") if isinstance(obj.get("choices"), list) else []
                     if not choices:
                         continue
-                    delta = choices[0].get("delta") if isinstance(choices[0], dict) else {}
+                    choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                    finish_reason = str(choice0.get("finish_reason") or finish_reason or "")
+                    delta = choice0.get("delta") if isinstance(choice0.get("delta"), dict) else {}
                     if not isinstance(delta, dict):
                         continue
+
+                    delta_role = str(delta.get("role") or "").strip()
+                    if delta_role:
+                        role = delta_role
+
                     content = delta.get("content")
-                    if not content:
-                        continue
-                    chunks += 1
-                    chars_out += len(content)
-                    if len("".join(preview_parts)) < 4000:
-                        preview_parts.append(content)
-                    yield content
+                    if content:
+                        text_chunk = str(content)
+                        chars_out += len(text_chunk)
+                        content_parts.append(text_chunk)
+                        if len("".join(preview_parts)) < 4000:
+                            preview_parts.append(text_chunk)
+                        if callable(on_text_chunk):
+                            result = on_text_chunk(text_chunk)
+                            if inspect.isawaitable(result):
+                                await result
+
+                    tool_deltas = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []
+                    for tool_delta in tool_deltas:
+                        if not isinstance(tool_delta, dict):
+                            continue
+                        try:
+                            index = int(tool_delta.get("index") or 0)
+                        except Exception:
+                            index = 0
+                        current = tool_calls_by_index.setdefault(
+                            index,
+                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                        )
+                        item_id = str(tool_delta.get("id") or "")
+                        if item_id:
+                            current["id"] = item_id
+                        item_type = str(tool_delta.get("type") or "").strip()
+                        if item_type:
+                            current["type"] = item_type
+                        function = tool_delta.get("function") if isinstance(tool_delta.get("function"), dict) else {}
+                        function_name = str(function.get("name") or "")
+                        if function_name:
+                            current["function"]["name"] += function_name
+                        function_args = function.get("arguments")
+                        if function_args:
+                            current["function"]["arguments"] += str(function_args)
+
+        tool_calls: List[Dict[str, Any]] = [tool_calls_by_index[idx] for idx in sorted(tool_calls_by_index.keys())]
+        normalized_message: Dict[str, Any] = {
+            "role": role or "assistant",
+            "content": "".join(content_parts),
+        }
+        if tool_calls:
+            normalized_message["tool_calls"] = tool_calls
 
         self._log_struct(
             "INFO",
@@ -350,37 +284,85 @@ class GPTModel:
                 "req_id": trace_id,
                 "endpoint": "chat_stream",
                 "duration_sec": round(time.perf_counter() - t0, 3),
-                "chunks": chunks,
                 "chars_out": chars_out,
                 "usage": self.last_usage,
+                "finish_reason": finish_reason,
+                "tool_calls": tool_calls,
                 "response_preview": "".join(preview_parts)[:4000],
             },
         )
+        return {
+            "message": normalized_message,
+            "usage": dict(self.last_usage or {}),
+            "finish_reason": finish_reason,
+        }
 
     async def stream_chat(
         self,
-        user_text: str,
+        user_text: Optional[str] = None,
         system_text: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
         max_tokens: int = 512,
         model: Optional[str] = None,
         endpoint: str = "chat",
         temperature: Optional[float] = None,
         include_usage: bool = True,
         trace_id: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
     ) -> AsyncIterator[str]:
-        messages: List[Dict[str, Any]] = []
-        if system_text:
-            messages.append({"role": "system", "content": system_text})
-        for item in history or []:
-            if isinstance(item, dict):
-                messages.append(dict(item))
-        messages.append({"role": "user", "content": user_text})
-        async for chunk in self.stream_messages(
-            messages=messages,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            trace_id=trace_id,
-        ):
-            yield chunk
+        request_messages: List[Dict[str, Any]] = []
+        if isinstance(messages, list) and messages:
+            request_messages = [dict(item) for item in messages if isinstance(item, dict)]
+        else:
+            if system_text:
+                request_messages.append({"role": "system", "content": system_text})
+            for item in history or []:
+                if isinstance(item, dict):
+                    request_messages.append(dict(item))
+            request_messages.append({"role": "user", "content": user_text or ""})
+
+        self.last_usage = {}
+        self.last_message = {}
+        self.last_finish_reason = ""
+
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        sentinel = object()
+
+        async def _on_chunk(chunk: str) -> None:
+            await queue.put(chunk)
+
+        async def _runner() -> None:
+            try:
+                result = await self._stream_chat_completion(
+                    messages=request_messages,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    trace_id=trace_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    on_text_chunk=_on_chunk,
+                )
+                self.last_message = result.get("message") if isinstance(result.get("message"), dict) else {}
+                self.last_usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+                self.last_finish_reason = str(result.get("finish_reason") or "")
+            finally:
+                await queue.put(sentinel)
+
+        task = asyncio.create_task(_runner())
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                yield str(item)
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass

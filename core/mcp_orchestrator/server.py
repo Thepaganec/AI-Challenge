@@ -16,6 +16,7 @@ load_dotenv(override=True)
 @dataclass
 class ToolRoute:
     public_name: str
+    logical_name: str
     source_name: str
     service_name: str
     description: str
@@ -27,16 +28,18 @@ class OrchestratorRuntime:
         self.registry = registry
         self.logger = logger
         self.client = StdioMCPToolClient(logger=logger)
-        self.routes: Dict[str, ToolRoute] = {}
+        self.routes_by_public: Dict[str, ToolRoute] = {}
+        self.routes_by_logical: Dict[str, ToolRoute] = {}
         self.service_map: Dict[str, ServiceRegistryEntry] = {entry.public_name: entry for entry in registry}
 
     async def load_routes(self) -> List[ToolRoute]:
-        routes: Dict[str, ToolRoute] = {}
+        public_routes: Dict[str, ToolRoute] = {}
+        logical_routes: Dict[str, ToolRoute] = {}
         for entry in self.registry:
             tools = await self.client.list_tools(entry.server)
             for tool in tools:
-                name = str(getattr(tool, "name", "") or (tool.get("name") if isinstance(tool, dict) else "")).strip()
-                if not name:
+                source_name = str(getattr(tool, "name", "") or (tool.get("name") if isinstance(tool, dict) else "")).strip()
+                if not source_name:
                     continue
                 source_description = str(
                     getattr(tool, "description", "") or (tool.get("description") if isinstance(tool, dict) else "")
@@ -46,29 +49,47 @@ class OrchestratorRuntime:
                     schema = tool.get("inputSchema") or tool.get("input_schema")
                 if schema is None:
                     schema = getattr(tool, "input_schema", None)
-                public_name = name if name.startswith(f"{entry.public_name}.") else f"{entry.public_name}.{name}"
-                description = f"Tool from {entry.public_name} MCP server. {source_description}".strip()
-                routes[public_name] = ToolRoute(
+                logical_name = f"{entry.public_name}.{source_name}"
+                public_name = f"{entry.public_name}__{source_name}"
+                description = f"{entry.public_name}: {source_description}".strip()
+                route = ToolRoute(
                     public_name=public_name,
-                    source_name=name,
+                    logical_name=logical_name,
+                    source_name=source_name,
                     service_name=entry.public_name,
                     description=description,
                     input_schema=schema if isinstance(schema, dict) else {"type": "object", "properties": {}},
                 )
-        self.routes = routes
+                public_routes[public_name] = route
+                logical_routes[logical_name] = route
+        self.routes_by_public = public_routes
+        self.routes_by_logical = logical_routes
         self.logger.info(
             "ORCHESTRATOR_ROUTES_READY",
             {
                 "services": [entry.public_name for entry in self.registry],
-                "tools": [name for name in sorted(routes.keys())],
+                "tools": [name for name in sorted(public_routes.keys())],
             },
         )
-        return [routes[name] for name in sorted(routes.keys())]
+        return [public_routes[name] for name in sorted(public_routes.keys())]
 
-    async def call_tool(self, public_tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        route = self.routes.get(public_tool_name)
-        if route is None:
-            raise ValueError(f"Unknown orchestrated tool: {public_tool_name}")
+    def _resolve_route(self, tool_name: str) -> ToolRoute:
+        clean = str(tool_name or "").strip()
+        route = self.routes_by_public.get(clean)
+        if route is not None:
+            return route
+        route = self.routes_by_logical.get(clean)
+        if route is not None:
+            return route
+        if "__" in clean and "." not in clean:
+            fallback = clean.replace("__", ".", 1)
+            route = self.routes_by_logical.get(fallback)
+            if route is not None:
+                return route
+        raise ValueError(f"Unknown orchestrated tool: {clean}")
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        route = self._resolve_route(tool_name)
         entry = self.service_map.get(route.service_name)
         if entry is None:
             raise ValueError(f"Service '{route.service_name}' is not registered")
@@ -82,7 +103,8 @@ class OrchestratorRuntime:
             "ORCHESTRATOR_TOOL_REQUEST",
             {
                 "service": route.service_name,
-                "public_tool_name": public_tool_name,
+                "public_tool_name": route.public_name,
+                "logical_tool_name": route.logical_name,
                 "source_tool_name": route.source_name,
                 "trace_id": trace_id,
                 "arguments": payload,
@@ -93,7 +115,8 @@ class OrchestratorRuntime:
             "ORCHESTRATOR_TOOL_RESPONSE",
             {
                 "service": route.service_name,
-                "public_tool_name": public_tool_name,
+                "public_tool_name": route.public_name,
+                "logical_tool_name": route.logical_name,
                 "source_tool_name": route.source_name,
                 "trace_id": trace_id,
                 "result": result,
@@ -145,34 +168,12 @@ def _build_proxy_function(route: ToolRoute, runtime: OrchestratorRuntime, logger
     for name in ordered_names:
         param_name = _safe_param_name(name)
         is_required = name in required and name != "trace_id"
-        if is_required:
-            params.append(f"{param_name}")
-        else:
-            params.append(f"{param_name}=None")
+        params.append(param_name if is_required else f"{param_name}=None")
         payload_lines.append(f'        "{name}": {param_name},')
 
     params_code = ", ".join(params) if params else ""
     payload_code = "\n".join(payload_lines)
-    fn_code = f'''async def generated_proxy({params_code}):
-    payload = {{
-{payload_code}
-    }}
-    payload = {{key: value for key, value in payload.items() if value is not None}}
-    try:
-        return await runtime.call_tool("{route.public_name}", payload)
-    except Exception as e:
-        error = {{
-            "ok": False,
-            "is_error": True,
-            "error_type": "orchestrator_routing_error",
-            "service": "{route.service_name}",
-            "tool": "{route.public_name}",
-            "message": str(e),
-            "trace_id": str(payload.get("trace_id") or ""),
-        }}
-        logger.error("ORCHESTRATOR_TOOL_ERROR", error)
-        return error
-'''
+    fn_code = f"async def generated_proxy({params_code}):\n    payload = {{\n{payload_code}\n    }}\n    payload = {{key: value for key, value in payload.items() if value is not None}}\n    try:\n        return await runtime.call_tool('{route.public_name}', payload)\n    except Exception as e:\n        error = {{'ok': False, 'is_error': True, 'error_type': 'orchestrator_routing_error', 'service': '{route.service_name}', 'tool': '{route.public_name}', 'message': str(e), 'trace_id': str(payload.get('trace_id') or '')}}\n        logger.error('ORCHESTRATOR_TOOL_ERROR', error)\n        return error\n"
     namespace = {"runtime": runtime, "logger": logger}
     exec(fn_code, namespace)
     generated = namespace["generated_proxy"]
@@ -182,8 +183,8 @@ def _build_proxy_function(route: ToolRoute, runtime: OrchestratorRuntime, logger
         schema_row = properties.get(name) if isinstance(properties.get(name), dict) else {}
         generated.__annotations__[param_name] = _schema_type_to_annotation(schema_row.get("type") if isinstance(schema_row, dict) else "string")
     generated.__annotations__["return"] = dict
-    generated.__name__ = route.public_name.replace('.', '_')
-    generated.__qualname__ = generated.__name__
+    generated.__name__ = route.public_name
+    generated.__qualname__ = route.public_name
     generated.__doc__ = route.description
     return generated
 
@@ -197,10 +198,7 @@ async def build_mcp_server() -> Tuple[FastMCP, OrchestratorRuntime]:
 
     mcp = FastMCP(
         name="mcp-orchestrator",
-        instructions=(
-            "Unified MCP orchestrator. All tools exposed here are routed to their underlying MCP service based on a registry. "
-            "Tool names are namespaced by service name and descriptions indicate the source MCP server."
-        ),
+        instructions="Routes tools from registered MCP services.",
         log_level="INFO",
     )
 

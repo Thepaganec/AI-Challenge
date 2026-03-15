@@ -99,11 +99,55 @@ def create_mcp_server() -> FastMCP:
             "last_error": task.get("last_error") or "",
         }
 
+    async def _get_scheduler_hints(trace_id: str = "") -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "trace_id": trace_id,
+            "summary": (
+                "Use this format when creating scheduler tasks. "
+                "A task stores schedule_type, schedule and a linear list of steps. "
+                "Each step calls an orchestrator-exposed tool by its public name, can save the result, "
+                "and later steps can use arguments_template with {{memory_key.field}} placeholders."
+            ),
+            "schedule_examples": {
+                "interval": {"every": 10, "unit": "minutes"},
+                "once": {"run_at": "2026-03-15 18:30"},
+            },
+            "step_schema": {
+                "tool": "public orchestrator tool name such as gismeteo__get_current_weather or telegram__send_message",
+                "arguments": "optional dict with static arguments",
+                "arguments_template": "optional dict rendered from execution memory before the step runs",
+                "save_result_as": "optional memory key for storing the full tool result",
+            },
+            "examples": [
+                {
+                    "title": "Weather to Telegram every 10 minutes",
+                    "schedule_type": "interval",
+                    "schedule": {"every": 10, "unit": "minutes"},
+                    "steps": [
+                        {
+                            "tool": "gismeteo__get_current_weather",
+                            "arguments": {},
+                            "save_result_as": "weather",
+                        },
+                        {
+                            "tool": "telegram__send_message",
+                            "arguments_template": {
+                                "chat_id": "123456789",
+                                "text": "Погода сейчас: {{weather.summary}}",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+
     create_tool = _wrap_tool(logger, "scheduler", "create_task", _create_task)
     list_tool = _wrap_tool(logger, "scheduler", "list_tasks", _list_tasks)
     get_tool = _wrap_tool(logger, "scheduler", "get_task", _get_task)
     delete_tool = _wrap_tool(logger, "scheduler", "delete_task", _delete_task)
     memory_tool = _wrap_tool(logger, "scheduler", "get_task_memory", _get_task_memory)
+    hints_tool = _wrap_tool(logger, "scheduler", "get_scheduler_hints", _get_scheduler_hints)
 
     @mcp.tool(
         name="create_task",
@@ -141,5 +185,12 @@ def create_mcp_server() -> FastMCP:
     )
     async def get_task_memory(task_id: str, trace_id: str = "") -> Dict[str, Any]:
         return await memory_tool(task_id=task_id, trace_id=trace_id)
+
+    @mcp.tool(
+        name="get_scheduler_hints",
+        description="Return the canonical scheduler task payload format with schedule and step examples.",
+    )
+    async def get_scheduler_hints(trace_id: str = "") -> Dict[str, Any]:
+        return await hints_tool(trace_id=trace_id)
 
     return mcp

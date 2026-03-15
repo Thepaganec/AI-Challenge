@@ -162,6 +162,15 @@ class LLMAgentServer:
     async def _send_error(self, writer: asyncio.StreamWriter, message: str) -> None:
         await self._send_json(writer, {"type": "error", "message": message})
 
+    async def _send_task_signal(self, writer: asyncio.StreamWriter, stage: str, message: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {"type": "task_signal", "stage": str(stage or "").strip()}
+        clean_message = str(message or "").strip()
+        if clean_message:
+            payload["message"] = clean_message
+        if isinstance(extra, dict) and extra:
+            payload["extra"] = extra
+        await self._send_json(writer, payload)
+
     def _log(self, level: str, message: str, payload: Any = None) -> None:
         if payload is None:
             self.logger.write(level, message)
@@ -371,14 +380,17 @@ class LLMAgentServer:
             {"role": "user", "content": f"{invariants_text}\n\nConversation snapshot:\n{json.dumps(messages, ensure_ascii=False)}"},
         ]
         try:
-            result = await self.gpt.complete_text(
+            parts: List[str] = []
+            async for chunk in self.gpt.stream_chat(
                 messages=validator_messages,
                 model=model,
                 max_tokens=200,
                 temperature=0.0,
                 trace_id=f"{req_id}:invariants",
-            )
-            text = str(result.get("text") or "").strip()
+            ):
+                if chunk:
+                    parts.append(str(chunk))
+            text = "".join(parts).strip()
             payload = json.loads(text) if text.startswith("{") else {}
             decision = str(payload.get("decision") or "pass").strip().lower()
             if decision not in {"pass", "warn"}:
@@ -398,32 +410,24 @@ class LLMAgentServer:
             "- Use a tool only when it materially helps answer the user.\n"
             "- Never invent required arguments.\n"
             "- If a required argument is missing, ask a clarifying question instead of calling the tool.\n"
-            "- Use namespaced tools exactly as provided.\n"
+            "- Use tool names exactly as provided.\n"
             "- If a tool returns an error, explain the error briefly and ask only for the missing concrete data."
         ]
         tool_names = {str(getattr(tool, "name", "") or "").strip() for tool in tools}
-        if "scheduler.create_task" in tool_names:
-            lines.append(
-                "[SCHEDULER_TOOL_HINTS]\n"
-                "- For scheduler.create_task always send both schedule and steps.\n"
-                "- schedule_type must match the schedule payload.\n"
-                "- For schedule_type='interval', schedule must be like {'every': 10, 'unit': 'minutes'} or {'every': 2, 'unit': 'hours'}.\n"
-                "- For schedule_type='once', schedule must be like {'run_at': '2026-03-12 18:30'}.\n"
-                "- steps must be a non-empty list of namespaced tools.\n"
-                "- Use save_result_as and arguments_template when later steps depend on earlier results."
-            )
+        if "scheduler__get_scheduler_hints" in tool_names:
+            lines.append("- If you need the scheduler task payload format, call scheduler__get_scheduler_hints.")
         return "\n".join(lines)
 
     def _augment_validation_error(self, tool_name: str, error_payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(tool_name or "").strip()
-        if name != "scheduler.create_task":
+        if name != "scheduler__create_task":
             return error_payload
         message = str(error_payload.get("message") or "").strip()
         hint = (
-            " scheduler.create_task requires schedule_type, schedule and steps. "
+            " scheduler__create_task requires schedule_type, schedule and steps. "
             "Example interval schedule: {'every':10,'unit':'minutes'}. "
             "Example once schedule: {'run_at':'2026-03-12 18:30'}. "
-            "steps must be a non-empty list like [{'tool':'gismeteo.get_current_weather','save_result_as':'weather'}]."
+            "steps must be a non-empty list like [{'tool':'gismeteo__get_current_weather','save_result_as':'weather'}]."
         )
         error_payload = dict(error_payload)
         error_payload["message"] = message + hint
@@ -811,6 +815,7 @@ class LLMAgentServer:
             invariants_state.get("invariants") or {},
             invariants_state.get("invariant_policy") or {},
         )
+        await self._send_task_signal(writer, "tools", "Получаю список инструментов MCP")
         mcp_tools, mcp_info = await self._get_mcp_tools()
         tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
         system_text = self._merge_system_text(memory_system_text, profile_system_text, system_text, invariants_text, tools_policy_text)
@@ -837,6 +842,7 @@ class LLMAgentServer:
         self._log("INFO", "INVARIANTS_VALIDATION", invariants_check)
 
         openai_tools = [tool.to_openai_tool() for tool in mcp_tools]
+        await self._send_task_signal(writer, "tools", "Инструменты MCP готовы", {"tools_count": len(openai_tools)})
         self._log("INFO", "MCP_TOOLS_FOR_LLM", {"req_id": req_id, "mcp_info": mcp_info, "tools": openai_tools})
 
         usage_agg: Dict[str, Any] = {}
@@ -848,17 +854,27 @@ class LLMAgentServer:
 
         while loop_guard < max_tool_iterations:
             loop_guard += 1
-            llm_result = await self.gpt.chat_completion(
+            await self._send_task_signal(writer, "llm", "Запрашиваю следующий шаг у модели", {"iteration": loop_guard})
+            stream_started = False
+
+            async for chunk in self.gpt.stream_chat(
                 messages=working_messages,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=float(temperature) if temperature is not None else None,
+                trace_id=f"{req_id}:loop:{loop_guard}",
                 tools=openai_tools if openai_tools else None,
                 tool_choice="auto",
-                trace_id=f"{req_id}:loop:{loop_guard}",
-            )
-            usage_agg = self._merge_usage(usage_agg, llm_result.get("usage") if isinstance(llm_result.get("usage"), dict) else {})
-            assistant_message = llm_result.get("message") if isinstance(llm_result.get("message"), dict) else {}
+            ):
+                if not chunk:
+                    continue
+                if not stream_started:
+                    stream_started = True
+                    await self._send_task_signal(writer, "final", "Начинаю потоковую генерацию ответа")
+                await self._send_json(writer, {"type": "chunk", "chunk": chunk})
+
+            usage_agg = self._merge_usage(usage_agg, self.gpt.last_usage if isinstance(self.gpt.last_usage, dict) else {})
+            assistant_message = self.gpt.last_message if isinstance(self.gpt.last_message, dict) else {}
             tool_calls = self._extract_tool_calls(assistant_message)
             self._log("INFO", "LLM_ASSISTANT_MESSAGE", assistant_message)
 
@@ -866,6 +882,7 @@ class LLMAgentServer:
                 assistant_entry = {"role": "assistant", "content": assistant_message.get("content"), "tool_calls": tool_calls}
                 working_messages.append(assistant_entry)
                 history.append(assistant_entry)
+                await self._send_task_signal(writer, "llm", "Модель запросила инструменты", {"iteration": loop_guard, "tool_calls": len(tool_calls)})
                 for tool_call in tool_calls:
                     tool_name = str((tool_call.get("function") or {}).get("name") or "").strip()
                     raw_args = str((tool_call.get("function") or {}).get("arguments") or "{}")
@@ -876,6 +893,7 @@ class LLMAgentServer:
                     except Exception as e:
                         tool_args = {"_raw_arguments": raw_args, "_parse_error": str(e)}
                     validation_error = self._validate_tool_arguments(tool_name, tool_args, mcp_tools)
+                    await self._send_task_signal(writer, "tool_call", f"Вызов инструмента {tool_name}", {"tool_name": tool_name, "arguments": tool_args, "iteration": loop_guard})
                     try:
                         if validation_error is not None:
                             raise MCPClientError(validation_error.get("message") or "Invalid tool arguments")
@@ -892,6 +910,7 @@ class LLMAgentServer:
                     }
                     working_messages.append(tool_message)
                     history.append(tool_message)
+                    await self._send_task_signal(writer, "tool_result", f"Инструмент {tool_name} завершён", {"tool_name": tool_name, "result": tool_result, "iteration": loop_guard})
                     event = {"tool_call": tool_call, "tool_result": tool_result}
                     tool_events.append(event)
                     self._log("INFO", "LLM_TOOL_ROUNDTRIP", event)
@@ -912,9 +931,6 @@ class LLMAgentServer:
         session["updated_at"] = branch["updated_at"]
         session["active_branch"] = active_branch
         self.memory_store.save_session(session)
-
-        if final_answer:
-            await self._send_json(writer, {"type": "chunk", "chunk": final_answer})
 
         token_stats = {
             "user_text_tokens_est": self._estimate_tokens_text(user_text_for_api),
@@ -949,6 +965,7 @@ class LLMAgentServer:
             "tools_available": len(mcp_tools),
         }
         cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
+        await self._send_task_signal(writer, "done", "Ответ сформирован", {"tool_iterations": loop_guard})
         done_payload = {
             "type": "done",
             "model": model,

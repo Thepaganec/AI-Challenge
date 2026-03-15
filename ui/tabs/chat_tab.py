@@ -261,7 +261,7 @@ class ChatTab(BaseTab):
         self.progress_bar.setVisible(False)
         self.sent_len_label = QLabel("API context tokens(est): N/A")
         self.task_signal_label = QLabel("Task signal: idle")
-        self.task_signal_label.setVisible(False)
+        self.task_signal_label.setVisible(True)
 
         self.output_editbox = QTextEdit()
         self.output_editbox.setFont(font)
@@ -473,7 +473,7 @@ class ChatTab(BaseTab):
         self.on_strategy_changed()
         self.refresh_sessions_timer = QTimer(self)
         # TODO: Рассмотреть увеличение интервала/переход на event-driven обновление списка сессий (минимизация polling).
-        self.refresh_sessions_timer.setInterval(1000)
+        self.refresh_sessions_timer.setInterval(2000)
         self.refresh_sessions_timer.timeout.connect(self._tick_refresh_sessions_list)
         self.refresh_sessions_timer.start()
 
@@ -1014,12 +1014,15 @@ class ChatTab(BaseTab):
         if not message and not stage:
             return
         if stage and message:
-            self.task_signal_label.setText(f"Task signal [{stage}]: {message}")
+            label_text = f"Task signal [{stage}]: {message}"
         elif message:
-            self.task_signal_label.setText(f"Task signal: {message}")
+            label_text = f"Task signal: {message}"
         else:
-            self.task_signal_label.setText(f"Task signal [{stage}]")
+            label_text = f"Task signal [{stage}]"
+        self.task_signal_label.setText(label_text)
         try:
+            extra_text = json.dumps(extra, ensure_ascii=False, indent=2) if extra else "{}"
+            self.metrics_box.append(f"TASK_SIGNAL | stage={stage or '-'} | message={message or '-'} | extra={extra_text}")
             if stage and message:
                 self.logger.info(f"TASK_SIGNAL [{stage}] {message} | extra={extra}")
             elif message:
@@ -1574,6 +1577,7 @@ class ChatTab(BaseTab):
                     return
 
             self.agent.on_task_signal = self._on_task_signal
+            self.task_signal_label.setVisible(True)
             self.task_signal_label.setText("Task signal: запрос отправлен")
             gen = self.agent.stream_chat(
                 user_text=user_text,
