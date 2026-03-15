@@ -42,10 +42,10 @@ def _wrap_tool(logger: Any, service_name: str, tool_name: str, handler: Callable
 
 def create_mcp_server() -> FastMCP:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    data_dir = os.getenv("TELEGRAM_MCP_DATA_DIR", os.path.join(project_root, "core", "telegram_mcp", "data"))
+    data_dir = os.getenv("MCP_TELEGRAM_DATA_DIR", os.path.join(project_root, "core", "mcp_telegram", "data"))
     logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
 
-    logger = build_service_logger("telegram_mcp", logs_root)
+    logger = build_service_logger("mcp_telegram", logs_root)
     service = TelegramMCPService(
         api_client=TelegramApiClient(),
         storage=TelegramBindingsStore(data_dir),

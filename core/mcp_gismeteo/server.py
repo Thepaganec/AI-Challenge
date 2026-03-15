@@ -41,7 +41,7 @@ def _wrap_tool(logger: Any, service_name: str, tool_name: str, handler: Callable
 def create_mcp_server() -> FastMCP:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
-    logger = build_service_logger("gismeteo_mcp", logs_root)
+    logger = build_service_logger("mcp_gismeteo", logs_root)
     service = GismeteoMCPService(
         source_url=str(os.getenv("GISMETEO_URL", "https://www.gismeteo.ru/weather-tver-4327/")).strip(),
         logger=logger,

@@ -3,7 +3,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from core.gismeteo_mcp import create_mcp_server
+from core.mcp_gismeteo import create_mcp_server
 
 
 async def main() -> None:

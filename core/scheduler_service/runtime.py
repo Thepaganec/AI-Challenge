@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from core.scheduler_mcp.schedule_utils import compute_next_run, is_due, normalize_schedule
+from core.mcp_scheduler.schedule_utils import compute_next_run, is_due, normalize_schedule
 from core.shared import RemoteMCPServer, StdioMCPToolClient
 
 from .storage import SchedulerTaskStore, now_iso

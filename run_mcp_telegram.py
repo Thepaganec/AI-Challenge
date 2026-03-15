@@ -1,7 +1,9 @@
-import asyncio, sys
+import asyncio
+import sys
+
 sys.dont_write_bytecode = True
 
-from core.scheduler_mcp import create_mcp_server
+from core.mcp_telegram import create_mcp_server
 
 
 async def main() -> None:

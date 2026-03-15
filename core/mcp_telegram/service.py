@@ -21,7 +21,7 @@ class TelegramMCPService:
             self.storage.save_binding(cached)
             return {
                 "ok": True,
-                "source": "telegram_mcp_cache",
+                "source": "mcp_telegram_cache",
                 "binding": cached,
                 "chat_id": str(cached.get("chat_id") or ""),
                 "telegram_username": normalized,

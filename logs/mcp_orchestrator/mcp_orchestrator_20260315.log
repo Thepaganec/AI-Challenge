@@ -1538,3 +1538,60 @@
     "telegram.send_message"
   ]
 }
+2026-03-15 15:58:29,902 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_mcp_telegram.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:58:30,979 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:58:30,980 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_mcp_gismeteo.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:58:32,085 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:58:32,085 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_mcp_scheduler.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:58:32,886 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:58:32,886 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}

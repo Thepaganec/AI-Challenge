@@ -42,7 +42,7 @@ def create_mcp_server() -> FastMCP:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     data_dir = os.getenv("SCHEDULER_SERVICE_DATA_DIR", os.path.join(project_root, "core", "scheduler_service", "data"))
     logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
-    logger = build_service_logger("scheduler_mcp", logs_root)
+    logger = build_service_logger("mcp_scheduler", logs_root)
     runtime = SchedulerRuntime(storage=SchedulerTaskStore(data_dir), logger=logger)
 
     mcp = FastMCP(

@@ -24,16 +24,16 @@
 1. `core/mcp_orchestrator`
    Единый MCP-сервис-оркестратор.
 
-2. `core/telegram_mcp`
+2. `core/mcp_telegram`
    Отдельный MCP-сервис, который умеет только работать с Telegram API.
 
-3. `core/gismeteo_mcp`
+3. `core/mcp_gismeteo`
    Отдельный MCP-сервис, который умеет только получать актуальный прогноз со страницы Gismeteo через локальные вспомогательные методы парсинга HTML.
 
 4. `core/scheduler_service`
    Отдельный runtime-сервис, исполняющий сохраненные задачи по расписанию.
 
-5. `core/scheduler_mcp`
+5. `core/mcp_scheduler`
    Отдельный MCP-сервис управления scheduler runtime, задачами и памятью задач.
 
 ## 3. Принципы архитектуры

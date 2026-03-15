@@ -37,19 +37,19 @@ def _default_registry_payload() -> List[Dict[str, Any]]:
         {
             "public_name": "telegram",
             "command": py,
-            "args": [os.path.join(root, "run_telegram_mcp.py")],
+            "args": [os.path.join(root, "run_mcp_telegram.py")],
             "env": common_env,
         },
         {
             "public_name": "gismeteo",
             "command": py,
-            "args": [os.path.join(root, "run_gismeteo_mcp.py")],
+            "args": [os.path.join(root, "run_mcp_gismeteo.py")],
             "env": common_env,
         },
         {
             "public_name": "scheduler",
             "command": py,
-            "args": [os.path.join(root, "run_scheduler_mcp.py")],
+            "args": [os.path.join(root, "run_mcp_scheduler.py")],
             "env": common_env,
         },
     ]
