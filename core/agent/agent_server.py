@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-from core.api.gptmodel import GPTModel
+from core.LLM_API.gptmodel import GPTModel
 from core.agent.agent_logger import AgentFileLogger
 from core.agent.invariants import build_invariants_system_text, normalize_invariants_state
 from core.agent.memory_store import AgentMemoryStore
