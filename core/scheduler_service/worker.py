@@ -15,7 +15,9 @@ async def run_worker() -> None:
     data_dir = os.getenv("SCHEDULER_SERVICE_DATA_DIR", os.path.join(project_root, "core", "scheduler_service", "data"))
     logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
     logger = build_service_logger("scheduler_service", logs_root)
-    runtime = SchedulerRuntime(storage=SchedulerTaskStore(data_dir), logger=logger)
+    storage = SchedulerTaskStore(data_dir)
+    runtime = SchedulerRuntime(storage=storage, logger=logger)
+
     await runtime.start()
     try:
         while True:

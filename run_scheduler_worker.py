@@ -1,8 +1,9 @@
-import asyncio, sys
-sys.dont_write_bytecode = True
+import asyncio
 
-from core.scheduler_mcp.worker import run_worker
-
+from core.scheduler_service.worker import run_worker
 
 if __name__ == "__main__":
-    asyncio.run(run_worker())
+    try:
+        asyncio.run(run_worker())
+    except KeyboardInterrupt:
+        pass

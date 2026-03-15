@@ -1,0 +1,395 @@
+2026-03-15 15:44:26,173 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "metadata": {},
+    "schedule": {
+      "run_at": "2026-03-15 15:54"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "template_text": "",
+    "title": "test_orchestrator_route",
+    "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+  },
+  "service": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:44:26,183 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:54:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:44:26",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:54:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:54:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "test_orchestrator_route",
+      "updated_at": "2026-03-15 15:44:26"
+    },
+    "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+    "title": "test_orchestrator_route",
+    "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+  },
+  "service": "scheduler",
+  "tool": "create_task",
+  "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+}
+2026-03-15 15:44:29,874 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "status": "",
+    "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+  },
+  "service": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:44:29,875 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "count": 1,
+    "ok": true,
+    "tasks": [
+      {
+        "created_at": "2026-03-15 15:44:26",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:54:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:54:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:44:26"
+      }
+    ],
+    "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+  },
+  "service": "scheduler",
+  "tool": "list_tasks",
+  "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+}
+2026-03-15 15:45:54,406 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "metadata": {},
+    "schedule": {
+      "run_at": "2026-03-15 15:55"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "template_text": "",
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "service": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:45:54,412 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:55:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:45:54",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:55:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:55:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "test_orchestrator_route",
+      "updated_at": "2026-03-15 15:45:54"
+    },
+    "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "service": "scheduler",
+  "tool": "create_task",
+  "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+}
+2026-03-15 15:45:58,165 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "status": "",
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "service": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:45:58,166 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "count": 2,
+    "ok": true,
+    "tasks": [
+      {
+        "created_at": "2026-03-15 15:44:26",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:54:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:54:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:44:26"
+      },
+      {
+        "created_at": "2026-03-15 15:45:54",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:55:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:55:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:45:54"
+      }
+    ],
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "service": "scheduler",
+  "tool": "list_tasks",
+  "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+}
+2026-03-15 15:46:22,588 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "metadata": {},
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "template_text": "",
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "service": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:22,594 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:22",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route",
+      "updated_at": "2026-03-15 15:46:22"
+    },
+    "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "service": "scheduler",
+  "tool": "create_task",
+  "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+}
+2026-03-15 15:46:59,676 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "metadata": {},
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "template_text": "",
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "service": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:59,683 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:59",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route_2",
+      "updated_at": "2026-03-15 15:46:59"
+    },
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "service": "scheduler",
+  "tool": "create_task",
+  "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+}
+2026-03-15 15:47:03,431 [INFO] MCP_TOOL_REQUEST
+{
+  "arguments": {
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "service": "scheduler",
+  "tool": "delete_task"
+}
+2026-03-15 15:47:03,433 [INFO] MCP_TOOL_RESPONSE
+{
+  "result": {
+    "ok": true,
+    "status": "deleted",
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "service": "scheduler",
+  "tool": "delete_task",
+  "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+}

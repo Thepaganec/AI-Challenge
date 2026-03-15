@@ -398,31 +398,32 @@ class LLMAgentServer:
             "- Use a tool only when it materially helps answer the user.\n"
             "- Never invent required arguments.\n"
             "- If a required argument is missing, ask a clarifying question instead of calling the tool.\n"
-            "- Never send placeholder values like owner, repo, username, branch, tag, query, path.\n"
+            "- Use namespaced tools exactly as provided.\n"
             "- If a tool returns an error, explain the error briefly and ask only for the missing concrete data."
         ]
         tool_names = {str(getattr(tool, "name", "") or "").strip() for tool in tools}
-        if "scheduler_create_task" in tool_names:
+        if "scheduler.create_task" in tool_names:
             lines.append(
                 "[SCHEDULER_TOOL_HINTS]\n"
-                "- For scheduler_create_task always send both schedule and job_payload.\n"
+                "- For scheduler.create_task always send both schedule and steps.\n"
+                "- schedule_type must match the schedule payload.\n"
                 "- For schedule_type='interval', schedule must be like {'every': 10, 'unit': 'minutes'} or {'every': 2, 'unit': 'hours'}.\n"
                 "- For schedule_type='once', schedule must be like {'run_at': '2026-03-12 18:30'}.\n"
-                "- For weather_summary, job_payload must contain at least {'city': '...'} and may include period/requested_by.\n"
-                "- If the city or schedule details are unknown, ask the user before calling the tool."
+                "- steps must be a non-empty list of namespaced tools.\n"
+                "- Use save_result_as and arguments_template when later steps depend on earlier results."
             )
         return "\n".join(lines)
 
     def _augment_validation_error(self, tool_name: str, error_payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(tool_name or "").strip()
-        if name != "scheduler_create_task":
+        if name != "scheduler.create_task":
             return error_payload
         message = str(error_payload.get("message") or "").strip()
         hint = (
-            " scheduler_create_task requires schedule and job_payload. "
-            "Examples: schedule={'every':10,'unit':'minutes'} for interval, "
-            "schedule={'run_at':'2026-03-12 18:30'} for once, "
-            "job_payload={'city':'Moscow','period':'now','requested_by':'agent'} for weather_summary."
+            " scheduler.create_task requires schedule_type, schedule and steps. "
+            "Example interval schedule: {'every':10,'unit':'minutes'}. "
+            "Example once schedule: {'run_at':'2026-03-12 18:30'}. "
+            "steps must be a non-empty list like [{'tool':'gismeteo.get_current_weather','save_result_as':'weather'}]."
         )
         error_payload = dict(error_payload)
         error_payload["message"] = message + hint
@@ -842,7 +843,7 @@ class LLMAgentServer:
         final_answer = ""
         tool_events: List[Dict[str, Any]] = []
         loop_guard = 0
-        max_tool_iterations = 8
+        max_tool_iterations = max(8, int(str(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "32")).strip() or "32"))
         history.append({"role": "user", "content": user_text})
 
         while loop_guard < max_tool_iterations:
@@ -1032,3 +1033,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+

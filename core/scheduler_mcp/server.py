@@ -1,127 +1,145 @@
 import os
-from typing import Any, Dict
+import uuid
+from typing import Any, Awaitable, Callable, Dict, List
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-from core.scheduler_mcp.logging_utils import build_scheduler_logger
-from core.scheduler_mcp.runtime import SchedulerRuntime
-from core.scheduler_mcp.storage import SchedulerStorage
-from core.scheduler_mcp.telegram_client import TelegramClient
+from core.scheduler_service.runtime import SchedulerRuntime
+from core.scheduler_service.storage import SchedulerTaskStore
+from core.shared import build_service_logger
 
 load_dotenv(override=True)
 
 
+def _wrap_tool(logger: Any, service_name: str, tool_name: str, handler: Callable[..., Awaitable[Dict[str, Any]]]):
+    async def _wrapped(**kwargs):
+        trace_id = str(kwargs.get("trace_id") or uuid.uuid4())
+        payload = dict(kwargs)
+        payload["trace_id"] = trace_id
+        logger.info("MCP_TOOL_REQUEST", {"service": service_name, "tool": tool_name, "arguments": payload})
+        try:
+            result = await handler(**payload)
+            logger.info("MCP_TOOL_RESPONSE", {"service": service_name, "tool": tool_name, "trace_id": trace_id, "result": result})
+            return result
+        except Exception as e:
+            error = {
+                "ok": False,
+                "is_error": True,
+                "error_type": "tool_execution_error",
+                "service": service_name,
+                "tool": tool_name,
+                "trace_id": trace_id,
+                "message": str(e),
+            }
+            logger.error("MCP_TOOL_ERROR", error)
+            return error
+
+    return _wrapped
+
+
 def create_mcp_server() -> FastMCP:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    data_dir = os.getenv("SCHEDULER_MCP_DATA_DIR", os.path.join(project_root, "core", "scheduler_mcp", "data"))
-    logs_dir = os.getenv("SCHEDULER_MCP_LOGS_DIR", os.path.join(project_root, "logs"))
-    logger = build_scheduler_logger(logs_dir)
-    storage = SchedulerStorage(data_dir)
-    telegram_client = TelegramClient()
-    runtime = SchedulerRuntime(storage=storage, telegram_client=telegram_client, logger=logger)
+    data_dir = os.getenv("SCHEDULER_SERVICE_DATA_DIR", os.path.join(project_root, "core", "scheduler_service", "data"))
+    logs_root = os.getenv("SERVICE_LOGS_DIR", os.path.join(project_root, "logs"))
+    logger = build_service_logger("scheduler_mcp", logs_root)
+    runtime = SchedulerRuntime(storage=SchedulerTaskStore(data_dir), logger=logger)
 
     mcp = FastMCP(
-        name="local-scheduler-mcp",
+        name="scheduler-mcp",
         instructions=(
-            "Provides tools for Telegram recipient binding and scheduled background tasks. "
-            "For personal Telegram delivery, the user must first send any message to the bot, "
-            "then telegram_bind_recipient should be called before scheduler_create_task. "
-            "Always provide concrete schedule and job_payload fields when creating tasks."
+            "Scheduler control MCP server. It manages scheduler tasks, routes, task memory and task status. "
+            "The runtime that executes schedules is a separate service."
         ),
         log_level="INFO",
     )
 
-    @mcp.tool(
-        name="telegram_bind_recipient",
-        description=(
-            "Bind a Telegram recipient by username after the user has sent a message to the bot. "
-            "Input requires telegram_username without guessing. If the user is not found in getUpdates, "
-            "the tool returns a message asking the user to message the bot first."
-        ),
-    )
-    async def telegram_bind_recipient(telegram_username: str) -> Dict[str, Any]:
-        return await runtime.bind_recipient(telegram_username)
-
-    @mcp.tool(
-        name="scheduler_create_task",
-        description=(
-            "Create a scheduled Telegram task. Supports schedule_type: once, interval, daily, weekly. "
-            "For once use schedule.run_at='YYYY-MM-DD HH:MM'. "
-            "For interval use schedule.every with schedule.unit='minutes' or 'hours'. "
-            "For daily use schedule.time_points=[{hour, minute}]. "
-            "For weekly use schedule.days plus schedule.time_points. "
-            "You must always include job_payload and schedule. "
-            "For weather_summary, job_payload should include city and may include period and requested_by. "
-            "Example interval task: schedule_type='interval', schedule={'every':10,'unit':'minutes'}, "
-            "job_payload={'city':'Moscow','period':'now','requested_by':'agent'}. "
-            "The telegram recipient must already be bound with telegram_bind_recipient. "
-            "Current supported job_type is weather_summary and it sends a fixed stub weather message."
-        ),
-    )
-    async def scheduler_create_task(
-        title: str,
-        job_type: str,
-        schedule_type: str,
-        telegram_username: str,
-        job_payload: Dict[str, Any] | None = None,
-        schedule: Dict[str, Any] | None = None,
-    ) -> Dict[str, Any]:
-        normalized_job_payload = dict(job_payload or {})
-        normalized_schedule = dict(schedule or {})
-        if str(job_type or "").strip().lower() == "weather_summary" and normalized_job_payload:
-            normalized_job_payload.setdefault("period", "now")
-            normalized_job_payload.setdefault("requested_by", "agent")
+    async def _create_task(trace_id: str = "", title: str = "", schedule_type: str = "", schedule: Dict[str, Any] | None = None,
+                           steps: List[Dict[str, Any]] | None = None, template_text: str = "", metadata: Dict[str, Any] | None = None) -> Dict[str, Any]:
         task = await runtime.create_task(
             title=title,
-            job_type=job_type,
-            job_payload=normalized_job_payload,
             schedule_type=schedule_type,
-            schedule=normalized_schedule,
-            telegram_username=telegram_username,
+            schedule=dict(schedule or {}),
+            steps=list(steps or []),
+            template_text=template_text,
+            metadata=dict(metadata or {}),
         )
         return {
             "ok": True,
+            "trace_id": trace_id,
             "task_id": task.get("task_id"),
             "title": task.get("title"),
             "status": task.get("status"),
-            "schedule_type": task.get("schedule_type"),
             "next_run_at": task.get("next_run_at"),
-            "telegram_username": (task.get("recipient") or {}).get("telegram_username"),
-            "message": f"Task '{task.get('title')}' created.",
+            "schedule_type": task.get("schedule_type"),
+            "steps_count": len(task.get("steps") or []),
+            "task": task,
         }
 
+    async def _list_tasks(trace_id: str = "", status: str = "") -> Dict[str, Any]:
+        tasks = await runtime.list_tasks(status=status)
+        return {"ok": True, "trace_id": trace_id, "count": len(tasks), "tasks": tasks}
+
+    async def _get_task(trace_id: str = "", task_id: str = "") -> Dict[str, Any]:
+        task = await runtime.get_task(task_id)
+        return {"ok": True, "trace_id": trace_id, "task": task}
+
+    async def _delete_task(trace_id: str = "", task_id: str = "") -> Dict[str, Any]:
+        result = await runtime.delete_task(task_id)
+        return {"ok": True, "trace_id": trace_id, **result}
+
+    async def _get_task_memory(trace_id: str = "", task_id: str = "") -> Dict[str, Any]:
+        task = await runtime.get_task(task_id)
+        return {
+            "ok": True,
+            "trace_id": trace_id,
+            "task_id": task_id,
+            "execution_memory": task.get("execution_memory") or {},
+            "last_run_log": task.get("last_run_log") or [],
+            "last_error": task.get("last_error") or "",
+        }
+
+    create_tool = _wrap_tool(logger, "scheduler", "create_task", _create_task)
+    list_tool = _wrap_tool(logger, "scheduler", "list_tasks", _list_tasks)
+    get_tool = _wrap_tool(logger, "scheduler", "get_task", _get_task)
+    delete_tool = _wrap_tool(logger, "scheduler", "delete_task", _delete_task)
+    memory_tool = _wrap_tool(logger, "scheduler", "get_task_memory", _get_task_memory)
+
     @mcp.tool(
-        name="scheduler_list_tasks",
+        name="create_task",
         description=(
-            "List scheduler tasks. Optional filters: status and telegram_username. "
-            "Use this to inspect active or existing scheduled Telegram tasks."
+            "Create a scheduled task with a generic linear route of steps, optional save_result_as fields, and arguments_template values."
         ),
     )
-    async def scheduler_list_tasks(status: str = "", telegram_username: str = "") -> Dict[str, Any]:
-        tasks = await runtime.list_tasks(status=status, telegram_username=telegram_username)
-        return {
-            "count": len(tasks),
-            "tasks": [
-                {
-                    "task_id": task.get("task_id"),
-                    "title": task.get("title"),
-                    "status": task.get("status"),
-                    "schedule_type": task.get("schedule_type"),
-                    "next_run_at": task.get("next_run_at"),
-                    "telegram_username": ((task.get("recipient") or {}).get("telegram_username") if isinstance(task.get("recipient"), dict) else ""),
-                    "job_type": task.get("job_type"),
-                }
-                for task in tasks
-            ],
-        }
+    async def create_task(title: str, schedule_type: str, schedule: Dict[str, Any], steps: List[Dict[str, Any]], template_text: str = "", metadata: Dict[str, Any] | None = None, trace_id: str = "") -> Dict[str, Any]:
+        return await create_tool(title=title, schedule_type=schedule_type, schedule=schedule, steps=steps, template_text=template_text, metadata=metadata or {}, trace_id=trace_id)
 
     @mcp.tool(
-        name="scheduler_cancel_task",
-        description="Cancel and delete a scheduled task by task_id.",
+        name="list_tasks",
+        description="List scheduler tasks and their current status.",
     )
-    async def scheduler_cancel_task(task_id: str) -> Dict[str, Any]:
-        result = await runtime.cancel_task(task_id)
-        return {"ok": True, **result, "message": f"Task '{task_id}' cancelled."}
+    async def list_tasks(status: str = "", trace_id: str = "") -> Dict[str, Any]:
+        return await list_tool(status=status, trace_id=trace_id)
+
+    @mcp.tool(
+        name="get_task",
+        description="Return full stored configuration for a task including route and schedule.",
+    )
+    async def get_task(task_id: str, trace_id: str = "") -> Dict[str, Any]:
+        return await get_tool(task_id=task_id, trace_id=trace_id)
+
+    @mcp.tool(
+        name="delete_task",
+        description="Delete a task by task_id.",
+    )
+    async def delete_task(task_id: str, trace_id: str = "") -> Dict[str, Any]:
+        return await delete_tool(task_id=task_id, trace_id=trace_id)
+
+    @mcp.tool(
+        name="get_task_memory",
+        description="Return execution memory, last run log and last error for a task.",
+    )
+    async def get_task_memory(task_id: str, trace_id: str = "") -> Dict[str, Any]:
+        return await memory_tool(task_id=task_id, trace_id=trace_id)
 
     return mcp

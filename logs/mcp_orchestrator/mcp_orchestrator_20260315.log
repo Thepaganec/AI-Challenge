@@ -1,0 +1,1540 @@
+2026-03-15 15:41:05,259 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:41:07,118 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:41:07,118 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:41:08,243 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:41:08,243 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:41:09,001 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:41:09,001 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:41:23,934 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:41:24,810 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:41:24,810 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:41:25,680 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:41:25,680 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:41:26,367 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:41:26,367 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:43:51,551 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:43:52,445 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:43:52,446 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:43:53,405 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:43:53,405 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "C:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "C:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:43:54,075 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:43:54,075 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:43:54,165 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:43:55,055 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:43:55,056 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:43:55,932 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:43:55,932 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:43:56,591 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:43:56,592 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:44:23,150 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:44:24,015 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:44:24,015 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:44:24,872 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:44:24,873 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:44:25,543 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:44:25,543 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:44:25,560 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:54"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "test_orchestrator_route",
+    "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+  },
+  "public_tool_name": "scheduler.create_task",
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+}
+2026-03-15 15:44:25,560 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:54"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "test_orchestrator_route",
+    "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:44:26,249 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"ok\": true,\n  \"trace_id\": \"b5b43280-4d60-4cfe-b097-8b9234e91836\",\n  \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n  \"title\": \"test_orchestrator_route\",\n  \"status\": \"active\",\n  \"next_run_at\": \"2026-03-15 15:54:00\",\n  \"schedule_type\": \"once\",\n  \"steps_count\": 1,\n  \"task\": {\n    \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n    \"title\": \"test_orchestrator_route\",\n    \"status\": \"active\",\n    \"created_at\": \"2026-03-15 15:44:26\",\n    \"updated_at\": \"2026-03-15 15:44:26\",\n    \"schedule_type\": \"once\",\n    \"schedule\": {\n      \"run_at\": \"2026-03-15 15:54:00\"\n    },\n    \"steps\": [\n      {\n        \"tool\": \"gismeteo.get_current_weather\",\n        \"save_result_as\": \"weather\"\n      }\n    ],\n    \"template_text\": \"\",\n    \"metadata\": {},\n    \"execution_memory\": {},\n    \"last_run_log\": [],\n    \"last_run_at\": \"\",\n    \"last_failed_at\": \"\",\n    \"last_error\": \"\",\n    \"timezone\": \"Europe/Moscow\",\n    \"next_run_at\": \"2026-03-15 15:54:00\"\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "is_error": false,
+    "structured_content": {
+      "result": {
+        "next_run_at": "2026-03-15 15:54:00",
+        "ok": true,
+        "schedule_type": "once",
+        "status": "active",
+        "steps_count": 1,
+        "task": {
+          "created_at": "2026-03-15 15:44:26",
+          "execution_memory": {},
+          "last_error": "",
+          "last_failed_at": "",
+          "last_run_at": "",
+          "last_run_log": [],
+          "metadata": {},
+          "next_run_at": "2026-03-15 15:54:00",
+          "schedule": {
+            "run_at": "2026-03-15 15:54:00"
+          },
+          "schedule_type": "once",
+          "status": "active",
+          "steps": [
+            {
+              "save_result_as": "weather",
+              "tool": "gismeteo.get_current_weather"
+            }
+          ],
+          "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+          "template_text": "",
+          "timezone": "Europe/Moscow",
+          "title": "test_orchestrator_route",
+          "updated_at": "2026-03-15 15:44:26"
+        },
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "title": "test_orchestrator_route",
+        "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+      }
+    }
+  },
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:44:26,250 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.create_task",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"ok\": true,\n  \"trace_id\": \"b5b43280-4d60-4cfe-b097-8b9234e91836\",\n  \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n  \"title\": \"test_orchestrator_route\",\n  \"status\": \"active\",\n  \"next_run_at\": \"2026-03-15 15:54:00\",\n  \"schedule_type\": \"once\",\n  \"steps_count\": 1,\n  \"task\": {\n    \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n    \"title\": \"test_orchestrator_route\",\n    \"status\": \"active\",\n    \"created_at\": \"2026-03-15 15:44:26\",\n    \"updated_at\": \"2026-03-15 15:44:26\",\n    \"schedule_type\": \"once\",\n    \"schedule\": {\n      \"run_at\": \"2026-03-15 15:54:00\"\n    },\n    \"steps\": [\n      {\n        \"tool\": \"gismeteo.get_current_weather\",\n        \"save_result_as\": \"weather\"\n      }\n    ],\n    \"template_text\": \"\",\n    \"metadata\": {},\n    \"execution_memory\": {},\n    \"last_run_log\": [],\n    \"last_run_at\": \"\",\n    \"last_failed_at\": \"\",\n    \"last_error\": \"\",\n    \"timezone\": \"Europe/Moscow\",\n    \"next_run_at\": \"2026-03-15 15:54:00\"\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "is_error": false,
+    "structured_content": {
+      "result": {
+        "next_run_at": "2026-03-15 15:54:00",
+        "ok": true,
+        "schedule_type": "once",
+        "status": "active",
+        "steps_count": 1,
+        "task": {
+          "created_at": "2026-03-15 15:44:26",
+          "execution_memory": {},
+          "last_error": "",
+          "last_failed_at": "",
+          "last_run_at": "",
+          "last_run_log": [],
+          "metadata": {},
+          "next_run_at": "2026-03-15 15:54:00",
+          "schedule": {
+            "run_at": "2026-03-15 15:54:00"
+          },
+          "schedule_type": "once",
+          "status": "active",
+          "steps": [
+            {
+              "save_result_as": "weather",
+              "tool": "gismeteo.get_current_weather"
+            }
+          ],
+          "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+          "template_text": "",
+          "timezone": "Europe/Moscow",
+          "title": "test_orchestrator_route",
+          "updated_at": "2026-03-15 15:44:26"
+        },
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "title": "test_orchestrator_route",
+        "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+      }
+    }
+  },
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "b5b43280-4d60-4cfe-b097-8b9234e91836"
+}
+2026-03-15 15:44:26,886 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:44:27,739 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:44:27,739 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:44:28,599 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:44:28,599 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:44:29,255 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:44:29,255 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:44:29,272 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+  },
+  "public_tool_name": "scheduler.list_tasks",
+  "service": "scheduler",
+  "source_tool_name": "list_tasks",
+  "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+}
+2026-03-15 15:44:29,272 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:44:29,935 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"ok\": true,\n  \"trace_id\": \"37ce6426-aafe-4403-9f6c-e5cf45f85896\",\n  \"count\": 1,\n  \"tasks\": [\n    {\n      \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n      \"title\": \"test_orchestrator_route\",\n      \"status\": \"active\",\n      \"created_at\": \"2026-03-15 15:44:26\",\n      \"updated_at\": \"2026-03-15 15:44:26\",\n      \"schedule_type\": \"once\",\n      \"schedule\": {\n        \"run_at\": \"2026-03-15 15:54:00\"\n      },\n      \"steps\": [\n        {\n          \"tool\": \"gismeteo.get_current_weather\",\n          \"save_result_as\": \"weather\"\n        }\n      ],\n      \"template_text\": \"\",\n      \"metadata\": {},\n      \"execution_memory\": {},\n      \"last_run_log\": [],\n      \"last_run_at\": \"\",\n      \"last_failed_at\": \"\",\n      \"last_error\": \"\",\n      \"timezone\": \"Europe/Moscow\",\n      \"next_run_at\": \"2026-03-15 15:54:00\"\n    }\n  ]\n}",
+        "type": "text"
+      }
+    ],
+    "is_error": false,
+    "structured_content": {
+      "result": {
+        "count": 1,
+        "ok": true,
+        "tasks": [
+          {
+            "created_at": "2026-03-15 15:44:26",
+            "execution_memory": {},
+            "last_error": "",
+            "last_failed_at": "",
+            "last_run_at": "",
+            "last_run_log": [],
+            "metadata": {},
+            "next_run_at": "2026-03-15 15:54:00",
+            "schedule": {
+              "run_at": "2026-03-15 15:54:00"
+            },
+            "schedule_type": "once",
+            "status": "active",
+            "steps": [
+              {
+                "save_result_as": "weather",
+                "tool": "gismeteo.get_current_weather"
+              }
+            ],
+            "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+            "template_text": "",
+            "timezone": "Europe/Moscow",
+            "title": "test_orchestrator_route",
+            "updated_at": "2026-03-15 15:44:26"
+          }
+        ],
+        "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+      }
+    }
+  },
+  "server": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:44:29,935 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.list_tasks",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"ok\": true,\n  \"trace_id\": \"37ce6426-aafe-4403-9f6c-e5cf45f85896\",\n  \"count\": 1,\n  \"tasks\": [\n    {\n      \"task_id\": \"90337a67-2cd3-48cf-bfab-46681625731f\",\n      \"title\": \"test_orchestrator_route\",\n      \"status\": \"active\",\n      \"created_at\": \"2026-03-15 15:44:26\",\n      \"updated_at\": \"2026-03-15 15:44:26\",\n      \"schedule_type\": \"once\",\n      \"schedule\": {\n        \"run_at\": \"2026-03-15 15:54:00\"\n      },\n      \"steps\": [\n        {\n          \"tool\": \"gismeteo.get_current_weather\",\n          \"save_result_as\": \"weather\"\n        }\n      ],\n      \"template_text\": \"\",\n      \"metadata\": {},\n      \"execution_memory\": {},\n      \"last_run_log\": [],\n      \"last_run_at\": \"\",\n      \"last_failed_at\": \"\",\n      \"last_error\": \"\",\n      \"timezone\": \"Europe/Moscow\",\n      \"next_run_at\": \"2026-03-15 15:54:00\"\n    }\n  ]\n}",
+        "type": "text"
+      }
+    ],
+    "is_error": false,
+    "structured_content": {
+      "result": {
+        "count": 1,
+        "ok": true,
+        "tasks": [
+          {
+            "created_at": "2026-03-15 15:44:26",
+            "execution_memory": {},
+            "last_error": "",
+            "last_failed_at": "",
+            "last_run_at": "",
+            "last_run_log": [],
+            "metadata": {},
+            "next_run_at": "2026-03-15 15:54:00",
+            "schedule": {
+              "run_at": "2026-03-15 15:54:00"
+            },
+            "schedule_type": "once",
+            "status": "active",
+            "steps": [
+              {
+                "save_result_as": "weather",
+                "tool": "gismeteo.get_current_weather"
+              }
+            ],
+            "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+            "template_text": "",
+            "timezone": "Europe/Moscow",
+            "title": "test_orchestrator_route",
+            "updated_at": "2026-03-15 15:44:26"
+          }
+        ],
+        "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+      }
+    }
+  },
+  "service": "scheduler",
+  "source_tool_name": "list_tasks",
+  "trace_id": "37ce6426-aafe-4403-9f6c-e5cf45f85896"
+}
+2026-03-15 15:45:51,270 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:45:52,169 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:45:52,169 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:45:53,041 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:45:53,041 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:45:53,787 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:45:53,787 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:45:53,803 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:55"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "public_tool_name": "scheduler.create_task",
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+}
+2026-03-15 15:45:53,804 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:55"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:45:54,476 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:55:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:45:54",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:55:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:55:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "test_orchestrator_route",
+      "updated_at": "2026-03-15 15:45:54"
+    },
+    "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:45:54,476 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.create_task",
+  "result": {
+    "next_run_at": "2026-03-15 15:55:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:45:54",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:55:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:55:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "test_orchestrator_route",
+      "updated_at": "2026-03-15 15:45:54"
+    },
+    "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+    "title": "test_orchestrator_route",
+    "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+  },
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "1d96a3a8-9186-4693-9d8e-80e0cb681e7d"
+}
+2026-03-15 15:45:55,116 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:45:55,991 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:45:55,991 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:45:56,858 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:45:56,859 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:45:57,536 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:45:57,536 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:45:57,553 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "public_tool_name": "scheduler.list_tasks",
+  "service": "scheduler",
+  "source_tool_name": "list_tasks",
+  "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+}
+2026-03-15 15:45:57,553 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:45:58,228 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "count": 2,
+    "ok": true,
+    "tasks": [
+      {
+        "created_at": "2026-03-15 15:44:26",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:54:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:54:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:44:26"
+      },
+      {
+        "created_at": "2026-03-15 15:45:54",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:55:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:55:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:45:54"
+      }
+    ],
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "server": "scheduler",
+  "tool": "list_tasks"
+}
+2026-03-15 15:45:58,228 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.list_tasks",
+  "result": {
+    "count": 2,
+    "ok": true,
+    "tasks": [
+      {
+        "created_at": "2026-03-15 15:44:26",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:54:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:54:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "90337a67-2cd3-48cf-bfab-46681625731f",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:44:26"
+      },
+      {
+        "created_at": "2026-03-15 15:45:54",
+        "execution_memory": {},
+        "last_error": "",
+        "last_failed_at": "",
+        "last_run_at": "",
+        "last_run_log": [],
+        "metadata": {},
+        "next_run_at": "2026-03-15 15:55:00",
+        "schedule": {
+          "run_at": "2026-03-15 15:55:00"
+        },
+        "schedule_type": "once",
+        "status": "active",
+        "steps": [
+          {
+            "save_result_as": "weather",
+            "tool": "gismeteo.get_current_weather"
+          }
+        ],
+        "task_id": "aff2f12b-c3cb-44c7-b2bf-560fd16d3174",
+        "template_text": "",
+        "timezone": "Europe/Moscow",
+        "title": "test_orchestrator_route",
+        "updated_at": "2026-03-15 15:45:54"
+      }
+    ],
+    "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+  },
+  "service": "scheduler",
+  "source_tool_name": "list_tasks",
+  "trace_id": "0d6711e0-6c86-48f4-a53c-06c74616f37c"
+}
+2026-03-15 15:46:19,606 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:46:20,477 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:46:20,478 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:46:21,342 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:46:21,342 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:46:21,979 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:46:21,979 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:46:21,995 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "public_tool_name": "scheduler.create_task",
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+}
+2026-03-15 15:46:21,996 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:22,655 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:22",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route",
+      "updated_at": "2026-03-15 15:46:22"
+    },
+    "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:22,655 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.create_task",
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:22",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route",
+      "updated_at": "2026-03-15 15:46:22"
+    },
+    "task_id": "ae430792-f7df-4937-8f27-3f2d77e7b297",
+    "title": "inspect_orchestrator_route",
+    "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+  },
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "9dcacb2f-88b9-45a9-a97f-c50629f09edd"
+}
+2026-03-15 15:46:56,676 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:46:57,561 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:46:57,562 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:46:58,407 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:46:58,407 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:46:59,058 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:46:59,059 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:46:59,075 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "public_tool_name": "scheduler.create_task",
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+}
+2026-03-15 15:46:59,075 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "schedule": {
+      "run_at": "2026-03-15 15:56"
+    },
+    "schedule_type": "once",
+    "steps": [
+      {
+        "save_result_as": "weather",
+        "tool": "gismeteo.get_current_weather"
+      }
+    ],
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:59,745 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:59",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route_2",
+      "updated_at": "2026-03-15 15:46:59"
+    },
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "server": "scheduler",
+  "tool": "create_task"
+}
+2026-03-15 15:46:59,746 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.create_task",
+  "result": {
+    "next_run_at": "2026-03-15 15:56:00",
+    "ok": true,
+    "schedule_type": "once",
+    "status": "active",
+    "steps_count": 1,
+    "task": {
+      "created_at": "2026-03-15 15:46:59",
+      "execution_memory": {},
+      "last_error": "",
+      "last_failed_at": "",
+      "last_run_at": "",
+      "last_run_log": [],
+      "metadata": {},
+      "next_run_at": "2026-03-15 15:56:00",
+      "schedule": {
+        "run_at": "2026-03-15 15:56:00"
+      },
+      "schedule_type": "once",
+      "status": "active",
+      "steps": [
+        {
+          "save_result_as": "weather",
+          "tool": "gismeteo.get_current_weather"
+        }
+      ],
+      "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+      "template_text": "",
+      "timezone": "Europe/Moscow",
+      "title": "inspect_orchestrator_route_2",
+      "updated_at": "2026-03-15 15:46:59"
+    },
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "title": "inspect_orchestrator_route_2",
+    "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+  },
+  "service": "scheduler",
+  "source_tool_name": "create_task",
+  "trace_id": "201f7f87-7887-4ffe-9512-d58649f14870"
+}
+2026-03-15 15:47:00,394 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:47:01,267 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:47:01,267 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:47:02,138 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:47:02,138 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:47:02,805 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:47:02,806 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
+2026-03-15 15:47:02,821 [INFO] ORCHESTRATOR_TOOL_REQUEST
+{
+  "arguments": {
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "public_tool_name": "scheduler.delete_task",
+  "service": "scheduler",
+  "source_tool_name": "delete_task",
+  "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+}
+2026-03-15 15:47:02,822 [INFO] REMOTE_MCP_CALL_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "arguments": {
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler",
+  "tool": "delete_task"
+}
+2026-03-15 15:47:03,495 [INFO] REMOTE_MCP_CALL_RESPONSE
+{
+  "result": {
+    "ok": true,
+    "status": "deleted",
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "server": "scheduler",
+  "tool": "delete_task"
+}
+2026-03-15 15:47:03,495 [INFO] ORCHESTRATOR_TOOL_RESPONSE
+{
+  "public_tool_name": "scheduler.delete_task",
+  "result": {
+    "ok": true,
+    "status": "deleted",
+    "task_id": "8e64b2ec-ae19-48b5-9678-418f7ad25ee1",
+    "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+  },
+  "service": "scheduler",
+  "source_tool_name": "delete_task",
+  "trace_id": "bf818895-36b3-41d3-9868-222463ca98bd"
+}
+2026-03-15 15:49:26,520 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_telegram_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "telegram"
+}
+2026-03-15 15:49:27,443 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "telegram",
+  "tools_count": 2
+}
+2026-03-15 15:49:27,443 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_gismeteo_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "gismeteo"
+}
+2026-03-15 15:49:28,319 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "gismeteo",
+  "tools_count": 1
+}
+2026-03-15 15:49:28,319 [INFO] REMOTE_MCP_LIST_TOOLS_REQUEST
+{
+  "args": [
+    "c:\\Development\\Python\\Projects\\AI Challenge\\run_scheduler_mcp.py"
+  ],
+  "command": "c:\\Development\\Python\\Projects\\AI Challenge\\.venv\\Scripts\\python.exe",
+  "server": "scheduler"
+}
+2026-03-15 15:49:28,989 [INFO] REMOTE_MCP_LIST_TOOLS_RESPONSE
+{
+  "server": "scheduler",
+  "tools_count": 5
+}
+2026-03-15 15:49:28,989 [INFO] ORCHESTRATOR_ROUTES_READY
+{
+  "services": [
+    "telegram",
+    "gismeteo",
+    "scheduler"
+  ],
+  "tools": [
+    "gismeteo.get_current_weather",
+    "scheduler.create_task",
+    "scheduler.delete_task",
+    "scheduler.get_task",
+    "scheduler.get_task_memory",
+    "scheduler.list_tasks",
+    "telegram.resolve_chat_id",
+    "telegram.send_message"
+  ]
+}
