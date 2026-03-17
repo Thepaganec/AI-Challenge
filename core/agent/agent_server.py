@@ -15,6 +15,7 @@ from core.agent.agent_logger import AgentFileLogger
 from core.agent.invariants import build_invariants_state, build_invariants_system_text
 from core.agent.memory_store import AgentMemoryStore
 from core.agent.profile_store import AgentProfileStore
+from core.agent.rag_retriever import RagError, RagRetriever
 from core.agent.strategies import (
     build_facts_strategy,
     build_sliding_window,
@@ -48,6 +49,14 @@ class LLMAgentServer:
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
         self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
+        self.rag = RagRetriever(
+            project_root=self.project_root,
+            rag_dir=str(os.getenv("RAG_DIR", "RAG")).strip() or "RAG",
+            ollama_url=str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).strip() or "http://127.0.0.1:11434",
+            model=str(os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")).strip() or "nomic-embed-text",
+            timeout_sec=max(5, int(str(os.getenv("RAG_OLLAMA_TIMEOUT_SEC", "30")).strip() or "30")),
+        )
+        self.rag_top_k_default = max(1, int(str(os.getenv("RAG_TOP_K_DEFAULT", "4")).strip() or "4"))
         self.mcp = MCPClient(logger=self.logger)
         self.scheduler_worker_process: Optional[asyncio.subprocess.Process] = None
 
@@ -884,6 +893,12 @@ class LLMAgentServer:
         strategy = str(request.get("context_strategy") or "sliding").strip().lower()
         user_text = str(request.get("user_text") or "").strip()
         use_profile = bool(request.get("use_profile", False))
+        use_rag = bool(request.get("use_rag", False))
+        rag_strategy = str(request.get("rag_strategy") or "fixed").strip().lower() or "fixed"
+        try:
+            rag_top_k = max(1, int(request.get("rag_top_k") or self.rag_top_k_default))
+        except Exception:
+            rag_top_k = self.rag_top_k_default
         if not user_text:
             await self._send_error(writer, "user_text is required")
             return
@@ -908,6 +923,8 @@ class LLMAgentServer:
 
         user_text_for_api = user_text
         system_text = None
+        rag_context_text = None
+        rag_chunks: List[Dict[str, Any]] = []
         if strategy == "facts":
             facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=facts)
             branch["facts"] = facts
@@ -919,6 +936,25 @@ class LLMAgentServer:
             branch["summary"] = summary_text
         else:
             history_for_llm = build_sliding_window(history, keep_last_n)
+
+        if use_rag:
+            await self._send_task_signal(
+                writer,
+                "rag",
+                "Выполняю retrieval по RAG-индексу",
+                {"strategy": rag_strategy, "top_k": rag_top_k},
+            )
+            try:
+                rag_chunks = await asyncio.to_thread(
+                    self.rag.retrieve,
+                    query=user_text,
+                    strategy=rag_strategy,
+                    top_k=rag_top_k,
+                )
+                rag_context_text = self.rag.build_rag_context(rag_chunks)
+            except RagError as e:
+                await self._send_error(writer, f"RAG error: {e}")
+                return
 
         memory_system_text = self._build_memory_system_text(memory_layers)
         profile_state = self.profile_store.get_state()
@@ -939,7 +975,15 @@ class LLMAgentServer:
         tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
         scheduler_task_protocol = self._build_scheduler_task_protocol(user_text, mcp_tools)
         scheduler_task_mode = bool(scheduler_task_protocol)
-        system_text = self._merge_system_text(memory_system_text, profile_system_text, system_text, invariants_text, tools_policy_text, scheduler_task_protocol)
+        system_text = self._merge_system_text(
+            memory_system_text,
+            profile_system_text,
+            system_text,
+            rag_context_text,
+            invariants_text,
+            tools_policy_text,
+            scheduler_task_protocol,
+        )
         working_messages = self._build_messages_for_llm(system_text=system_text, history_for_llm=history_for_llm, user_text=user_text_for_api)
         self._log(
             "INFO",
@@ -1062,11 +1106,17 @@ class LLMAgentServer:
                 continue
 
             final_answer = str(assistant_message.get("content") or "")
-            history.append({"role": "assistant", "content": final_answer})
             break
 
         if not final_answer:
             final_answer = "LLM не вернула финальный текстовый ответ."
+        if use_rag and rag_chunks:
+            sources_block = self.rag.build_sources_block(rag_chunks)
+            sources_chunk = f"\n\n{sources_block}"
+            final_answer = (final_answer.rstrip() + sources_chunk) if final_answer.strip() else sources_block
+            await self._send_json(writer, {"type": "chunk", "chunk": sources_chunk})
+
+        history.append({"role": "assistant", "content": final_answer})
 
         self._sync_short_term_from_history(memory_layers, history)
         branch["history"] = history
@@ -1108,6 +1158,10 @@ class LLMAgentServer:
             "invariants_reason": invariants_check.get("reason") or "",
             "tool_iterations": loop_guard,
             "tools_available": len(mcp_tools),
+            "use_rag": use_rag,
+            "rag_strategy": rag_strategy if use_rag else "off",
+            "rag_top_k": rag_top_k if use_rag else 0,
+            "rag_sources_count": len(rag_chunks) if use_rag else 0,
         }
         cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
         await self._send_task_signal(writer, "done", "Ответ сформирован", {"tool_iterations": loop_guard})

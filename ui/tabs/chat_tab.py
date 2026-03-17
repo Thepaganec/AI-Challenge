@@ -11,6 +11,7 @@ from PySide6.QtGui import QTextCursor, QFont
 
 from ui.tabs.base_tab import BaseTab
 from ui.tabs.metrics_memory_tab import MetricsMemoryTab
+from ui.custom_objects.toggle_switch import ToggleSwitch
 from core.agent.agent_client import AgentClient
 from extra.global_utils import set_editbox_height
 
@@ -226,6 +227,17 @@ class ChatTab(BaseTab):
         self.summary_max_tokens_input.setRange(32, 8000)
         self.summary_max_tokens_input.setValue(600)
 
+        self.rag_use_toggle = ToggleSwitch()
+        self.rag_use_toggle.setChecked(False)
+        self.rag_use_toggle.toggled.connect(self.on_rag_toggle_changed)
+        self.rag_use_toggle.toggled.connect(lambda _checked: self.save_window_state())
+        self.rag_base_toggle = ToggleSwitch()
+        self.rag_base_toggle.setChecked(False)
+        self.rag_base_toggle.setEnabled(False)
+        self.rag_base_toggle.toggled.connect(self.on_rag_base_toggle_changed)
+        self.rag_base_toggle.toggled.connect(lambda _checked: self.save_window_state())
+        self.rag_base_value_label = QLabel("fixed")
+
         # branching controls
         self.branch_selector = QComboBox()
         self.branch_selector.setFixedWidth(240)
@@ -347,6 +359,19 @@ class ChatTab(BaseTab):
         p_l.addWidget(row4)
         p_l.addWidget(row5)
         p_l.addWidget(row6)
+
+        row7 = QWidget()
+        r7 = QHBoxLayout(row7)
+        r7.setContentsMargins(0, 0, 0, 0)
+        r7.setSpacing(8)
+        r7.addWidget(QLabel("RAG:"))
+        r7.addWidget(self.rag_use_toggle, alignment=Qt.AlignLeft)
+        r7.addSpacing(12)
+        r7.addWidget(QLabel("RAG база (fixed/structural):"))
+        r7.addWidget(self.rag_base_toggle, alignment=Qt.AlignLeft)
+        r7.addWidget(self.rag_base_value_label)
+        r7.addStretch(1)
+        p_l.addWidget(row7)
 
         self.summary_params_row = QWidget()
         spr = QHBoxLayout(self.summary_params_row)
@@ -522,6 +547,8 @@ class ChatTab(BaseTab):
             state = {
                 "log_splitter": self.log_splitter.saveState().toHex().data().decode(),
                 "vertical_splitter": self.vertical_splitter.saveState().toHex().data().decode(),
+                "rag_enabled": bool(self.rag_use_toggle.isChecked()),
+                "rag_structural": bool(self.rag_base_toggle.isChecked()),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -541,6 +568,10 @@ class ChatTab(BaseTab):
                 self.log_splitter.restoreState(QByteArray.fromHex(str(state["log_splitter"]).encode()))
             if "vertical_splitter" in state:
                 self.vertical_splitter.restoreState(QByteArray.fromHex(str(state["vertical_splitter"]).encode()))
+            self.rag_use_toggle.setChecked(bool(state.get("rag_enabled", False)))
+            self.rag_base_toggle.setChecked(bool(state.get("rag_structural", False)))
+            self.on_rag_toggle_changed(self.rag_use_toggle.isChecked())
+            self.on_rag_base_toggle_changed(self.rag_base_toggle.isChecked())
         except Exception as e:
             self.logger.error(f"Ошибка загрузки состояния окна для вкладки ChatTab: {e}")
 
@@ -1408,6 +1439,26 @@ class ChatTab(BaseTab):
 
     # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
+    def on_rag_toggle_changed(self, checked: bool):
+        enabled = bool(checked)
+        self.rag_base_toggle.setEnabled(enabled)
+        strategy = "structural" if self.rag_base_toggle.isChecked() else "fixed"
+        self.rag_base_value_label.setText(strategy)
+        if enabled:
+            self.logger.info(f"RAG включен. Стратегия базы: {strategy}.")
+        else:
+            self.logger.info("RAG выключен. Используется обычный режим без retrieval.")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
+    def on_rag_base_toggle_changed(self, checked: bool):
+        strategy = "structural" if bool(checked) else "fixed"
+        self.rag_base_value_label.setText(strategy)
+        if self.rag_use_toggle.isChecked():
+            self.logger.info(f"RAG база переключена на {strategy}.")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_branch_changed(self):
         if self.strategy_selector.currentData() != "branching":
             return
@@ -1522,6 +1573,9 @@ class ChatTab(BaseTab):
         keep_last_n = int(self.keep_last_n_input.value())
         strategy = self.strategy_selector.currentData()
         use_profile = bool(self.profile_use_toggle.isEnabled() and self.profile_use_toggle.isChecked())
+        use_rag = bool(self.rag_use_toggle.isChecked())
+        rag_strategy = "structural" if self.rag_base_toggle.isChecked() else "fixed"
+        rag_top_k = 4
         summary_config = None
         if strategy == "summary":
             summary_config = {
@@ -1543,6 +1597,9 @@ class ChatTab(BaseTab):
                 memory_write=self.pending_memory_write,
                 use_profile=use_profile,
                 summary_config=summary_config,
+                use_rag=use_rag,
+                rag_strategy=rag_strategy,
+                rag_top_k=rag_top_k,
             )
         )
         self.pending_memory_write = None
@@ -1561,6 +1618,9 @@ class ChatTab(BaseTab):
         memory_write=None,
         use_profile: bool = False,
         summary_config: dict | None = None,
+        use_rag: bool = False,
+        rag_strategy: str = "fixed",
+        rag_top_k: int = 4,
     ):
         t0 = time.perf_counter()
         ttft_sec = None
@@ -1592,6 +1652,9 @@ class ChatTab(BaseTab):
                 memory_write=memory_write,
                 use_profile=use_profile,
                 summary_config=summary_config,
+                use_rag=use_rag,
+                rag_strategy=rag_strategy,
+                rag_top_k=rag_top_k,
             )
 
             async for chunk in gen:
@@ -1669,6 +1732,9 @@ class ChatTab(BaseTab):
             task_injected_stat = bool(ms.get("task_injected", False))
             mcp_connected = bool(mcp_info.get("connected", False))
             mcp_tools_count = int(mcp_info.get("tools_count") or len(mcp_info.get("tools") or []))
+            rag_enabled_stat = bool(ms.get("use_rag", use_rag))
+            rag_strategy_stat = str(ms.get("rag_strategy") or ("structural" if rag_strategy == "structural" else "fixed"))
+            rag_sources_count_stat = int(ms.get("rag_sources_count") or 0)
             self.sent_len_label.setText(f"API context tokens(est): {api_context_tokens if api_context_tokens is not None else 'N/A'}")
 
             line = (
@@ -1678,7 +1744,8 @@ class ChatTab(BaseTab):
                 f"Temp={temp_str} | max_tokens={max_tokens} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
                 f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat} | "
                 f"task_state={task_state_stat} | task_step={task_step_stat}/{task_total_stat} | task_paused={task_paused_stat} | task_injected={task_injected_stat} | "
-                f"mcp_connected={mcp_connected} | mcp_tools={mcp_tools_count}"
+                f"mcp_connected={mcp_connected} | mcp_tools={mcp_tools_count} | "
+                f"use_rag={rag_enabled_stat} | rag_strategy={rag_strategy_stat} | rag_sources={rag_sources_count_stat}"
             )
             if facts_count is not None:
                 line += f" | facts={facts_count}"

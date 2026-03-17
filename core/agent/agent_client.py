@@ -279,6 +279,9 @@ class AgentClient:
         memory_write: Optional[Dict[str, str]] = None,
         use_profile: bool = False,
         summary_config: Optional[Dict[str, Any]] = None,
+        use_rag: bool = False,
+        rag_strategy: str = "fixed",
+        rag_top_k: int = 4,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -316,6 +319,9 @@ class AgentClient:
             request["memory_write"] = memory_write
         if request["context_strategy"] == "summary" and isinstance(summary_config, dict):
             request["summary_config"] = summary_config
+        request["use_rag"] = bool(use_rag)
+        request["rag_strategy"] = str(rag_strategy or "fixed").strip().lower()
+        request["rag_top_k"] = max(1, int(rag_top_k or 4))
 
         async with self._conn_lock:
             try:
