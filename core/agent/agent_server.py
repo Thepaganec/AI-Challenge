@@ -55,8 +55,21 @@ class LLMAgentServer:
             ollama_url=str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).strip() or "http://127.0.0.1:11434",
             model=str(os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")).strip() or "nomic-embed-text",
             timeout_sec=max(5, int(str(os.getenv("RAG_OLLAMA_TIMEOUT_SEC", "30")).strip() or "30")),
+            llm_base_url=str(os.getenv("RAG_LLM_BASE_URL", base_url)).strip() or base_url,
+            llm_api_key_env=str(os.getenv("RAG_LLM_API_KEY_ENV", api_key_env)).strip() or api_key_env,
+            llm_model=str(os.getenv("RAG_LLM_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini",
+            llm_timeout_sec=max(5, int(str(os.getenv("RAG_LLM_TIMEOUT_SEC", "40")).strip() or "40")),
+            heuristic_w_semantic=float(str(os.getenv("RAG_HEURISTIC_W_SEMANTIC", "0.8")).strip() or "0.8"),
+            heuristic_w_lexical=float(str(os.getenv("RAG_HEURISTIC_W_LEXICAL", "0.2")).strip() or "0.2"),
+            llm_rerank_max_chunks=max(1, int(str(os.getenv("RAG_LLM_RERANK_MAX_CHUNKS", "8")).strip() or "8")),
+            llm_rerank_max_chars_per_chunk=max(200, int(str(os.getenv("RAG_LLM_RERANK_MAX_CHARS", "1200")).strip() or "1200")),
         )
         self.rag_top_k_default = max(1, int(str(os.getenv("RAG_TOP_K_DEFAULT", "4")).strip() or "4"))
+        self.rag_top_k_before_default = max(1, int(str(os.getenv("RAG_TOP_K_BEFORE_DEFAULT", "10")).strip() or "10"))
+        self.rag_similarity_threshold_default = float(str(os.getenv("RAG_SIMILARITY_THRESHOLD_DEFAULT", "0.5")).strip() or "0.5")
+        self.rag_top_k_after_default = max(1, int(str(os.getenv("RAG_TOP_K_AFTER_DEFAULT", "5")).strip() or "5"))
+        self.rag_rewrite_default = str(os.getenv("RAG_REWRITE_DEFAULT", "false")).strip().lower() in {"1", "true", "yes", "on"}
+        self.rag_rerank_mode_default = str(os.getenv("RAG_RERANK_MODE_DEFAULT", "none")).strip().lower() or "none"
         self.mcp = MCPClient(logger=self.logger)
         self.scheduler_worker_process: Optional[asyncio.subprocess.Process] = None
 
@@ -899,6 +912,21 @@ class LLMAgentServer:
             rag_top_k = max(1, int(request.get("rag_top_k") or self.rag_top_k_default))
         except Exception:
             rag_top_k = self.rag_top_k_default
+        rag_rewrite_enabled = bool(request.get("rag_rewrite_enabled", self.rag_rewrite_default))
+        rag_rerank_mode = str(request.get("rag_rerank_mode") or self.rag_rerank_mode_default).strip().lower() or "none"
+        try:
+            rag_top_k_before = max(1, int(request.get("rag_top_k_before") or self.rag_top_k_before_default))
+        except Exception:
+            rag_top_k_before = self.rag_top_k_before_default
+        try:
+            rag_similarity_threshold = float(request.get("rag_similarity_threshold"))
+        except Exception:
+            rag_similarity_threshold = self.rag_similarity_threshold_default
+        try:
+            rag_top_k_after = max(1, int(request.get("rag_top_k_after") or self.rag_top_k_after_default))
+        except Exception:
+            rag_top_k_after = self.rag_top_k_after_default
+        rag_similarity_threshold = max(0.0, min(1.0, rag_similarity_threshold))
         if not user_text:
             await self._send_error(writer, "user_text is required")
             return
@@ -942,7 +970,15 @@ class LLMAgentServer:
                 writer,
                 "rag",
                 "Выполняю retrieval по RAG-индексу",
-                {"strategy": rag_strategy, "top_k": rag_top_k},
+                {
+                    "strategy": rag_strategy,
+                    "top_k": rag_top_k,
+                    "rewrite": rag_rewrite_enabled,
+                    "rerank_mode": rag_rerank_mode,
+                    "top_k_before": rag_top_k_before,
+                    "similarity_threshold": rag_similarity_threshold,
+                    "top_k_after": rag_top_k_after,
+                },
             )
             try:
                 rag_chunks = await asyncio.to_thread(
@@ -950,6 +986,11 @@ class LLMAgentServer:
                     query=user_text,
                     strategy=rag_strategy,
                     top_k=rag_top_k,
+                    rewrite_enabled=rag_rewrite_enabled,
+                    rerank_mode=rag_rerank_mode,
+                    top_k_before=rag_top_k_before,
+                    similarity_threshold=rag_similarity_threshold,
+                    top_k_after=rag_top_k_after,
                 )
                 rag_context_text = self.rag.build_rag_context(rag_chunks)
             except RagError as e:
@@ -1015,6 +1056,7 @@ class LLMAgentServer:
         tool_events: List[Dict[str, Any]] = []
         loop_guard = 0
         max_tool_iterations = max(8, int(str(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "32")).strip() or "32"))
+        rag_meta = dict(self.rag.last_run_meta) if use_rag and isinstance(getattr(self.rag, "last_run_meta", None), dict) else {}
         history.append({"role": "user", "content": user_text})
 
         while loop_guard < max_tool_iterations:
@@ -1162,6 +1204,18 @@ class LLMAgentServer:
             "rag_strategy": rag_strategy if use_rag else "off",
             "rag_top_k": rag_top_k if use_rag else 0,
             "rag_sources_count": len(rag_chunks) if use_rag else 0,
+            "rag_rewrite_enabled": bool(rag_meta.get("rewrite_enabled", rag_rewrite_enabled)) if use_rag else False,
+            "rag_rewrite_applied": bool(rag_meta.get("rewrite_applied", False)) if use_rag else False,
+            "rag_rerank_mode": str(rag_meta.get("rerank_mode") or rag_rerank_mode) if use_rag else "off",
+            "rag_top_k_before": int(rag_meta.get("top_k_before") or rag_top_k_before) if use_rag else 0,
+            "rag_similarity_threshold": float(rag_meta.get("similarity_threshold") or rag_similarity_threshold) if use_rag else 0.0,
+            "rag_top_k_after": int(rag_meta.get("top_k_after") or rag_top_k_after) if use_rag else 0,
+            "rag_candidates_before": int(rag_meta.get("initial_candidates_count") or rag_top_k_before) if use_rag else 0,
+            "rag_candidates_after": int(rag_meta.get("final_candidates_count") or len(rag_chunks)) if use_rag else 0,
+            "rag_rewrite_error": str(rag_meta.get("rewrite_error") or "") if use_rag else "",
+            "rag_rerank_error": str(rag_meta.get("rerank_error") or "") if use_rag else "",
+            "rag_query_original": str(rag_meta.get("original_query") or user_text) if use_rag else "",
+            "rag_query_effective": str(rag_meta.get("effective_query") or user_text) if use_rag else "",
         }
         cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
         await self._send_task_signal(writer, "done", "Ответ сформирован", {"tool_iterations": loop_guard})

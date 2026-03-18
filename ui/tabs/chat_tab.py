@@ -237,6 +237,58 @@ class ChatTab(BaseTab):
         self.rag_base_toggle.toggled.connect(self.on_rag_base_toggle_changed)
         self.rag_base_toggle.toggled.connect(lambda _checked: self.save_window_state())
         self.rag_base_value_label = QLabel("fixed")
+        self.rag_rewrite_toggle = ToggleSwitch()
+        self.rag_rewrite_toggle.setChecked(False)
+        self.rag_rewrite_toggle.setEnabled(False)
+        self.rag_rewrite_toggle.toggled.connect(lambda _checked: self.save_window_state())
+        self.rag_mode_selector = QComboBox()
+        self.rag_mode_selector.setFixedWidth(130)
+        self.rag_mode_selector.addItem("none", "none")
+        self.rag_mode_selector.addItem("threshold", "threshold")
+        self.rag_mode_selector.addItem("heuristic", "heuristic")
+        self.rag_mode_selector.addItem("llm", "llm")
+        self.rag_mode_selector.setEnabled(False)
+        self.rag_mode_selector.currentIndexChanged.connect(lambda _idx: self.save_window_state())
+        self.rag_top_k_before_input = QSpinBox()
+        self.rag_top_k_before_input.setRange(1, 100)
+        self.rag_top_k_before_input.setValue(10)
+        self.rag_top_k_before_input.setFixedWidth(90)
+        self.rag_top_k_before_input.setEnabled(False)
+        self.rag_top_k_before_input.valueChanged.connect(lambda _value: self.save_window_state())
+        self.rag_similarity_threshold_input = QDoubleSpinBox()
+        self.rag_similarity_threshold_input.setRange(0.0, 1.0)
+        self.rag_similarity_threshold_input.setDecimals(2)
+        self.rag_similarity_threshold_input.setSingleStep(0.05)
+        self.rag_similarity_threshold_input.setValue(0.5)
+        self.rag_similarity_threshold_input.setFixedWidth(90)
+        self.rag_similarity_threshold_input.setEnabled(False)
+        self.rag_similarity_threshold_input.valueChanged.connect(lambda _value: self.save_window_state())
+        self.rag_top_k_after_input = QSpinBox()
+        self.rag_top_k_after_input.setRange(1, 100)
+        self.rag_top_k_after_input.setValue(5)
+        self.rag_top_k_after_input.setFixedWidth(90)
+        self.rag_top_k_after_input.setEnabled(False)
+        self.rag_top_k_after_input.valueChanged.connect(lambda _value: self.save_window_state())
+        try:
+            self.rag_top_k_before_input.setValue(max(1, int(str(os.getenv("RAG_TOP_K_BEFORE_DEFAULT", "10")).strip() or "10")))
+        except Exception:
+            self.rag_top_k_before_input.setValue(10)
+        try:
+            self.rag_similarity_threshold_input.setValue(
+                max(0.0, min(1.0, float(str(os.getenv("RAG_SIMILARITY_THRESHOLD_DEFAULT", "0.5")).strip() or "0.5")))
+            )
+        except Exception:
+            self.rag_similarity_threshold_input.setValue(0.5)
+        try:
+            self.rag_top_k_after_input.setValue(max(1, int(str(os.getenv("RAG_TOP_K_AFTER_DEFAULT", "5")).strip() or "5")))
+        except Exception:
+            self.rag_top_k_after_input.setValue(5)
+        self.rag_rewrite_toggle.setChecked(
+            str(os.getenv("RAG_REWRITE_DEFAULT", "false")).strip().lower() in {"1", "true", "yes", "on"}
+        )
+        mode_default = str(os.getenv("RAG_RERANK_MODE_DEFAULT", "none")).strip().lower() or "none"
+        mode_idx = self.rag_mode_selector.findData(mode_default)
+        self.rag_mode_selector.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
 
         # branching controls
         self.branch_selector = QComboBox()
@@ -372,6 +424,24 @@ class ChatTab(BaseTab):
         r7.addWidget(self.rag_base_value_label)
         r7.addStretch(1)
         p_l.addWidget(row7)
+
+        row8 = QWidget()
+        r8 = QHBoxLayout(row8)
+        r8.setContentsMargins(0, 0, 0, 0)
+        r8.setSpacing(8)
+        r8.addWidget(QLabel("Rewrite:"))
+        r8.addWidget(self.rag_rewrite_toggle, alignment=Qt.AlignLeft)
+        r8.addSpacing(12)
+        r8.addWidget(QLabel("Rerank:"))
+        r8.addWidget(self.rag_mode_selector)
+        r8.addWidget(QLabel("TopK before:"))
+        r8.addWidget(self.rag_top_k_before_input)
+        r8.addWidget(QLabel("Threshold:"))
+        r8.addWidget(self.rag_similarity_threshold_input)
+        r8.addWidget(QLabel("TopK after:"))
+        r8.addWidget(self.rag_top_k_after_input)
+        r8.addStretch(1)
+        p_l.addWidget(row8)
 
         self.summary_params_row = QWidget()
         spr = QHBoxLayout(self.summary_params_row)
@@ -549,6 +619,11 @@ class ChatTab(BaseTab):
                 "vertical_splitter": self.vertical_splitter.saveState().toHex().data().decode(),
                 "rag_enabled": bool(self.rag_use_toggle.isChecked()),
                 "rag_structural": bool(self.rag_base_toggle.isChecked()),
+                "rag_rewrite": bool(self.rag_rewrite_toggle.isChecked()),
+                "rag_mode": str(self.rag_mode_selector.currentData() or "none"),
+                "rag_top_k_before": int(self.rag_top_k_before_input.value()),
+                "rag_similarity_threshold": float(self.rag_similarity_threshold_input.value()),
+                "rag_top_k_after": int(self.rag_top_k_after_input.value()),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -570,6 +645,24 @@ class ChatTab(BaseTab):
                 self.vertical_splitter.restoreState(QByteArray.fromHex(str(state["vertical_splitter"]).encode()))
             self.rag_use_toggle.setChecked(bool(state.get("rag_enabled", False)))
             self.rag_base_toggle.setChecked(bool(state.get("rag_structural", False)))
+            self.rag_rewrite_toggle.setChecked(bool(state.get("rag_rewrite", self.rag_rewrite_toggle.isChecked())))
+            mode_saved = str(state.get("rag_mode") or "none").strip().lower() or "none"
+            mode_idx = self.rag_mode_selector.findData(mode_saved)
+            if mode_idx >= 0:
+                self.rag_mode_selector.setCurrentIndex(mode_idx)
+            try:
+                self.rag_top_k_before_input.setValue(max(1, int(state.get("rag_top_k_before", self.rag_top_k_before_input.value()))))
+            except Exception:
+                pass
+            try:
+                threshold = float(state.get("rag_similarity_threshold", self.rag_similarity_threshold_input.value()))
+                self.rag_similarity_threshold_input.setValue(max(0.0, min(1.0, threshold)))
+            except Exception:
+                pass
+            try:
+                self.rag_top_k_after_input.setValue(max(1, int(state.get("rag_top_k_after", self.rag_top_k_after_input.value()))))
+            except Exception:
+                pass
             self.on_rag_toggle_changed(self.rag_use_toggle.isChecked())
             self.on_rag_base_toggle_changed(self.rag_base_toggle.isChecked())
         except Exception as e:
@@ -1442,6 +1535,11 @@ class ChatTab(BaseTab):
     def on_rag_toggle_changed(self, checked: bool):
         enabled = bool(checked)
         self.rag_base_toggle.setEnabled(enabled)
+        self.rag_rewrite_toggle.setEnabled(enabled)
+        self.rag_mode_selector.setEnabled(enabled)
+        self.rag_top_k_before_input.setEnabled(enabled)
+        self.rag_similarity_threshold_input.setEnabled(enabled)
+        self.rag_top_k_after_input.setEnabled(enabled)
         strategy = "structural" if self.rag_base_toggle.isChecked() else "fixed"
         self.rag_base_value_label.setText(strategy)
         if enabled:
@@ -1576,6 +1674,11 @@ class ChatTab(BaseTab):
         use_rag = bool(self.rag_use_toggle.isChecked())
         rag_strategy = "structural" if self.rag_base_toggle.isChecked() else "fixed"
         rag_top_k = 4
+        rag_rewrite_enabled = bool(self.rag_rewrite_toggle.isChecked())
+        rag_rerank_mode = str(self.rag_mode_selector.currentData() or "none").strip().lower() or "none"
+        rag_top_k_before = int(self.rag_top_k_before_input.value())
+        rag_similarity_threshold = float(self.rag_similarity_threshold_input.value())
+        rag_top_k_after = int(self.rag_top_k_after_input.value())
         summary_config = None
         if strategy == "summary":
             summary_config = {
@@ -1600,6 +1703,11 @@ class ChatTab(BaseTab):
                 use_rag=use_rag,
                 rag_strategy=rag_strategy,
                 rag_top_k=rag_top_k,
+                rag_rewrite_enabled=rag_rewrite_enabled,
+                rag_rerank_mode=rag_rerank_mode,
+                rag_top_k_before=rag_top_k_before,
+                rag_similarity_threshold=rag_similarity_threshold,
+                rag_top_k_after=rag_top_k_after,
             )
         )
         self.pending_memory_write = None
@@ -1621,6 +1729,11 @@ class ChatTab(BaseTab):
         use_rag: bool = False,
         rag_strategy: str = "fixed",
         rag_top_k: int = 4,
+        rag_rewrite_enabled: bool = False,
+        rag_rerank_mode: str = "none",
+        rag_top_k_before: int = 10,
+        rag_similarity_threshold: float = 0.5,
+        rag_top_k_after: int = 5,
     ):
         t0 = time.perf_counter()
         ttft_sec = None
@@ -1655,6 +1768,11 @@ class ChatTab(BaseTab):
                 use_rag=use_rag,
                 rag_strategy=rag_strategy,
                 rag_top_k=rag_top_k,
+                rag_rewrite_enabled=rag_rewrite_enabled,
+                rag_rerank_mode=rag_rerank_mode,
+                rag_top_k_before=rag_top_k_before,
+                rag_similarity_threshold=rag_similarity_threshold,
+                rag_top_k_after=rag_top_k_after,
             )
 
             async for chunk in gen:
@@ -1735,6 +1853,16 @@ class ChatTab(BaseTab):
             rag_enabled_stat = bool(ms.get("use_rag", use_rag))
             rag_strategy_stat = str(ms.get("rag_strategy") or ("structural" if rag_strategy == "structural" else "fixed"))
             rag_sources_count_stat = int(ms.get("rag_sources_count") or 0)
+            rag_rewrite_enabled_stat = bool(ms.get("rag_rewrite_enabled", rag_rewrite_enabled))
+            rag_rewrite_applied_stat = bool(ms.get("rag_rewrite_applied", False))
+            rag_rerank_mode_stat = str(ms.get("rag_rerank_mode") or rag_rerank_mode or "none")
+            rag_top_k_before_stat = int(ms.get("rag_top_k_before") or rag_top_k_before)
+            rag_threshold_stat = float(ms.get("rag_similarity_threshold") or rag_similarity_threshold)
+            rag_top_k_after_stat = int(ms.get("rag_top_k_after") or rag_top_k_after)
+            rag_candidates_before_stat = int(ms.get("rag_candidates_before") or rag_top_k_before_stat)
+            rag_candidates_after_stat = int(ms.get("rag_candidates_after") or rag_sources_count_stat)
+            rag_rewrite_error_stat = str(ms.get("rag_rewrite_error") or "").strip()
+            rag_rerank_error_stat = str(ms.get("rag_rerank_error") or "").strip()
             self.sent_len_label.setText(f"API context tokens(est): {api_context_tokens if api_context_tokens is not None else 'N/A'}")
 
             line = (
@@ -1745,12 +1873,19 @@ class ChatTab(BaseTab):
                 f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat} | "
                 f"task_state={task_state_stat} | task_step={task_step_stat}/{task_total_stat} | task_paused={task_paused_stat} | task_injected={task_injected_stat} | "
                 f"mcp_connected={mcp_connected} | mcp_tools={mcp_tools_count} | "
-                f"use_rag={rag_enabled_stat} | rag_strategy={rag_strategy_stat} | rag_sources={rag_sources_count_stat}"
+                f"use_rag={rag_enabled_stat} | rag_strategy={rag_strategy_stat} | rag_sources={rag_sources_count_stat} | "
+                f"rag_rewrite={rag_rewrite_enabled_stat}/{rag_rewrite_applied_stat} | rag_mode={rag_rerank_mode_stat} | "
+                f"rag_k={rag_top_k_before_stat}->{rag_top_k_after_stat} | rag_threshold={rag_threshold_stat:.2f} | "
+                f"rag_candidates={rag_candidates_before_stat}->{rag_candidates_after_stat}"
             )
             if facts_count is not None:
                 line += f" | facts={facts_count}"
             if isinstance(tool_events, list) and tool_events:
                 line += f" | tool_events={len(tool_events)}"
+            if rag_rewrite_error_stat:
+                line += f" | rag_rewrite_error={rag_rewrite_error_stat}"
+            if rag_rerank_error_stat:
+                line += f" | rag_rerank_error={rag_rerank_error_stat}"
 
             if error_text:
                 short = error_text.replace("\n", " ")

@@ -282,6 +282,11 @@ class AgentClient:
         use_rag: bool = False,
         rag_strategy: str = "fixed",
         rag_top_k: int = 4,
+        rag_rewrite_enabled: bool = False,
+        rag_rerank_mode: str = "none",
+        rag_top_k_before: int = 10,
+        rag_similarity_threshold: float = 0.5,
+        rag_top_k_after: int = 5,
     ) -> AsyncIterator[str]:
         self.last_usage = {}
         self.last_cost_rub = None
@@ -322,6 +327,11 @@ class AgentClient:
         request["use_rag"] = bool(use_rag)
         request["rag_strategy"] = str(rag_strategy or "fixed").strip().lower()
         request["rag_top_k"] = max(1, int(rag_top_k or 4))
+        request["rag_rewrite_enabled"] = bool(rag_rewrite_enabled)
+        request["rag_rerank_mode"] = str(rag_rerank_mode or "none").strip().lower()
+        request["rag_top_k_before"] = max(1, int(rag_top_k_before or 10))
+        request["rag_similarity_threshold"] = float(rag_similarity_threshold if rag_similarity_threshold is not None else 0.5)
+        request["rag_top_k_after"] = max(1, int(rag_top_k_after or 5))
 
         async with self._conn_lock:
             try:
