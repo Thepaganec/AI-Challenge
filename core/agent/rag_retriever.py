@@ -110,8 +110,12 @@ class RagRetriever:
             joined.append(
                 {
                     "chunk_id": chunk_id,
+                    "source": str(chunk.get("source") or item.get("source") or "repo"),
+                    "title": str(chunk.get("title") or item.get("title") or chunk.get("file") or item.get("file") or ""),
                     "file": str(chunk.get("file") or item.get("file") or ""),
+                    "path": str(chunk.get("path") or item.get("path") or ""),
                     "section": str(chunk.get("section") or item.get("section") or ""),
+                    "strategy": str(chunk.get("strategy") or item.get("strategy") or strategy),
                     "start_line": int(chunk.get("start_line") or 0),
                     "end_line": int(chunk.get("end_line") or 0),
                     "content": content,
@@ -529,12 +533,17 @@ class RagRetriever:
     def build_sources_block(chunks: List[Dict[str, Any]]) -> str:
         lines: List[str] = ["Источники:"]
         for idx, item in enumerate(chunks, start=1):
+            chunk_id = str(item.get("chunk_id") or "")
+            source = str(item.get("source") or "repo")
             file_path = str(item.get("file") or "")
+            title = str(item.get("title") or file_path)
             section = str(item.get("section") or "")
+            strategy = str(item.get("strategy") or "")
             start_ln = int(item.get("start_line") or 0)
             end_ln = int(item.get("end_line") or 0)
             score = float(item.get("score") or 0.0)
             lines.append(
-                f"{idx}) {file_path} | {section} | lines {start_ln}-{end_ln} | score={score:.4f}"
+                f"{idx}) {source} | chunk_id={chunk_id} | {file_path} | {title} | {section} | "
+                f"{strategy} | lines {start_ln}-{end_ln} | score={score:.4f}"
             )
         return "\n".join(lines).strip()

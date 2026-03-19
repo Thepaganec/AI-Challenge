@@ -391,6 +391,260 @@ class LLMAgentServer:
         messages.append({"role": "user", "content": user_text})
         return messages
 
+    @staticmethod
+    def _parse_json_object_text(text: Any) -> Dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines:
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if 0 <= start < end:
+            snippet = raw[start : end + 1]
+            try:
+                obj2 = json.loads(snippet)
+                return obj2 if isinstance(obj2, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _clip_text(value: Any, max_len: int = 240) -> str:
+        clean = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(clean) <= max_len:
+            return clean
+        return clean[: max(0, max_len - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _source_match_key(item: Dict[str, Any]) -> Tuple[str, str, int, int, str]:
+        return (
+            str(item.get("file") or "").strip().lower(),
+            str(item.get("section") or "").strip().lower(),
+            int(item.get("start_line") or 0),
+            int(item.get("end_line") or 0),
+            str(item.get("strategy") or "").strip().lower(),
+        )
+
+    async def _synthesize_rag_answer(
+        self,
+        *,
+        user_text: str,
+        draft_answer: str,
+        rag_chunks: List[Dict[str, Any]],
+        rag_similarity_threshold: float,
+    ) -> Tuple[str, Dict[str, Any]]:
+        if not rag_chunks:
+            unknown_text = "Ответ: Не знаю. В контексте RAG не найдено релевантных фрагментов. Уточните запрос."
+            return unknown_text, {
+                "is_unknown": True,
+                "unknown_reason": "RAG returned no chunks",
+                "sources_count": 0,
+                "synthesis_error": "",
+                "forced_unknown_by_threshold": True,
+                "max_score": 0.0,
+            }
+
+        max_score = max(float(item.get("score") or 0.0) for item in rag_chunks)
+        forced_unknown_by_threshold = bool(max_score < float(rag_similarity_threshold))
+
+        compact_chunks: List[Dict[str, Any]] = []
+        by_chunk_id: Dict[str, Dict[str, Any]] = {}
+        by_match_key: Dict[Tuple[str, str, int, int, str], List[Dict[str, Any]]] = {}
+        for item in rag_chunks:
+            chunk_id = str(item.get("chunk_id") or "").strip()
+            normalized = {
+                "chunk_id": chunk_id,
+                "source": str(item.get("source") or "repo"),
+                "file": str(item.get("file") or ""),
+                "title": str(item.get("title") or item.get("file") or ""),
+                "section": str(item.get("section") or ""),
+                "strategy": str(item.get("strategy") or ""),
+                "start_line": int(item.get("start_line") or 0),
+                "end_line": int(item.get("end_line") or 0),
+                "score": float(item.get("score") or 0.0),
+                "content": str(item.get("content") or ""),
+            }
+            compact_chunks.append(
+                {
+                    **normalized,
+                    "content": str(normalized["content"])[:1800],
+                }
+            )
+            if chunk_id:
+                by_chunk_id[chunk_id] = normalized
+            key = self._source_match_key(normalized)
+            bucket = by_match_key.get(key)
+            if bucket is None:
+                by_match_key[key] = [normalized]
+            else:
+                bucket.append(normalized)
+
+        prompt_system = (
+            "You are a strict RAG answer formatter.\n"
+            "Return strict JSON only with this schema:\n"
+            "{\n"
+            "  \"answer_text\": \"string\",\n"
+            "  \"sources\": [\n"
+            "    {\n"
+            "      \"chunk_id\": \"string\",\n"
+            "      \"source\": \"string\",\n"
+            "      \"file\": \"string\",\n"
+            "      \"title\": \"string\",\n"
+            "      \"section\": \"string\",\n"
+            "      \"strategy\": \"string\",\n"
+            "      \"start_line\": 0,\n"
+            "      \"end_line\": 0,\n"
+            "      \"quote\": \"string\"\n"
+            "    }\n"
+            "  ],\n"
+            "  \"unknown\": {\n"
+            "    \"is_unknown\": false,\n"
+            "    \"reason\": \"string\"\n"
+            "  }\n"
+            "}\n"
+            "Rules:\n"
+            "1) Use only provided chunks as facts. No external knowledge.\n"
+            "2) One key thesis in answer_text must be backed by at least one source with quote.\n"
+            "3) If information is insufficient, set unknown.is_unknown=true and explicitly say you do not know in answer_text.\n"
+            "4) Never invent chunk ids, files, sections, lines or quotes.\n"
+            "5) Keep quotes short exact snippets from chunk content.\n"
+        )
+        prompt_user_payload = {
+            "question": user_text,
+            "draft_answer": draft_answer,
+            "force_unknown_due_threshold": forced_unknown_by_threshold,
+            "threshold": float(rag_similarity_threshold),
+            "max_score": float(max_score),
+            "chunks": compact_chunks,
+        }
+
+        synthesis_error = ""
+        parsed: Dict[str, Any] = {}
+        try:
+            raw = await asyncio.to_thread(
+                self.rag._chat_completion_text,
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": json.dumps(prompt_user_payload, ensure_ascii=False)},
+                ],
+                max_tokens=1800,
+            )
+            parsed = self._parse_json_object_text(raw)
+        except Exception as e:
+            synthesis_error = str(e)
+
+        answer_text = str(parsed.get("answer_text") or "").strip() if isinstance(parsed, dict) else ""
+        unknown_data = parsed.get("unknown") if isinstance(parsed.get("unknown"), dict) else {}
+        is_unknown = bool(unknown_data.get("is_unknown", False))
+        unknown_reason = str(unknown_data.get("reason") or "").strip()
+        raw_sources = parsed.get("sources") if isinstance(parsed.get("sources"), list) else []
+
+        normalized_sources: List[Dict[str, Any]] = []
+        seen_keys = set()
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("chunk_id") or "").strip()
+            base: Optional[Dict[str, Any]] = None
+            if cid and cid in by_chunk_id:
+                base = by_chunk_id[cid]
+            else:
+                key = self._source_match_key(
+                    {
+                        "file": item.get("file"),
+                        "section": item.get("section"),
+                        "start_line": item.get("start_line"),
+                        "end_line": item.get("end_line"),
+                        "strategy": item.get("strategy"),
+                    }
+                )
+                matched = by_match_key.get(key) or []
+                if len(matched) == 1:
+                    base = matched[0]
+            if base is None:
+                continue
+            quote = str(item.get("quote") or "").strip()
+            if not quote:
+                quote = self._clip_text(base.get("content") or "", 220)
+            record = {
+                "chunk_id": str(base.get("chunk_id") or ""),
+                "source": str(base.get("source") or "repo"),
+                "file": str(base.get("file") or ""),
+                "title": str(base.get("title") or base.get("file") or ""),
+                "section": str(base.get("section") or ""),
+                "strategy": str(base.get("strategy") or ""),
+                "start_line": int(base.get("start_line") or 0),
+                "end_line": int(base.get("end_line") or 0),
+                "quote": quote,
+            }
+            dedup_key = (record["chunk_id"], record["quote"])
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            normalized_sources.append(record)
+
+        if forced_unknown_by_threshold:
+            is_unknown = True
+            if not unknown_reason:
+                unknown_reason = (
+                    f"Недостаточная релевантность контекста: max_score={max_score:.4f} "
+                    f"ниже порога {float(rag_similarity_threshold):.4f}."
+                )
+
+        if not answer_text and draft_answer.strip():
+            answer_text = draft_answer.strip()
+
+        if (not is_unknown) and not normalized_sources:
+            is_unknown = True
+            if not unknown_reason:
+                unknown_reason = "LLM не смогла корректно привязать ответ к источникам RAG."
+
+        answer_lower = answer_text.lower()
+        if is_unknown and "не знаю" not in answer_lower:
+            reason_tail = f" {unknown_reason}" if unknown_reason else ""
+            answer_text = f"Не знаю.{reason_tail}".strip()
+
+        if not answer_text:
+            answer_text = "Не знаю. Недостаточно данных для обоснованного ответа."
+            is_unknown = True
+            if not unknown_reason:
+                unknown_reason = "empty_answer_after_synthesis"
+
+        lines: List[str] = [f"Ответ: {answer_text}"]
+        if normalized_sources:
+            lines.append("")
+            lines.append("Источники:")
+            for idx, src in enumerate(normalized_sources, start=1):
+                quote_clean = self._clip_text(src.get("quote") or "", 260)
+                lines.append(
+                    f"{idx}) {src['source']} | chunk_id={src['chunk_id']} | {src['file']} | {src['title']} | "
+                    f"{src['section']} | {src['strategy']} | "
+                    f"lines {src['start_line']}-{src['end_line']} (цитата: \"{quote_clean}\")"
+                )
+        elif is_unknown:
+            lines.append("")
+            lines.append("Источники: нет подтвержденных релевантных источников для ответа.")
+
+        return "\n".join(lines).strip(), {
+            "is_unknown": bool(is_unknown),
+            "unknown_reason": unknown_reason,
+            "sources_count": len(normalized_sources),
+            "synthesis_error": synthesis_error,
+            "forced_unknown_by_threshold": bool(forced_unknown_by_threshold),
+            "max_score": float(max_score),
+        }
+
     async def _validate_invariants(self, *, req_id: str, messages: List[Dict[str, Any]], invariants_text: Optional[str], model: str) -> Dict[str, Any]:
         if not invariants_text:
             return {"decision": "pass", "reason": "no invariants"}
@@ -907,6 +1161,7 @@ class LLMAgentServer:
         user_text = str(request.get("user_text") or "").strip()
         use_profile = bool(request.get("use_profile", False))
         use_rag = bool(request.get("use_rag", False))
+        use_mcp_tools = bool(request.get("use_mcp_tools", True))
         rag_strategy = str(request.get("rag_strategy") or "fixed").strip().lower() or "fixed"
         try:
             rag_top_k = max(1, int(request.get("rag_top_k") or self.rag_top_k_default))
@@ -1011,11 +1266,26 @@ class LLMAgentServer:
             invariants_state.get("invariants") or {},
             invariants_state.get("invariant_policy") or {},
         )
-        await self._send_task_signal(writer, "tools", "Получаю список инструментов MCP")
-        mcp_tools, mcp_info = await self._get_mcp_tools()
-        tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
-        scheduler_task_protocol = self._build_scheduler_task_protocol(user_text, mcp_tools)
-        scheduler_task_mode = bool(scheduler_task_protocol)
+        if use_mcp_tools:
+            await self._send_task_signal(writer, "tools", "Получаю список инструментов MCP")
+            mcp_tools, mcp_info = await self._get_mcp_tools()
+            tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
+            scheduler_task_protocol = self._build_scheduler_task_protocol(user_text, mcp_tools)
+            scheduler_task_mode = bool(scheduler_task_protocol)
+            mcp_info = {**mcp_info, "provided_to_llm": True, "disabled_by_user": False}
+        else:
+            mcp_tools = []
+            mcp_info = {
+                "enabled": bool(self.mcp.enabled),
+                "connected": bool(self.mcp.enabled),
+                "tools_count": 0,
+                "provided_to_llm": False,
+                "disabled_by_user": True,
+            }
+            tools_policy_text = None
+            scheduler_task_protocol = None
+            scheduler_task_mode = False
+            await self._send_task_signal(writer, "tools", "Подача MCP-инструментов в LLM отключена")
         system_text = self._merge_system_text(
             memory_system_text,
             profile_system_text,
@@ -1048,15 +1318,24 @@ class LLMAgentServer:
         self._log("INFO", "INVARIANTS_VALIDATION", invariants_check)
 
         openai_tools = [tool.to_openai_tool() for tool in mcp_tools]
-        await self._send_task_signal(writer, "tools", "Инструменты MCP готовы", {"tools_count": len(openai_tools)})
-        self._log("INFO", "MCP_TOOLS_FOR_LLM", {"req_id": req_id, "mcp_info": mcp_info, "tools": openai_tools})
+        await self._send_task_signal(writer, "tools", "Инструменты MCP готовы", {"tools_count": len(openai_tools), "use_mcp_tools": use_mcp_tools})
+        self._log("INFO", "MCP_TOOLS_FOR_LLM", {"req_id": req_id, "mcp_info": mcp_info, "tools": openai_tools, "use_mcp_tools": use_mcp_tools})
 
         usage_agg: Dict[str, Any] = {}
         final_answer = ""
         tool_events: List[Dict[str, Any]] = []
+        rag_output_meta: Dict[str, Any] = {
+            "is_unknown": False,
+            "unknown_reason": "",
+            "sources_count": 0,
+            "synthesis_error": "",
+            "forced_unknown_by_threshold": False,
+            "max_score": 0.0,
+        }
         loop_guard = 0
         max_tool_iterations = max(8, int(str(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "32")).strip() or "32"))
         rag_meta = dict(self.rag.last_run_meta) if use_rag and isinstance(getattr(self.rag, "last_run_meta", None), dict) else {}
+        relay_stream_chunks = not use_rag
         history.append({"role": "user", "content": user_text})
 
         while loop_guard < max_tool_iterations:
@@ -1078,7 +1357,8 @@ class LLMAgentServer:
                 if not stream_started:
                     stream_started = True
                     await self._send_task_signal(writer, "final", "Начинаю потоковую генерацию ответа")
-                await self._send_json(writer, {"type": "chunk", "chunk": chunk})
+                if relay_stream_chunks:
+                    await self._send_json(writer, {"type": "chunk", "chunk": chunk})
 
             usage_agg = self._merge_usage(usage_agg, self.gpt.last_usage if isinstance(self.gpt.last_usage, dict) else {})
             assistant_message = self.gpt.last_message if isinstance(self.gpt.last_message, dict) else {}
@@ -1152,11 +1432,15 @@ class LLMAgentServer:
 
         if not final_answer:
             final_answer = "LLM не вернула финальный текстовый ответ."
-        if use_rag and rag_chunks:
-            sources_block = self.rag.build_sources_block(rag_chunks)
-            sources_chunk = f"\n\n{sources_block}"
-            final_answer = (final_answer.rstrip() + sources_chunk) if final_answer.strip() else sources_block
-            await self._send_json(writer, {"type": "chunk", "chunk": sources_chunk})
+        if use_rag:
+            await self._send_task_signal(writer, "rag", "Формирую структурированный ответ с источниками и цитатами")
+            final_answer, rag_output_meta = await self._synthesize_rag_answer(
+                user_text=user_text,
+                draft_answer=final_answer,
+                rag_chunks=rag_chunks,
+                rag_similarity_threshold=rag_similarity_threshold,
+            )
+            await self._send_json(writer, {"type": "chunk", "chunk": final_answer + "\n"})
 
         history.append({"role": "assistant", "content": final_answer})
 
@@ -1200,10 +1484,11 @@ class LLMAgentServer:
             "invariants_reason": invariants_check.get("reason") or "",
             "tool_iterations": loop_guard,
             "tools_available": len(mcp_tools),
+            "use_mcp_tools": use_mcp_tools,
             "use_rag": use_rag,
             "rag_strategy": rag_strategy if use_rag else "off",
             "rag_top_k": rag_top_k if use_rag else 0,
-            "rag_sources_count": len(rag_chunks) if use_rag else 0,
+            "rag_sources_count": int(rag_output_meta.get("sources_count") or len(rag_chunks)) if use_rag else 0,
             "rag_rewrite_enabled": bool(rag_meta.get("rewrite_enabled", rag_rewrite_enabled)) if use_rag else False,
             "rag_rewrite_applied": bool(rag_meta.get("rewrite_applied", False)) if use_rag else False,
             "rag_rerank_mode": str(rag_meta.get("rerank_mode") or rag_rerank_mode) if use_rag else "off",
@@ -1216,6 +1501,11 @@ class LLMAgentServer:
             "rag_rerank_error": str(rag_meta.get("rerank_error") or "") if use_rag else "",
             "rag_query_original": str(rag_meta.get("original_query") or user_text) if use_rag else "",
             "rag_query_effective": str(rag_meta.get("effective_query") or user_text) if use_rag else "",
+            "rag_unknown": bool(rag_output_meta.get("is_unknown")) if use_rag else False,
+            "rag_unknown_reason": str(rag_output_meta.get("unknown_reason") or "") if use_rag else "",
+            "rag_forced_unknown_by_threshold": bool(rag_output_meta.get("forced_unknown_by_threshold")) if use_rag else False,
+            "rag_max_score": float(rag_output_meta.get("max_score") or 0.0) if use_rag else 0.0,
+            "rag_synthesis_error": str(rag_output_meta.get("synthesis_error") or "") if use_rag else "",
         }
         cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
         await self._send_task_signal(writer, "done", "Ответ сформирован", {"tool_iterations": loop_guard})

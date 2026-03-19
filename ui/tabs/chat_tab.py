@@ -289,6 +289,10 @@ class ChatTab(BaseTab):
         mode_default = str(os.getenv("RAG_RERANK_MODE_DEFAULT", "none")).strip().lower() or "none"
         mode_idx = self.rag_mode_selector.findData(mode_default)
         self.rag_mode_selector.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self.mcp_tools_toggle = ToggleSwitch()
+        self.mcp_tools_toggle.setChecked(True)
+        self.mcp_tools_toggle.toggled.connect(self.on_mcp_tools_toggle_changed)
+        self.mcp_tools_toggle.toggled.connect(lambda _checked: self.save_window_state())
 
         # branching controls
         self.branch_selector = QComboBox()
@@ -442,6 +446,15 @@ class ChatTab(BaseTab):
         r8.addWidget(self.rag_top_k_after_input)
         r8.addStretch(1)
         p_l.addWidget(row8)
+
+        row9 = QWidget()
+        r9 = QHBoxLayout(row9)
+        r9.setContentsMargins(0, 0, 0, 0)
+        r9.setSpacing(8)
+        r9.addWidget(QLabel("MCP инструменты в LLM:"))
+        r9.addWidget(self.mcp_tools_toggle, alignment=Qt.AlignLeft)
+        r9.addStretch(1)
+        p_l.addWidget(row9)
 
         self.summary_params_row = QWidget()
         spr = QHBoxLayout(self.summary_params_row)
@@ -624,6 +637,7 @@ class ChatTab(BaseTab):
                 "rag_top_k_before": int(self.rag_top_k_before_input.value()),
                 "rag_similarity_threshold": float(self.rag_similarity_threshold_input.value()),
                 "rag_top_k_after": int(self.rag_top_k_after_input.value()),
+                "mcp_tools_to_llm": bool(self.mcp_tools_toggle.isChecked()),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -663,8 +677,10 @@ class ChatTab(BaseTab):
                 self.rag_top_k_after_input.setValue(max(1, int(state.get("rag_top_k_after", self.rag_top_k_after_input.value()))))
             except Exception:
                 pass
+            self.mcp_tools_toggle.setChecked(bool(state.get("mcp_tools_to_llm", True)))
             self.on_rag_toggle_changed(self.rag_use_toggle.isChecked())
             self.on_rag_base_toggle_changed(self.rag_base_toggle.isChecked())
+            self.on_mcp_tools_toggle_changed(self.mcp_tools_toggle.isChecked())
         except Exception as e:
             self.logger.error(f"Ошибка загрузки состояния окна для вкладки ChatTab: {e}")
 
@@ -1557,6 +1573,14 @@ class ChatTab(BaseTab):
 
     # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
 
+    def on_mcp_tools_toggle_changed(self, checked: bool):
+        if bool(checked):
+            self.logger.info("MCP инструменты будут передаваться в LLM.")
+        else:
+            self.logger.info("MCP инструменты не будут передаваться в LLM.")
+
+    # Реакция на пользовательское событие UI: валидирует текущее состояние и запускает соответствующую бизнес-операцию.
+
     def on_branch_changed(self):
         if self.strategy_selector.currentData() != "branching":
             return
@@ -1672,6 +1696,7 @@ class ChatTab(BaseTab):
         strategy = self.strategy_selector.currentData()
         use_profile = bool(self.profile_use_toggle.isEnabled() and self.profile_use_toggle.isChecked())
         use_rag = bool(self.rag_use_toggle.isChecked())
+        use_mcp_tools = bool(self.mcp_tools_toggle.isChecked())
         rag_strategy = "structural" if self.rag_base_toggle.isChecked() else "fixed"
         rag_top_k = 4
         rag_rewrite_enabled = bool(self.rag_rewrite_toggle.isChecked())
@@ -1701,6 +1726,7 @@ class ChatTab(BaseTab):
                 use_profile=use_profile,
                 summary_config=summary_config,
                 use_rag=use_rag,
+                use_mcp_tools=use_mcp_tools,
                 rag_strategy=rag_strategy,
                 rag_top_k=rag_top_k,
                 rag_rewrite_enabled=rag_rewrite_enabled,
@@ -1727,6 +1753,7 @@ class ChatTab(BaseTab):
         use_profile: bool = False,
         summary_config: dict | None = None,
         use_rag: bool = False,
+        use_mcp_tools: bool = True,
         rag_strategy: str = "fixed",
         rag_top_k: int = 4,
         rag_rewrite_enabled: bool = False,
@@ -1766,6 +1793,7 @@ class ChatTab(BaseTab):
                 use_profile=use_profile,
                 summary_config=summary_config,
                 use_rag=use_rag,
+                use_mcp_tools=use_mcp_tools,
                 rag_strategy=rag_strategy,
                 rag_top_k=rag_top_k,
                 rag_rewrite_enabled=rag_rewrite_enabled,
@@ -1856,6 +1884,7 @@ class ChatTab(BaseTab):
             rag_rewrite_enabled_stat = bool(ms.get("rag_rewrite_enabled", rag_rewrite_enabled))
             rag_rewrite_applied_stat = bool(ms.get("rag_rewrite_applied", False))
             rag_rerank_mode_stat = str(ms.get("rag_rerank_mode") or rag_rerank_mode or "none")
+            use_mcp_tools_stat = bool(ms.get("use_mcp_tools", use_mcp_tools))
             rag_top_k_before_stat = int(ms.get("rag_top_k_before") or rag_top_k_before)
             rag_threshold_stat = float(ms.get("rag_similarity_threshold") or rag_similarity_threshold)
             rag_top_k_after_stat = int(ms.get("rag_top_k_after") or rag_top_k_after)
@@ -1872,7 +1901,7 @@ class ChatTab(BaseTab):
                 f"Temp={temp_str} | max_tokens={max_tokens} | user_est={user_tokens} | ctx_est={api_context_tokens} | dialog_est={dialog_tokens} | overflow_risk={may_exceed} | "
                 f"use_profile={use_profile_stat} | active_profile={active_profile_stat or 'Без профиля'} | description_len={desc_len_stat} | "
                 f"task_state={task_state_stat} | task_step={task_step_stat}/{task_total_stat} | task_paused={task_paused_stat} | task_injected={task_injected_stat} | "
-                f"mcp_connected={mcp_connected} | mcp_tools={mcp_tools_count} | "
+                f"mcp_connected={mcp_connected} | mcp_tools={mcp_tools_count} | use_mcp_tools={use_mcp_tools_stat} | "
                 f"use_rag={rag_enabled_stat} | rag_strategy={rag_strategy_stat} | rag_sources={rag_sources_count_stat} | "
                 f"rag_rewrite={rag_rewrite_enabled_stat}/{rag_rewrite_applied_stat} | rag_mode={rag_rerank_mode_stat} | "
                 f"rag_k={rag_top_k_before_stat}->{rag_top_k_after_stat} | rag_threshold={rag_threshold_stat:.2f} | "
