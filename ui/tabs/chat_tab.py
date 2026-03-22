@@ -1004,6 +1004,12 @@ class ChatTab(BaseTab):
             "is_paused": bool(task_state.get("is_paused", False)),
             "plan": task_state.get("plan") if isinstance(task_state.get("plan"), list) else [],
             "done": task_state.get("done") if isinstance(task_state.get("done"), list) else [],
+            "goal": str(task_state.get("goal") or "").strip(),
+            "clarifications": task_state.get("clarifications") if isinstance(task_state.get("clarifications"), list) else [],
+            "constraints": task_state.get("constraints") if isinstance(task_state.get("constraints"), list) else [],
+            "terms": task_state.get("terms") if isinstance(task_state.get("terms"), list) else [],
+            "open_questions": task_state.get("open_questions") if isinstance(task_state.get("open_questions"), list) else [],
+            "done_steps": task_state.get("done_steps") if isinstance(task_state.get("done_steps"), list) else [],
         }
         self.task_state_cache = normalized
         signature = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
@@ -1017,6 +1023,12 @@ class ChatTab(BaseTab):
         paused = normalized["is_paused"]
         plan = normalized["plan"]
         done = normalized["done"]
+        goal = normalized["goal"]
+        clarifications = normalized["clarifications"]
+        constraints = normalized["constraints"]
+        terms = normalized["terms"]
+        open_questions = normalized["open_questions"]
+        done_steps = normalized["done_steps"]
 
         if signature != self._task_state_signature:
             scrollbar = self.task_state_box.verticalScrollBar()
@@ -1048,13 +1060,46 @@ class ChatTab(BaseTab):
                         lines.append(f"- {item}")
                 else:
                     lines.append("- (empty)")
+                lines.append("")
+                lines.append("[TASK MEMORY]")
+                lines.append(f"goal: {goal or '-'}")
+                lines.append("clarifications:")
+                if clarifications:
+                    for item in clarifications:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
+                lines.append("constraints:")
+                if constraints:
+                    for item in constraints:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
+                lines.append("terms:")
+                if terms:
+                    for item in terms:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
+                lines.append("open_questions:")
+                if open_questions:
+                    for item in open_questions:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
+                lines.append("done_steps:")
+                if done_steps:
+                    for item in done_steps:
+                        lines.append(f"- {item}")
+                else:
+                    lines.append("- (empty)")
                 self.task_state_box.setPlainText("\n".join(lines))
 
             if scrollbar is not None:
                 scrollbar.setValue(min(prev_value, int(scrollbar.maximum())))
             self._task_state_signature = signature
 
-        has_task = bool(task) and total > 0
+        has_task = bool(task or goal or plan or done or open_questions or done_steps)
         can_pause = has_task and (not paused)
         can_resume = has_task and paused
 
@@ -1069,7 +1114,10 @@ class ChatTab(BaseTab):
             self.render_task_state({})
             return
         try:
-            task_state = await self.agent.get_task_state()
+            task_state = await self.agent.get_task_state(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
         except Exception as e:
             self.logger.warning(f"Не удалось получить task_state: {e}")
@@ -1082,7 +1130,10 @@ class ChatTab(BaseTab):
             self.logger.warning("Агент OFFLINE: confirm plan недоступен.")
             return
         try:
-            task_state = await self.agent.confirm_task_plan()
+            task_state = await self.agent.confirm_task_plan(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
             self.logger.success("План подтвержден. Состояние: execution.")
         except Exception as e:
@@ -1096,7 +1147,10 @@ class ChatTab(BaseTab):
             self.logger.warning("Агент OFFLINE: pause недоступен.")
             return
         try:
-            task_state = await self.agent.pause_task()
+            task_state = await self.agent.pause_task(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
             self.logger.success("Задача поставлена на паузу.")
         except Exception as e:
@@ -1110,7 +1164,10 @@ class ChatTab(BaseTab):
             self.logger.warning("Агент OFFLINE: resume недоступен.")
             return
         try:
-            task_state = await self.agent.resume_task()
+            task_state = await self.agent.resume_task(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
             self.logger.success("Задача возвращена в контекст.")
         except Exception as e:
@@ -1124,7 +1181,10 @@ class ChatTab(BaseTab):
             self.logger.warning("Агент OFFLINE: next step недоступен.")
             return
         try:
-            task_state = await self.agent.next_task_step()
+            task_state = await self.agent.next_task_step(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
             self.logger.success("Переход к следующему шагу выполнен.")
         except Exception as e:
@@ -1138,7 +1198,10 @@ class ChatTab(BaseTab):
             self.logger.warning("Агент OFFLINE: delete task недоступен.")
             return
         try:
-            task_state = await self.agent.delete_task()
+            task_state = await self.agent.delete_task(
+                session_id=self.current_session_id,
+                branch_id=self.current_branch_id,
+            )
             self.render_task_state(task_state)
             self.task_signal_label.setText("Task signal: task deleted")
             self.logger.success("Активная задача удалена.")
@@ -1855,7 +1918,10 @@ class ChatTab(BaseTab):
             # Это убирает рассинхрон, когда done/task_state в потоке устарел или пустой.
             if self.is_agent_connected:
                 try:
-                    rpc_task_state = await self.agent.get_task_state()
+                    rpc_task_state = await self.agent.get_task_state(
+                        session_id=self.current_session_id,
+                        branch_id=self.current_branch_id,
+                    )
                     if isinstance(rpc_task_state, dict):
                         task_state = rpc_task_state
                 except Exception as e:
@@ -1987,7 +2053,10 @@ class ChatTab(BaseTab):
             if not self.is_agent_connected:
                 return
             try:
-                task_state = await self.agent.pause_task()
+                task_state = await self.agent.pause_task(
+                    session_id=self.current_session_id,
+                    branch_id=self.current_branch_id,
+                )
                 self.render_task_state(task_state)
                 self.logger.info("Активная задача поставлена на паузу (STOP).")
             except Exception as e:

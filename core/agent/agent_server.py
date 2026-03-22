@@ -103,6 +103,14 @@ class LLMAgentServer:
             "get_invariants_state": self._handle_get_invariants_state,
             "save_invariant": self._handle_save_invariant,
             "set_invariant_policy": self._handle_set_invariant_policy,
+            "get_task_state": self._handle_get_task_state,
+            "generate_task_plan": self._handle_generate_task_plan,
+            "confirm_task_plan": self._handle_confirm_task_plan,
+            "pause_task": self._handle_pause_task,
+            "resume_task": self._handle_resume_task,
+            "next_task_step": self._handle_next_task_step,
+            "update_task_progress": self._handle_update_task_progress,
+            "delete_task": self._handle_delete_task,
             "mcp_status": self._handle_mcp_status,
             "mcp_list_tools": self._handle_mcp_list_tools,
             "mcp_call_tool": self._handle_mcp_call_tool,
@@ -261,6 +269,7 @@ class LLMAgentServer:
                 "checkpoints": [],
                 "summary": "",
                 "memory_layers": {"short_term": [], "working": {}, "long_term": {}},
+                "task_state": {},
                 "created_at": now,
                 "updated_at": now,
             }
@@ -305,6 +314,7 @@ class LLMAgentServer:
             "checkpoints": [],
             "summary": str(source.get("summary") or ""),
             "memory_layers": self._copy_memory_layers(source.get("memory_layers")),
+            "task_state": dict(source.get("task_state") or {}),
             "created_at": now,
             "updated_at": now,
         }
@@ -425,6 +435,265 @@ class LLMAgentServer:
         if len(clean) <= max_len:
             return clean
         return clean[: max(0, max_len - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _task_text_list(value: Any, max_items: int = 24, max_len: int = 280) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        out: List[str] = []
+        for item in value:
+            clean = str(item or "").strip()
+            if not clean:
+                continue
+            if len(clean) > max_len:
+                clean = clean[: max_len - 3].rstrip() + "..."
+            out.append(clean)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def _default_task_state(self) -> Dict[str, Any]:
+        return {
+            "task": "",
+            "state": "active",
+            "step": 0,
+            "total": 0,
+            "current": "",
+            "expected_action": "answer_or_clarify",
+            "is_paused": False,
+            "plan": [],
+            "done": [],
+            "goal": "",
+            "clarifications": [],
+            "constraints": [],
+            "terms": [],
+            "open_questions": [],
+            "done_steps": [],
+            "schema_version": 1,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "last_reset_decision": "",
+        }
+
+    def _normalize_task_state(self, task_state: Any, *, fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        base = self._default_task_state()
+        if isinstance(fallback, dict):
+            base.update(fallback)
+        raw = task_state if isinstance(task_state, dict) else {}
+
+        goal = str(raw["goal"] if ("goal" in raw and raw.get("goal") is not None) else base.get("goal") or "").strip()
+        clarifications = self._task_text_list(
+            raw["clarifications"] if "clarifications" in raw else base.get("clarifications"),
+            max_items=32,
+            max_len=320,
+        )
+        constraints = self._task_text_list(
+            raw["constraints"] if "constraints" in raw else base.get("constraints"),
+            max_items=32,
+            max_len=320,
+        )
+        terms = self._task_text_list(
+            raw["terms"] if "terms" in raw else base.get("terms"),
+            max_items=32,
+            max_len=220,
+        )
+        open_questions = self._task_text_list(
+            raw["open_questions"] if "open_questions" in raw else base.get("open_questions"),
+            max_items=32,
+            max_len=320,
+        )
+        done_steps = self._task_text_list(
+            raw["done_steps"] if "done_steps" in raw else base.get("done_steps"),
+            max_items=64,
+            max_len=320,
+        )
+
+        is_paused = bool(raw.get("is_paused", base.get("is_paused", False)))
+        state = str(raw.get("state") or base.get("state") or "active").strip().lower()
+        if state not in {"planning", "active", "paused", "done"}:
+            state = "paused" if is_paused else "active"
+        if is_paused:
+            state = "paused"
+        elif state == "paused":
+            state = "active"
+
+        task_text = str(raw["task"] if "task" in raw else base.get("task") or "").strip()
+        if not task_text:
+            task_text = goal
+
+        step = len(done_steps)
+        total = max(step + len(open_questions), step)
+        current = str(raw["current"] if "current" in raw else base.get("current") or "").strip()
+        if not current:
+            current = open_questions[0] if open_questions else ""
+        expected_action = str(raw["expected_action"] if "expected_action" in raw else base.get("expected_action") or "").strip() or "answer_or_clarify"
+
+        normalized = {
+            "task": task_text,
+            "state": state,
+            "step": step,
+            "total": total,
+            "current": current,
+            "expected_action": expected_action,
+            "is_paused": is_paused,
+            "plan": list(open_questions),
+            "done": list(done_steps),
+            "goal": goal,
+            "clarifications": clarifications,
+            "constraints": constraints,
+            "terms": terms,
+            "open_questions": open_questions,
+            "done_steps": done_steps,
+            "schema_version": 1,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "last_reset_decision": str(raw.get("last_reset_decision") or base.get("last_reset_decision") or "").strip(),
+        }
+        return normalized
+
+    def _get_branch_task_state(self, branch: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = self._normalize_task_state(branch.get("task_state"), fallback=None)
+        branch["task_state"] = normalized
+        return normalized
+
+    def _set_branch_task_state(self, branch: Dict[str, Any], task_state: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = self._normalize_task_state(task_state, fallback=self._get_branch_task_state(branch))
+        branch["task_state"] = normalized
+        return normalized
+
+    @staticmethod
+    def _looks_like_task_forget_request(user_text: str) -> bool:
+        clean = str(user_text or "").strip().lower()
+        if not clean:
+            return False
+        markers = (
+            "забудь задачу",
+            "сбрось задачу",
+            "очисти задачу",
+            "удали задачу",
+            "forget task",
+            "clear task",
+            "reset task",
+            "delete task memory",
+            "forget context",
+            "clear context",
+        )
+        return any(marker in clean for marker in markers)
+
+    async def _llm_should_forget_task_state(
+        self,
+        *,
+        user_text: str,
+        task_state: Dict[str, Any],
+        model: str,
+        req_id: str,
+    ) -> Dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You classify if the user explicitly asked to clear current task memory.\n"
+                    "Return strict JSON only: "
+                    "{\"should_forget\":true|false,\"reason\":\"...\",\"confidence\":0..1}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "user_text": user_text,
+                        "current_task_state": {
+                            "goal": task_state.get("goal"),
+                            "open_questions": task_state.get("open_questions"),
+                            "done_steps": task_state.get("done_steps"),
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        parts: List[str] = []
+        try:
+            async for chunk in self.gpt.stream_chat(
+                messages=messages,
+                model=model,
+                max_tokens=180,
+                temperature=0.0,
+                trace_id=f"{req_id}:task_reset_classifier",
+            ):
+                if chunk:
+                    parts.append(str(chunk))
+            payload = self._parse_json_object_text("".join(parts))
+            return {
+                "should_forget": bool(payload.get("should_forget", False)),
+                "reason": str(payload.get("reason") or "").strip(),
+                "confidence": float(payload.get("confidence") or 0.0),
+            }
+        except Exception as e:
+            return {"should_forget": False, "reason": f"classifier_failed: {e}", "confidence": 0.0}
+
+    async def _llm_update_task_state(
+        self,
+        *,
+        user_text: str,
+        assistant_text: str,
+        current_task_state: Dict[str, Any],
+        model: str,
+        req_id: str,
+    ) -> Dict[str, Any]:
+        schema_hint = {
+            "goal": "string",
+            "clarifications": ["string"],
+            "constraints": ["string"],
+            "terms": ["string"],
+            "open_questions": ["string"],
+            "done_steps": ["string"],
+        }
+        prompt_system = (
+            "You maintain task memory for a coding assistant conversation.\n"
+            "Return strict JSON only with keys: goal, clarifications, constraints, terms, open_questions, done_steps.\n"
+            "Rules:\n"
+            "1) Preserve existing facts unless clearly contradicted.\n"
+            "2) Keep items concise and deduplicated.\n"
+            "3) Do not invent facts absent from the dialogue.\n"
+            "4) Task is ongoing by default; unresolved items stay in open_questions.\n"
+            "5) Output valid JSON object only."
+        )
+        payload_user = {
+            "schema": schema_hint,
+            "current_task_state": {
+                "goal": current_task_state.get("goal") or "",
+                "clarifications": current_task_state.get("clarifications") or [],
+                "constraints": current_task_state.get("constraints") or [],
+                "terms": current_task_state.get("terms") or [],
+                "open_questions": current_task_state.get("open_questions") or [],
+                "done_steps": current_task_state.get("done_steps") or [],
+            },
+            "new_turn": {
+                "user": user_text,
+                "assistant": assistant_text,
+            },
+        }
+        parts: List[str] = []
+        try:
+            async for chunk in self.gpt.stream_chat(
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": json.dumps(payload_user, ensure_ascii=False)},
+                ],
+                model=model,
+                max_tokens=700,
+                temperature=0.0,
+                trace_id=f"{req_id}:task_state_update",
+            ):
+                if chunk:
+                    parts.append(str(chunk))
+            parsed = self._parse_json_object_text("".join(parts))
+            next_state = self._normalize_task_state(parsed, fallback=current_task_state)
+            return next_state
+        except Exception as e:
+            fallback = self._normalize_task_state(current_task_state, fallback=current_task_state)
+            fallback["last_reset_decision"] = str(fallback.get("last_reset_decision") or "")
+            self._log("WARN", "TASK_STATE_UPDATE_FAILED", {"req_id": req_id, "error": str(e)})
+            return fallback
 
     @staticmethod
     def _source_match_key(item: Dict[str, Any]) -> Tuple[str, str, int, int, str]:
@@ -1131,6 +1400,154 @@ class LLMAgentServer:
             return
         await self._send_json(writer, {"type": "ok", **state})
 
+    async def _handle_get_task_state(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        task_state = self._get_branch_task_state(branch)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": task_state})
+
+    async def _handle_generate_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        task_text = str(request.get("task") or "").strip()
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        current = self._get_branch_task_state(branch)
+        merged = dict(current)
+        if task_text and not str(merged.get("goal") or "").strip():
+            merged["goal"] = task_text
+            merged["task"] = task_text
+        merged["state"] = "active"
+        merged["is_paused"] = False
+        merged = self._set_branch_task_state(branch, merged)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": merged})
+
+    async def _handle_confirm_task_plan(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._get_branch_task_state(branch)
+        state["state"] = "active"
+        state["is_paused"] = False
+        state = self._set_branch_task_state(branch, state)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
+    async def _handle_pause_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._get_branch_task_state(branch)
+        state["is_paused"] = True
+        state["state"] = "paused"
+        state = self._set_branch_task_state(branch, state)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
+    async def _handle_resume_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._get_branch_task_state(branch)
+        state["is_paused"] = False
+        state["state"] = "active"
+        state = self._set_branch_task_state(branch, state)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
+    async def _handle_next_task_step(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._set_branch_task_state(branch, self._get_branch_task_state(branch))
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
+    async def _handle_update_task_progress(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._get_branch_task_state(branch)
+        done_item = str(request.get("done_item") or "").strip()
+        if done_item:
+            done_steps = state.get("done_steps") if isinstance(state.get("done_steps"), list) else []
+            if done_item not in done_steps:
+                done_steps.append(done_item)
+            state["done_steps"] = done_steps
+        current = str(request.get("current") or "").strip()
+        if current:
+            state["current"] = current
+        expected_action = str(request.get("expected_action") or "").strip()
+        if expected_action:
+            state["expected_action"] = expected_action
+        state = self._set_branch_task_state(branch, state)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
+    async def _handle_delete_task(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        session_id = str(request.get("session_id") or "").strip()
+        if not session_id:
+            await self._send_error(writer, "session_id is required")
+            return
+        branch_id = str(request.get("branch_id") or "").strip() or None
+        session = self.memory_store.load_session(session_id)
+        active_branch, branch = self._ensure_branch(session, branch_id)
+        state = self._default_task_state()
+        state["last_reset_decision"] = "manual_delete_via_rpc"
+        state = self._set_branch_task_state(branch, state)
+        branch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session["updated_at"] = branch["updated_at"]
+        session["active_branch"] = active_branch
+        self.memory_store.save_session(session)
+        await self._send_json(writer, {"type": "task_state", "active_branch": active_branch, "task_state": state})
+
     async def _handle_mcp_status(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         await self._send_json(writer, {"type": "mcp_status", "status": await self.mcp.status()})
 
@@ -1193,6 +1610,28 @@ class LLMAgentServer:
         history = branch.get("history") if isinstance(branch.get("history"), list) else []
         facts = branch.get("facts") if isinstance(branch.get("facts"), dict) else {}
         memory_layers = self._copy_memory_layers(branch.get("memory_layers"))
+        task_state = self._get_branch_task_state(branch)
+        reset_decision: Dict[str, Any] = {"checked": False, "should_forget": False, "reason": "", "confidence": 0.0}
+
+        if self._looks_like_task_forget_request(user_text):
+            reset_decision["checked"] = True
+            await self._send_task_signal(writer, "task_memory", "Проверяю намерение очистить память задачи через LLM")
+            llm_reset = await self._llm_should_forget_task_state(
+                user_text=user_text,
+                task_state=task_state,
+                model=model,
+                req_id=req_id,
+            )
+            reset_decision.update(llm_reset)
+            if bool(llm_reset.get("should_forget")):
+                task_state = self._default_task_state()
+                task_state["last_reset_decision"] = f"accepted: {str(llm_reset.get('reason') or '').strip()}"
+                branch["task_state"] = task_state
+                await self._send_task_signal(writer, "task_memory", "Память задачи очищена")
+            else:
+                task_state["last_reset_decision"] = f"rejected: {str(llm_reset.get('reason') or '').strip()}"
+                branch["task_state"] = task_state
+                await self._send_task_signal(writer, "task_memory", "Очистка task memory отклонена")
 
         explicit_memory = request.get("memory_write") if isinstance(request.get("memory_write"), dict) else None
         if isinstance(explicit_memory, dict):
@@ -1443,6 +1882,19 @@ class LLMAgentServer:
             await self._send_json(writer, {"type": "chunk", "chunk": final_answer + "\n"})
 
         history.append({"role": "assistant", "content": final_answer})
+        await self._send_task_signal(writer, "task_memory", "Обновляю память задачи через LLM")
+        task_state = await self._llm_update_task_state(
+            user_text=user_text,
+            assistant_text=final_answer,
+            current_task_state=task_state,
+            model=model,
+            req_id=req_id,
+        )
+        if reset_decision.get("checked"):
+            decision_text = "accepted" if reset_decision.get("should_forget") else "rejected"
+            reason = str(reset_decision.get("reason") or "").strip()
+            task_state["last_reset_decision"] = f"{decision_text}: {reason}".strip(": ")
+        branch["task_state"] = self._normalize_task_state(task_state, fallback=task_state)
 
         self._sync_short_term_from_history(memory_layers, history)
         branch["history"] = history
@@ -1482,6 +1934,14 @@ class LLMAgentServer:
             },
             "invariants_decision": invariants_check.get("decision") or "pass",
             "invariants_reason": invariants_check.get("reason") or "",
+            "task_state": str(task_state.get("state") or ""),
+            "task_step": int(task_state.get("step") or 0),
+            "task_total": int(task_state.get("total") or 0),
+            "task_paused": bool(task_state.get("is_paused", False)),
+            "task_injected": bool(task_state.get("goal") or task_state.get("open_questions") or task_state.get("done_steps")),
+            "task_reset_checked": bool(reset_decision.get("checked")),
+            "task_reset_approved": bool(reset_decision.get("should_forget")),
+            "task_reset_reason": str(reset_decision.get("reason") or ""),
             "tool_iterations": loop_guard,
             "tools_available": len(mcp_tools),
             "use_mcp_tools": use_mcp_tools,
@@ -1528,6 +1988,7 @@ class LLMAgentServer:
                 "profile_description_len": len(profile_description),
                 "profile_applied": bool(profile_system_text),
             },
+            "task_state": task_state,
             "mcp_info": {**mcp_info, "tools": self._serialize_mcp_tools(mcp_tools)},
             "tool_events": tool_events,
         }

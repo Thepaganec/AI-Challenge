@@ -20,6 +20,7 @@ class AgentClient:
         self.last_model: Optional[str] = None
         self.last_endpoint: Optional[str] = None
         self.last_title: Optional[str] = None
+        self.last_session_id: Optional[str] = None
         self.last_message_stats: Dict[str, Any] = {}
         self.last_active_branch: Optional[str] = None
         self.last_facts: Optional[dict] = None
@@ -32,6 +33,15 @@ class AgentClient:
         self.last_mcp_info: Dict[str, Any] = {}
         self.last_tool_events: List[Dict[str, Any]] = []
         self.on_task_signal = None
+
+    def _task_state_from_msg(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        if msg.get("type") == "task_state" and isinstance(msg.get("task_state"), dict):
+            state = msg.get("task_state") or {}
+            self.last_task_state = state
+            if msg.get("active_branch"):
+                self.last_active_branch = str(msg.get("active_branch") or self.last_active_branch or "main")
+            return state
+        return {}
 
     def _is_connected(self) -> bool:
         return self._writer is not None and not self._writer.is_closing() and self._reader is not None
@@ -334,6 +344,9 @@ class AgentClient:
         request["rag_top_k_before"] = max(1, int(rag_top_k_before or 10))
         request["rag_similarity_threshold"] = float(rag_similarity_threshold if rag_similarity_threshold is not None else 0.5)
         request["rag_top_k_after"] = max(1, int(rag_top_k_after or 5))
+        self.last_session_id = str(session_id or "").strip() or self.last_session_id
+        if branch_id:
+            self.last_active_branch = str(branch_id)
 
         async with self._conn_lock:
             try:
@@ -376,6 +389,8 @@ class AgentClient:
                         self.last_profile_info = msg.get("profile_info") if isinstance(msg.get("profile_info"), dict) else {}
                         self.last_mcp_info = msg.get("mcp_info") if isinstance(msg.get("mcp_info"), dict) else {}
                         self.last_tool_events = msg.get("tool_events") if isinstance(msg.get("tool_events"), list) else []
+                        self.last_task_state = msg.get("task_state") if isinstance(msg.get("task_state"), dict) else {}
+                        self.last_session_id = msg.get("session_id") or self.last_session_id
                         break
                     if msg_type == "error":
                         raise RuntimeError(msg.get("message") or "Agent error")
@@ -383,26 +398,115 @@ class AgentClient:
                 await self._close_connection()
                 raise
 
-    async def get_task_state(self) -> Dict[str, Any]:
-        return {}
+    async def get_task_state(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "get_task_state", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def generate_task_plan(self, task: str) -> Dict[str, Any]:
-        return {}
+    async def generate_task_plan(self, task: str, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "generate_task_plan", "session_id": sid, "task": str(task or "")}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def confirm_task_plan(self) -> Dict[str, Any]:
-        return {}
+    async def confirm_task_plan(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "confirm_task_plan", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def pause_task(self) -> Dict[str, Any]:
-        return {}
+    async def pause_task(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "pause_task", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def resume_task(self) -> Dict[str, Any]:
-        return {}
+    async def resume_task(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "resume_task", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def next_task_step(self) -> Dict[str, Any]:
-        return {}
+    async def next_task_step(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "next_task_step", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def update_task_progress(self, *, current: str = "", expected_action: str = "", done_item: str = "", step: Optional[int] = None) -> Dict[str, Any]:
-        return {}
+    async def update_task_progress(
+        self,
+        *,
+        current: str = "",
+        expected_action: str = "",
+        done_item: str = "",
+        step: Optional[int] = None,
+        session_id: Optional[str] = None,
+        branch_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {
+            "action": "update_task_progress",
+            "session_id": sid,
+            "current": str(current or ""),
+            "expected_action": str(expected_action or ""),
+            "done_item": str(done_item or ""),
+        }
+        if step is not None:
+            payload["step"] = int(step)
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
 
-    async def delete_task(self) -> Dict[str, Any]:
-        return {}
+    async def delete_task(self, session_id: Optional[str] = None, branch_id: Optional[str] = None) -> Dict[str, Any]:
+        sid = str(session_id or self.last_session_id or "").strip()
+        if not sid:
+            return {}
+        payload: Dict[str, Any] = {"action": "delete_task", "session_id": sid}
+        bid = str(branch_id or self.last_active_branch or "").strip()
+        if bid:
+            payload["branch_id"] = bid
+        msg = await self._rpc(payload)
+        self._raise_if_error(msg)
+        return self._task_state_from_msg(msg)
