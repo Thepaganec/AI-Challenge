@@ -695,6 +695,94 @@ class LLMAgentServer:
             self._log("WARN", "TASK_STATE_UPDATE_FAILED", {"req_id": req_id, "error": str(e)})
             return fallback
 
+    def _recent_turns_for_rag(self, history: List[Dict[str, Any]], max_pairs: int = 3) -> List[Dict[str, str]]:
+        if not isinstance(history, list) or not history:
+            return []
+        pairs: List[Dict[str, str]] = []
+        pending_user = ""
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip().lower()
+            text = self._clip_text(msg.get("content") or "", 420)
+            if not text:
+                continue
+            if role == "user":
+                pending_user = text
+                continue
+            if role == "assistant":
+                pairs.append({"user": pending_user, "assistant": text})
+                pending_user = ""
+        if pending_user:
+            pairs.append({"user": pending_user, "assistant": ""})
+        return pairs[-max_pairs:]
+
+    async def _llm_expand_rag_query(
+        self,
+        *,
+        user_text: str,
+        task_state: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        model: str,
+        req_id: str,
+    ) -> Dict[str, Any]:
+        current_goal = str(task_state.get("goal") or "").strip()
+        open_questions = self._task_text_list(task_state.get("open_questions"), max_items=8, max_len=220)
+        done_steps = self._task_text_list(task_state.get("done_steps"), max_items=8, max_len=220)
+        terms = self._task_text_list(task_state.get("terms"), max_items=12, max_len=120)
+        recent_turns = self._recent_turns_for_rag(history, max_pairs=3)
+        prompt_system = (
+            "You optimize repository retrieval queries.\n"
+            "Given the last user message plus active task context, resolve pronouns/references "
+            "(like 'этот класс', 'данный метод') into explicit entities.\n"
+            "Return strict JSON only: {\"rag_query\":\"...\",\"reason\":\"...\"}.\n"
+            "Do not add unrelated details. Keep it concise and specific for semantic code search."
+        )
+        payload = {
+            "last_user_message": user_text,
+            "active_task_goal": current_goal,
+            "task_terms": terms,
+            "open_questions": open_questions,
+            "done_steps": done_steps,
+            "recent_turns": recent_turns,
+        }
+        parts: List[str] = []
+        try:
+            async for chunk in self.gpt.stream_chat(
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                model=model,
+                max_tokens=220,
+                temperature=0.0,
+                trace_id=f"{req_id}:rag_query_expand",
+            ):
+                if chunk:
+                    parts.append(str(chunk))
+            parsed = self._parse_json_object_text("".join(parts))
+            candidate = str(parsed.get("rag_query") or "").strip()
+            if candidate:
+                return {
+                    "query": candidate,
+                    "reason": str(parsed.get("reason") or "").strip(),
+                    "used_llm": True,
+                    "error": "",
+                }
+            return {
+                "query": user_text,
+                "reason": "empty_rag_query_from_llm",
+                "used_llm": True,
+                "error": "",
+            }
+        except Exception as e:
+            return {
+                "query": user_text,
+                "reason": "rag_query_expand_failed",
+                "used_llm": False,
+                "error": str(e),
+            }
+
     @staticmethod
     def _source_match_key(item: Dict[str, Any]) -> Tuple[str, str, int, int, str]:
         return (
@@ -1647,6 +1735,8 @@ class LLMAgentServer:
         system_text = None
         rag_context_text = None
         rag_chunks: List[Dict[str, Any]] = []
+        rag_query_for_retrieval = user_text
+        rag_query_expand_meta: Dict[str, Any] = {"used_llm": False, "reason": "", "error": ""}
         if strategy == "facts":
             facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=facts)
             branch["facts"] = facts
@@ -1660,6 +1750,35 @@ class LLMAgentServer:
             history_for_llm = build_sliding_window(history, keep_last_n)
 
         if use_rag:
+            rag_query_expand_meta = await self._llm_expand_rag_query(
+                user_text=user_text,
+                task_state=task_state,
+                history=history,
+                model=model,
+                req_id=req_id,
+            )
+            rag_query_for_retrieval = str(rag_query_expand_meta.get("query") or user_text).strip() or user_text
+            self._log(
+                "INFO",
+                "RAG_RETRIEVE_REQUEST",
+                {
+                    "req_id": req_id,
+                    "session_id": session_id,
+                    "branch_id": active_branch,
+                    "user_text": user_text,
+                    "rag_query_retrieval": rag_query_for_retrieval,
+                    "rag_query_expand_used_llm": bool(rag_query_expand_meta.get("used_llm")),
+                    "rag_query_expand_reason": str(rag_query_expand_meta.get("reason") or ""),
+                    "rag_query_expand_error": str(rag_query_expand_meta.get("error") or ""),
+                    "strategy": rag_strategy,
+                    "top_k": rag_top_k,
+                    "rewrite_enabled": rag_rewrite_enabled,
+                    "rerank_mode": rag_rerank_mode,
+                    "top_k_before": rag_top_k_before,
+                    "similarity_threshold": rag_similarity_threshold,
+                    "top_k_after": rag_top_k_after,
+                },
+            )
             await self._send_task_signal(
                 writer,
                 "rag",
@@ -1672,12 +1791,13 @@ class LLMAgentServer:
                     "top_k_before": rag_top_k_before,
                     "similarity_threshold": rag_similarity_threshold,
                     "top_k_after": rag_top_k_after,
+                    "query_for_retrieval": self._clip_text(rag_query_for_retrieval, 180),
                 },
             )
             try:
                 rag_chunks = await asyncio.to_thread(
                     self.rag.retrieve,
-                    query=user_text,
+                    query=rag_query_for_retrieval,
                     strategy=rag_strategy,
                     top_k=rag_top_k,
                     rewrite_enabled=rag_rewrite_enabled,
@@ -1687,7 +1807,43 @@ class LLMAgentServer:
                     top_k_after=rag_top_k_after,
                 )
                 rag_context_text = self.rag.build_rag_context(rag_chunks)
+                self._log(
+                    "INFO",
+                    "RAG_RETRIEVE_RESPONSE",
+                    {
+                        "req_id": req_id,
+                        "session_id": session_id,
+                        "branch_id": active_branch,
+                        "rag_query_retrieval": rag_query_for_retrieval,
+                        "chunks_count": len(rag_chunks),
+                        "chunks": [
+                            {
+                                "rank": int(item.get("rank") or idx + 1),
+                                "chunk_id": str(item.get("chunk_id") or ""),
+                                "file": str(item.get("file") or ""),
+                                "section": str(item.get("section") or ""),
+                                "start_line": int(item.get("start_line") or 0),
+                                "end_line": int(item.get("end_line") or 0),
+                                "score": float(item.get("score") or 0.0),
+                            }
+                            for idx, item in enumerate(rag_chunks)
+                            if isinstance(item, dict)
+                        ],
+                        "rag_last_run_meta": dict(self.rag.last_run_meta) if isinstance(getattr(self.rag, "last_run_meta", None), dict) else {},
+                    },
+                )
             except RagError as e:
+                self._log(
+                    "ERROR",
+                    "RAG_RETRIEVE_ERROR",
+                    {
+                        "req_id": req_id,
+                        "session_id": session_id,
+                        "branch_id": active_branch,
+                        "rag_query_retrieval": rag_query_for_retrieval,
+                        "message": str(e),
+                    },
+                )
                 await self._send_error(writer, f"RAG error: {e}")
                 return
 
@@ -1959,8 +2115,12 @@ class LLMAgentServer:
             "rag_candidates_after": int(rag_meta.get("final_candidates_count") or len(rag_chunks)) if use_rag else 0,
             "rag_rewrite_error": str(rag_meta.get("rewrite_error") or "") if use_rag else "",
             "rag_rerank_error": str(rag_meta.get("rerank_error") or "") if use_rag else "",
-            "rag_query_original": str(rag_meta.get("original_query") or user_text) if use_rag else "",
-            "rag_query_effective": str(rag_meta.get("effective_query") or user_text) if use_rag else "",
+            "rag_query_original": str(user_text) if use_rag else "",
+            "rag_query_retrieval": str(rag_query_for_retrieval) if use_rag else "",
+            "rag_query_effective": str(rag_meta.get("effective_query") or rag_query_for_retrieval) if use_rag else "",
+            "rag_query_expand_used_llm": bool(rag_query_expand_meta.get("used_llm")) if use_rag else False,
+            "rag_query_expand_reason": str(rag_query_expand_meta.get("reason") or "") if use_rag else "",
+            "rag_query_expand_error": str(rag_query_expand_meta.get("error") or "") if use_rag else "",
             "rag_unknown": bool(rag_output_meta.get("is_unknown")) if use_rag else False,
             "rag_unknown_reason": str(rag_output_meta.get("unknown_reason") or "") if use_rag else "",
             "rag_forced_unknown_by_threshold": bool(rag_output_meta.get("forced_unknown_by_threshold")) if use_rag else False,
@@ -2006,14 +2166,18 @@ class LLMAgentServer:
                 try:
                     request = json.loads(line.decode("utf-8", errors="replace"))
                 except Exception:
+                    self._log("ERROR", "RPC_REQUEST_INVALID_JSON", {"peer": str(peer), "raw_line": line.decode("utf-8", errors="replace")[:800]})
                     await self._send_json(writer, {"type": "error", "message": "Invalid JSON"})
                     continue
                 action = str(request.get("action") or "").strip()
+                self._log("INFO", "RPC_REQUEST", {"peer": str(peer), "action": action, "request": request})
                 handler = self._action_handlers.get(action)
                 if handler is None:
+                    self._log("WARN", "RPC_REQUEST_UNKNOWN_ACTION", {"peer": str(peer), "action": action, "request": request})
                     await self._send_error(writer, "Unknown action")
                     continue
                 await handler(request, writer)
+                self._log("INFO", "RPC_REQUEST_DONE", {"peer": str(peer), "action": action})
         except Exception as e:
             self.logger.write("ERROR", "handle_client", extra=str(e))
             self.logger.write("ERROR", "TRACEBACK", extra=traceback.format_exc())
