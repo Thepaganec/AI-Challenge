@@ -931,9 +931,26 @@ class LLMAgentServer:
                     base = matched[0]
             if base is None:
                 continue
+            base_content = str(base.get("content") or "")
             quote = str(item.get("quote") or "").strip()
             if not quote:
-                quote = self._clip_text(base.get("content") or "", 220)
+                quote = self._clip_text(base_content, 220)
+            else:
+                normalized_content = " ".join(base_content.split()).lower()
+                normalized_quote = " ".join(quote.split()).lower()
+                if normalized_quote and normalized_quote not in normalized_content:
+                    self._log(
+                        "WARN",
+                        "RAG_QUOTE_REPLACED",
+                        {
+                            "reason": "llm_quote_not_found_in_chunk",
+                            "chunk_id": str(base.get("chunk_id") or ""),
+                            "file": str(base.get("file") or ""),
+                            "section": str(base.get("section") or ""),
+                            "llm_quote": quote,
+                        },
+                    )
+                    quote = self._clip_text(base_content, 220)
             record = {
                 "chunk_id": str(base.get("chunk_id") or ""),
                 "source": str(base.get("source") or "repo"),
