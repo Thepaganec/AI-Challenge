@@ -1742,7 +1742,8 @@ class ChatTab(BaseTab):
         self.input_editbox.clear()
 
         self.output_editbox.append(f"Ты: {text}\n")
-        self.output_editbox.append("GPT: ")
+        self.output_editbox.moveCursor(QTextCursor.End)
+        self.output_editbox.insertPlainText("GPT: ")
         self.output_editbox.moveCursor(QTextCursor.End)
         self.output_editbox.ensureCursorVisible()
 
