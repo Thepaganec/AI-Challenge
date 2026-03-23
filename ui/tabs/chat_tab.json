@@ -1,12 +1,13 @@
 {
   "log_splitter": "000000ff0000000100000002000002b60000011301ffffffff010000000200",
   "vertical_splitter": "000000ff00000001000000020000032b0000032801ffffffff010000000100",
-  "rag_enabled": true,
-  "rag_structural": true,
-  "rag_rewrite": true,
+  "rag_enabled": false,
+  "rag_structural": false,
+  "rag_rewrite": false,
   "rag_mode": "llm",
   "rag_top_k_before": 10,
   "rag_similarity_threshold": 0.5,
   "rag_top_k_after": 5,
-  "mcp_tools_to_llm": false
+  "mcp_tools_to_llm": false,
+  "selected_model": "gpt-3.5-turbo"
 }

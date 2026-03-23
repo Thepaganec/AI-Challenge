@@ -174,7 +174,19 @@ class ChatTab(BaseTab):
         # ===== top params =====
         self.model_selector = QComboBox()
         self.model_selector.setFixedWidth(260)
-        self.model_selector.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-5.2-chat-latest", "ollama:qwen3.5:0.8b"])
+        self.model_selector.addItems(
+            [
+                "gpt-3.5-turbo",
+                "gpt-4o-mini",
+                "gpt-4o",
+                "gpt-5.2-chat-latest",
+                "ollama:qwen3.5:0.8b",
+                "ollama:gemma3:270m",
+                "ollama:qwen2.5:0.5b",
+                "ollama:gemma3:1b",
+                "ollama:llama3.2:1b",
+            ]
+        )
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
 
         self.endpoint_selector = QComboBox()
