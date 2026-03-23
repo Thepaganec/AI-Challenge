@@ -18,9 +18,12 @@ class GPTModel:
         model: str = "gpt-5.2-chat-latest",
         timeout_sec: int = 60,
         logger: Optional[Any] = None,
+        api_key_optional: bool = False,
+        use_max_completion_tokens: bool = True,
+        include_stream_options: bool = True,
     ):
-        self.api_key = os.getenv(api_key_env)
-        if not self.api_key:
+        self.api_key = str(os.getenv(api_key_env) or "").strip() if api_key_env else ""
+        if (not self.api_key) and (not bool(api_key_optional)):
             raise RuntimeError(
                 f"Не найден API ключ в env переменной {api_key_env}. "
                 f"Добавь в .env: {api_key_env}=..."
@@ -29,6 +32,9 @@ class GPTModel:
         self.model = model
         self.timeout_sec = timeout_sec
         self.logger = logger
+        self.api_key_optional = bool(api_key_optional)
+        self.use_max_completion_tokens = bool(use_max_completion_tokens)
+        self.include_stream_options = bool(include_stream_options)
         self.last_usage: Dict[str, Any] = {}
         self.last_message: Dict[str, Any] = {}
         self.last_finish_reason: str = ""
@@ -105,10 +111,10 @@ class GPTModel:
         return pricing
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def _sanitize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sanitized: List[Dict[str, Any]] = []
@@ -147,9 +153,13 @@ class GPTModel:
             "model": selected_model,
             "messages": self._sanitize_messages(messages),
             "stream": True,
-            "max_completion_tokens": int(max_tokens),
-            "stream_options": {"include_usage": True},
         }
+        if self.use_max_completion_tokens:
+            payload["max_completion_tokens"] = int(max_tokens)
+        else:
+            payload["max_tokens"] = int(max_tokens)
+        if self.include_stream_options:
+            payload["stream_options"] = {"include_usage": True}
         if temperature is not None and float(temperature) != 1.0:
             payload["temperature"] = float(temperature)
         if isinstance(tools, list) and tools:
@@ -175,12 +185,17 @@ class GPTModel:
                 "endpoint": "chat_stream",
                 "url": url,
                 "headers": {
-                    "Authorization": f"Bearer {self._mask_api_key(self.api_key)}",
                     "Content-Type": "application/json",
                 },
                 "payload": payload,
             },
         )
+        if self.api_key:
+            self._log_struct(
+                "INFO",
+                "GPTMODEL_API_REQUEST_AUTH",
+                {"req_id": trace_id, "auth": self._mask_api_key(self.api_key)},
+            )
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=self._headers(), json=payload) as resp:
@@ -201,7 +216,7 @@ class GPTModel:
                         "GPTMODEL_API_RESPONSE_ERROR",
                         {"req_id": trace_id, "endpoint": "chat_stream", "status": int(resp.status), "body": body_text},
                     )
-                    raise RuntimeError(f"ProxyAPI error: HTTP {resp.status}\n{body_text}")
+                    raise RuntimeError(f"LLM API error: HTTP {resp.status}\n{body_text}")
 
                 async for raw_line in resp.content:
                     line = raw_line.decode("utf-8", errors="ignore").strip()

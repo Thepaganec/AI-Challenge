@@ -48,11 +48,25 @@ class LLMAgentServer:
         self.memory_dir = os.path.join(self.base_dir, "memory")
         self.memory_store = AgentMemoryStore(base_dir=self.memory_dir)
         self.profile_store = AgentProfileStore(file_path=os.path.join(self.base_dir, "profiles.json"))
+        self.ollama_url = str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).strip() or "http://127.0.0.1:11434"
+        ollama_chat_base_url = self.ollama_url.rstrip("/")
+        if not ollama_chat_base_url.lower().endswith("/v1"):
+            ollama_chat_base_url = f"{ollama_chat_base_url}/v1"
         self.gpt = GPTModel(api_key_env=api_key_env, base_url=base_url, timeout_sec=timeout_sec, logger=self.logger)
+        self.ollama = GPTModel(
+            api_key_env=str(os.getenv("OLLAMA_API_KEY_ENV", "OLLAMA_API_KEY")).strip() or "OLLAMA_API_KEY",
+            base_url=ollama_chat_base_url,
+            model=str(os.getenv("OLLAMA_CHAT_MODEL_DEFAULT", "qwen3.5:0.8b")).strip() or "qwen3.5:0.8b",
+            timeout_sec=max(5, int(str(os.getenv("OLLAMA_CHAT_TIMEOUT_SEC", "120")).strip() or "120")),
+            logger=self.logger,
+            api_key_optional=True,
+            use_max_completion_tokens=False,
+            include_stream_options=False,
+        )
         self.rag = RagRetriever(
             project_root=self.project_root,
             rag_dir=str(os.getenv("RAG_DIR", "RAG")).strip() or "RAG",
-            ollama_url=str(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).strip() or "http://127.0.0.1:11434",
+            ollama_url=self.ollama_url,
             model=str(os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")).strip() or "nomic-embed-text",
             timeout_sec=max(5, int(str(os.getenv("RAG_OLLAMA_TIMEOUT_SEC", "30")).strip() or "30")),
             llm_base_url=str(os.getenv("RAG_LLM_BASE_URL", base_url)).strip() or base_url,
@@ -226,7 +240,23 @@ class LLMAgentServer:
             total += 4
         return total
 
-    def _resolve_context_limit(self, model: str) -> int:
+    def _is_ollama_model(self, model: str) -> bool:
+        return str(model or "").strip().lower().startswith("ollama:")
+
+    def _resolve_model_provider(self, requested_model: str) -> Tuple[GPTModel, str, str]:
+        clean = str(requested_model or "").strip()
+        if self._is_ollama_model(clean):
+            provider_model = clean.split(":", 1)[1].strip()
+            if not provider_model:
+                provider_model = str(self.ollama.model or "").strip() or "qwen3.5:0.8b"
+            return self.ollama, provider_model, "ollama"
+        provider_model = clean or str(self.gpt.model or "").strip()
+        return self.gpt, provider_model, "proxyapi"
+
+    def _resolve_context_limit(self, model: str, provider: str = "proxyapi") -> int:
+        clean_provider = str(provider or "").strip().lower()
+        if clean_provider == "ollama":
+            return max(1024, int(str(os.getenv("OLLAMA_CONTEXT_LIMIT_DEFAULT", "32768")).strip() or "32768"))
         return int(self._model_context_limit.get(str(model or "").strip(), 128000))
 
     def _calc_cost_rub(self, model_id: str, usage: Dict[str, Any]) -> float:
@@ -583,6 +613,7 @@ class LLMAgentServer:
         *,
         user_text: str,
         task_state: Dict[str, Any],
+        llm: GPTModel,
         model: str,
         req_id: str,
     ) -> Dict[str, Any]:
@@ -612,7 +643,7 @@ class LLMAgentServer:
         ]
         parts: List[str] = []
         try:
-            async for chunk in self.gpt.stream_chat(
+            async for chunk in llm.stream_chat(
                 messages=messages,
                 model=model,
                 max_tokens=180,
@@ -636,6 +667,7 @@ class LLMAgentServer:
         user_text: str,
         assistant_text: str,
         current_task_state: Dict[str, Any],
+        llm: GPTModel,
         model: str,
         req_id: str,
     ) -> Dict[str, Any]:
@@ -674,7 +706,7 @@ class LLMAgentServer:
         }
         parts: List[str] = []
         try:
-            async for chunk in self.gpt.stream_chat(
+            async for chunk in llm.stream_chat(
                 messages=[
                     {"role": "system", "content": prompt_system},
                     {"role": "user", "content": json.dumps(payload_user, ensure_ascii=False)},
@@ -723,6 +755,7 @@ class LLMAgentServer:
         user_text: str,
         task_state: Dict[str, Any],
         history: List[Dict[str, Any]],
+        llm: GPTModel,
         model: str,
         req_id: str,
     ) -> Dict[str, Any]:
@@ -748,7 +781,7 @@ class LLMAgentServer:
         }
         parts: List[str] = []
         try:
-            async for chunk in self.gpt.stream_chat(
+            async for chunk in llm.stream_chat(
                 messages=[
                     {"role": "system", "content": prompt_system},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1019,7 +1052,15 @@ class LLMAgentServer:
             "max_score": float(max_score),
         }
 
-    async def _validate_invariants(self, *, req_id: str, messages: List[Dict[str, Any]], invariants_text: Optional[str], model: str) -> Dict[str, Any]:
+    async def _validate_invariants(
+        self,
+        *,
+        req_id: str,
+        messages: List[Dict[str, Any]],
+        invariants_text: Optional[str],
+        llm: GPTModel,
+        model: str,
+    ) -> Dict[str, Any]:
         if not invariants_text:
             return {"decision": "pass", "reason": "no invariants"}
         validator_messages = [
@@ -1035,7 +1076,7 @@ class LLMAgentServer:
         ]
         try:
             parts: List[str] = []
-            async for chunk in self.gpt.stream_chat(
+            async for chunk in llm.stream_chat(
                 messages=validator_messages,
                 model=model,
                 max_tokens=200,
@@ -1675,7 +1716,9 @@ class LLMAgentServer:
     async def _handle_stream_chat(self, request: Dict[str, Any], writer: asyncio.StreamWriter) -> None:
         req_id = str(uuid.uuid4())
         session_id = str(request.get("session_id") or "").strip() or str(uuid.uuid4())
-        model = str(request.get("model") or self.gpt.model).strip()
+        requested_model = str(request.get("model") or self.gpt.model).strip()
+        llm_client, llm_model, llm_provider = self._resolve_model_provider(requested_model)
+        model = requested_model or llm_model
         max_tokens = int(request.get("max_tokens") or 800)
         temperature = request.get("temperature")
         keep_last_n = int(request.get("keep_last_n") or 10)
@@ -1707,6 +1750,16 @@ class LLMAgentServer:
         if not user_text:
             await self._send_error(writer, "user_text is required")
             return
+        self._log(
+            "INFO",
+            "LLM_PROVIDER_RESOLVED",
+            {
+                "req_id": req_id,
+                "requested_model": requested_model,
+                "provider": llm_provider,
+                "provider_model": llm_model,
+            },
+        )
 
         session = self.memory_store.load_session(session_id)
         self.memory_store.set_title_if_empty(session, user_text)
@@ -1721,10 +1774,12 @@ class LLMAgentServer:
         if self._looks_like_task_forget_request(user_text):
             reset_decision["checked"] = True
             await self._send_task_signal(writer, "task_memory", "Проверяю намерение очистить память задачи через LLM")
+            # TODO: выделить отдельную модель для task-reset-classifier через UI (по типу LLM-операции).
             llm_reset = await self._llm_should_forget_task_state(
                 user_text=user_text,
                 task_state=task_state,
-                model=model,
+                llm=llm_client,
+                model=llm_model,
                 req_id=req_id,
             )
             reset_decision.update(llm_reset)
@@ -1767,11 +1822,13 @@ class LLMAgentServer:
             history_for_llm = build_sliding_window(history, keep_last_n)
 
         if use_rag:
+            # TODO: выделить отдельную модель для RAG query expand/rewrite через UI (по типу LLM-операции).
             rag_query_expand_meta = await self._llm_expand_rag_query(
                 user_text=user_text,
                 task_state=task_state,
                 history=history,
-                model=model,
+                llm=llm_client,
+                model=llm_model,
                 req_id=req_id,
             )
             rag_query_for_retrieval = str(rag_query_expand_meta.get("query") or user_text).strip() or user_text
@@ -1916,6 +1973,8 @@ class LLMAgentServer:
                 "session_id": session_id,
                 "branch_id": active_branch,
                 "strategy": strategy,
+                "llm_provider": llm_provider,
+                "llm_model": llm_model,
                 "system_text": system_text or "",
                 "messages": working_messages,
             },
@@ -1925,7 +1984,8 @@ class LLMAgentServer:
             req_id=req_id,
             messages=working_messages,
             invariants_text=invariants_text,
-            model=model,
+            llm=llm_client,
+            model=llm_model,
         )
         self._log("INFO", "INVARIANTS_VALIDATION", invariants_check)
 
@@ -1955,9 +2015,9 @@ class LLMAgentServer:
             await self._send_task_signal(writer, "llm", "Запрашиваю следующий шаг у модели", {"iteration": loop_guard})
             stream_started = False
 
-            async for chunk in self.gpt.stream_chat(
+            async for chunk in llm_client.stream_chat(
                 messages=working_messages,
-                model=model,
+                model=llm_model,
                 max_tokens=max_tokens,
                 temperature=float(temperature) if temperature is not None else None,
                 trace_id=f"{req_id}:loop:{loop_guard}",
@@ -1972,8 +2032,8 @@ class LLMAgentServer:
                 if relay_stream_chunks:
                     await self._send_json(writer, {"type": "chunk", "chunk": chunk})
 
-            usage_agg = self._merge_usage(usage_agg, self.gpt.last_usage if isinstance(self.gpt.last_usage, dict) else {})
-            assistant_message = self.gpt.last_message if isinstance(self.gpt.last_message, dict) else {}
+            usage_agg = self._merge_usage(usage_agg, llm_client.last_usage if isinstance(llm_client.last_usage, dict) else {})
+            assistant_message = llm_client.last_message if isinstance(llm_client.last_message, dict) else {}
             tool_calls = self._extract_tool_calls(assistant_message)
             self._log("INFO", "LLM_ASSISTANT_MESSAGE", assistant_message)
 
@@ -2056,11 +2116,13 @@ class LLMAgentServer:
 
         history.append({"role": "assistant", "content": final_answer})
         await self._send_task_signal(writer, "task_memory", "Обновляю память задачи через LLM")
+        # TODO: выделить отдельную модель для task-memory update через UI (по типу LLM-операции).
         task_state = await self._llm_update_task_state(
             user_text=user_text,
             assistant_text=final_answer,
             current_task_state=task_state,
-            model=model,
+            llm=llm_client,
+            model=llm_model,
             req_id=req_id,
         )
         if reset_decision.get("checked"):
@@ -2084,7 +2146,7 @@ class LLMAgentServer:
             "assistant_tokens": int(usage_agg.get("completion_tokens") or usage_agg.get("output_tokens") or self._estimate_tokens_text(final_answer)),
             "total_tokens_call": int(usage_agg.get("total_tokens") or 0),
             "dialog_tokens_est": self._estimate_tokens_messages(history),
-            "model_context_limit": self._resolve_context_limit(model),
+            "model_context_limit": self._resolve_context_limit(llm_model, provider=llm_provider),
             "may_exceed_context": False,
         }
         token_stats["may_exceed_context"] = bool(
@@ -2144,7 +2206,10 @@ class LLMAgentServer:
             "rag_max_score": float(rag_output_meta.get("max_score") or 0.0) if use_rag else 0.0,
             "rag_synthesis_error": str(rag_output_meta.get("synthesis_error") or "") if use_rag else "",
         }
-        cost_rub = self._calc_cost_rub(model_id=model, usage=usage_agg)
+        if llm_provider == "ollama":
+            cost_rub = 0.0
+        else:
+            cost_rub = self._calc_cost_rub(model_id=llm_model, usage=usage_agg)
         await self._send_task_signal(writer, "done", "Ответ сформирован", {"tool_iterations": loop_guard})
         done_payload = {
             "type": "done",
@@ -2168,6 +2233,7 @@ class LLMAgentServer:
             "task_state": task_state,
             "mcp_info": {**mcp_info, "tools": self._serialize_mcp_tools(mcp_tools)},
             "tool_events": tool_events,
+            "llm_provider": llm_provider,
         }
         self._log("INFO", "CHAT_DONE", done_payload)
         await self._send_json(writer, done_payload)

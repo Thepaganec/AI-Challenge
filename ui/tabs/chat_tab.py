@@ -174,7 +174,7 @@ class ChatTab(BaseTab):
         # ===== top params =====
         self.model_selector = QComboBox()
         self.model_selector.setFixedWidth(260)
-        self.model_selector.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-5.2-chat-latest"])
+        self.model_selector.addItems(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-5.2-chat-latest", "ollama:qwen3.5:0.8b"])
         self.model_selector.currentTextChanged.connect(self.on_model_changed)
 
         self.endpoint_selector = QComboBox()
@@ -638,6 +638,7 @@ class ChatTab(BaseTab):
                 "rag_similarity_threshold": float(self.rag_similarity_threshold_input.value()),
                 "rag_top_k_after": int(self.rag_top_k_after_input.value()),
                 "mcp_tools_to_llm": bool(self.mcp_tools_toggle.isChecked()),
+                "selected_model": self.model_selector.currentText().strip(),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -678,6 +679,11 @@ class ChatTab(BaseTab):
             except Exception:
                 pass
             self.mcp_tools_toggle.setChecked(bool(state.get("mcp_tools_to_llm", True)))
+            model_saved = str(state.get("selected_model") or "").strip()
+            if model_saved:
+                idx = self.model_selector.findText(model_saved)
+                if idx >= 0:
+                    self.model_selector.setCurrentIndex(idx)
             self.on_rag_toggle_changed(self.rag_use_toggle.isChecked())
             self.on_rag_base_toggle_changed(self.rag_base_toggle.isChecked())
             self.on_mcp_tools_toggle_changed(self.mcp_tools_toggle.isChecked())
