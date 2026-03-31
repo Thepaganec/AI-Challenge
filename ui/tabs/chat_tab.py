@@ -331,7 +331,7 @@ class ChatTab(BaseTab):
         # ===== chat widgets =====
         self.input_editbox = QTextEdit()
         self.input_editbox.setFont(font)
-        self.input_editbox.setPlaceholderText("Напиши сообщение. Shift+Enter — новая строка, Enter — отправить.")
+        self.input_editbox.setPlaceholderText("Напиши сообщение или /help <вопрос о проекте>. Shift+Enter — новая строка, Enter — отправить.")
         self.input_editbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         set_editbox_height(self.input_editbox, 6)
 

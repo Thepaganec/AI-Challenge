@@ -35,6 +35,12 @@ def _default_registry_payload() -> List[Dict[str, Any]]:
     common_env = dict(os.environ)
     return [
         {
+            "public_name": "project",
+            "command": py,
+            "args": [os.path.join(root, "run_mcp_project.py")],
+            "env": common_env,
+        },
+        {
             "public_name": "telegram",
             "command": py,
             "args": [os.path.join(root, "run_mcp_telegram.py")],

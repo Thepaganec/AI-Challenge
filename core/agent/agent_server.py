@@ -432,6 +432,140 @@ class LLMAgentServer:
         return messages
 
     @staticmethod
+    def _extract_developer_help_query(user_text: str) -> Tuple[bool, str]:
+        clean = str(user_text or "").strip()
+        if not clean.startswith("/help"):
+            return False, clean
+        return True, clean[5:].strip()
+
+    def _default_developer_help_query(self) -> str:
+        return (
+            "Дай краткую справку по проекту: назначение приложения, ключевые модули, "
+            "точки входа и где искать RAG, MCP и сервер агента."
+        )
+
+    def _build_developer_help_system_text(self) -> str:
+        return (
+            "[DEVELOPER_HELP_MODE]\n"
+            "Ты работаешь как ассистент разработчика по текущему репозиторию.\n"
+            "Отвечай только по этому проекту, опираясь прежде всего на RAG-контекст и служебный контекст репозитория.\n"
+            "Объясняй структуру проекта, роли модулей, точки входа и связи между компонентами.\n"
+            "Если данных недостаточно, прямо скажи об этом и не выдумывай детали."
+        )
+
+    def _collect_developer_help_doc_chunks(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        meta: Dict[str, Any] = {"files": [], "count": 0}
+        candidates: List[str] = []
+
+        readme_path = os.path.join(self.project_root, "README.md")
+        if os.path.exists(readme_path):
+            candidates.append(readme_path)
+
+        docs_root = os.path.join(self.project_root, "docs")
+        if os.path.isdir(docs_root):
+            for dirpath, _dirnames, filenames in os.walk(docs_root):
+                for filename in sorted(filenames):
+                    if not filename.lower().endswith((".md", ".txt")):
+                        continue
+                    candidates.append(os.path.join(dirpath, filename))
+
+        for idx, file_path in enumerate(candidates, start=1):
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read().strip()
+            except Exception:
+                continue
+            if not content:
+                continue
+            rel_path = os.path.relpath(file_path, self.project_root).replace("\\", "/")
+            lines_count = max(1, len(content.splitlines()))
+            chunks.append(
+                {
+                    "chunk_id": f"docs:developer_help:{idx}",
+                    "source": "docs",
+                    "title": os.path.basename(file_path),
+                    "file": rel_path,
+                    "path": rel_path,
+                    "section": "documentation",
+                    "strategy": "docs_live",
+                    "start_line": 1,
+                    "end_line": lines_count,
+                    "content": content[:5000],
+                    "score": 0.98,
+                }
+            )
+            meta["files"].append(rel_path)
+
+        meta["count"] = len(chunks)
+        return chunks, meta
+
+    async def _collect_developer_help_project_chunks(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        meta: Dict[str, Any] = {"git_branch": "", "files_returned": 0, "errors": []}
+
+        try:
+            branch_result = await self.mcp.call_tool("project__get_git_branch", {})
+            if not bool(branch_result.get("is_error")):
+                branch = str(branch_result.get("branch") or "").strip()
+                project_root = str(branch_result.get("project_root") or self.project_root)
+                meta["git_branch"] = branch
+                branch_text = (
+                    f"Current git branch: {branch or 'unknown'}\n"
+                    f"Project root: {project_root}\n"
+                    "This context is provided by the project MCP service."
+                )
+                chunks.append(
+                    {
+                        "chunk_id": "mcp:project_git_branch",
+                        "source": "mcp",
+                        "title": "Project Git Branch",
+                        "file": "MCP:project:get_git_branch",
+                        "path": "MCP:project:get_git_branch",
+                        "section": "git_branch",
+                        "strategy": "mcp",
+                        "start_line": 1,
+                        "end_line": 3,
+                        "content": branch_text,
+                        "score": 1.0,
+                    }
+                )
+            else:
+                meta["errors"].append(str(branch_result.get("message") or "project__get_git_branch failed"))
+        except Exception as e:
+            meta["errors"].append(f"project__get_git_branch: {e}")
+
+        try:
+            files_result = await self.mcp.call_tool("project__list_project_files", {"limit": 40, "max_depth": 3})
+            if not bool(files_result.get("is_error")):
+                files = files_result.get("files") if isinstance(files_result.get("files"), list) else []
+                files = [str(item).strip() for item in files if str(item).strip()]
+                if files:
+                    meta["files_returned"] = len(files)
+                    files_text = "Project file overview:\n" + "\n".join(f"- {item}" for item in files)
+                    chunks.append(
+                        {
+                            "chunk_id": "mcp:project_file_overview",
+                            "source": "mcp",
+                            "title": "Project File Overview",
+                            "file": "MCP:project:list_project_files",
+                            "path": "MCP:project:list_project_files",
+                            "section": "project_files",
+                            "strategy": "mcp",
+                            "start_line": 1,
+                            "end_line": max(1, len(files) + 1),
+                            "content": files_text,
+                            "score": 0.95,
+                        }
+                    )
+            else:
+                meta["errors"].append(str(files_result.get("message") or "project__list_project_files failed"))
+        except Exception as e:
+            meta["errors"].append(f"project__list_project_files: {e}")
+
+        return chunks, meta
+
+    @staticmethod
     def _parse_json_object_text(text: Any) -> Dict[str, Any]:
         raw = str(text or "").strip()
         if not raw:
@@ -630,7 +764,7 @@ class LLMAgentServer:
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "user_text": user_text,
+                        "user_text": request_user_text,
                         "current_task_state": {
                             "goal": task_state.get("goal"),
                             "open_questions": task_state.get("open_questions"),
@@ -1750,6 +1884,12 @@ class LLMAgentServer:
         if not user_text:
             await self._send_error(writer, "user_text is required")
             return
+        developer_help_mode, developer_help_query = self._extract_developer_help_query(user_text)
+        developer_help_query = developer_help_query or self._default_developer_help_query()
+        request_user_text = developer_help_query if developer_help_mode else user_text
+        if developer_help_mode:
+            use_rag = True
+            rag_strategy = "structural"
         self._log(
             "INFO",
             "LLM_PROVIDER_RESOLVED",
@@ -1771,12 +1911,12 @@ class LLMAgentServer:
         task_state = self._get_branch_task_state(branch)
         reset_decision: Dict[str, Any] = {"checked": False, "should_forget": False, "reason": "", "confidence": 0.0}
 
-        if self._looks_like_task_forget_request(user_text):
+        if self._looks_like_task_forget_request(request_user_text):
             reset_decision["checked"] = True
             await self._send_task_signal(writer, "task_memory", "Проверяю намерение очистить память задачи через LLM")
             # TODO: выделить отдельную модель для task-reset-classifier через UI (по типу LLM-операции).
             llm_reset = await self._llm_should_forget_task_state(
-                user_text=user_text,
+                user_text=request_user_text,
                 task_state=task_state,
                 llm=llm_client,
                 model=llm_model,
@@ -1803,14 +1943,19 @@ class LLMAgentServer:
             )
             branch["memory_layers"] = memory_layers
 
-        user_text_for_api = user_text
+        user_text_for_api = request_user_text
         system_text = None
+        developer_help_system_text = self._build_developer_help_system_text() if developer_help_mode else None
         rag_context_text = None
         rag_chunks: List[Dict[str, Any]] = []
-        rag_query_for_retrieval = user_text
+        developer_help_doc_chunks: List[Dict[str, Any]] = []
+        developer_help_doc_meta: Dict[str, Any] = {"files": [], "count": 0}
+        developer_help_project_chunks: List[Dict[str, Any]] = []
+        developer_help_project_meta: Dict[str, Any] = {"git_branch": "", "files_returned": 0, "errors": []}
+        rag_query_for_retrieval = request_user_text
         rag_query_expand_meta: Dict[str, Any] = {"used_llm": False, "reason": "", "error": ""}
         if strategy == "facts":
-            facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=user_text, prev_facts=facts)
+            facts, cleaned_user_text = parse_facts_and_strip_user_text(user_text=request_user_text, prev_facts=facts)
             branch["facts"] = facts
             user_text_for_api = cleaned_user_text or "Учти обновленные факты и продолжай."
             facts_system_text, history_for_llm = build_facts_strategy(history, facts, keep_last_n)
@@ -1824,14 +1969,14 @@ class LLMAgentServer:
         if use_rag:
             # TODO: выделить отдельную модель для RAG query expand/rewrite через UI (по типу LLM-операции).
             rag_query_expand_meta = await self._llm_expand_rag_query(
-                user_text=user_text,
+                user_text=request_user_text,
                 task_state=task_state,
                 history=history,
                 llm=llm_client,
                 model=llm_model,
                 req_id=req_id,
             )
-            rag_query_for_retrieval = str(rag_query_expand_meta.get("query") or user_text).strip() or user_text
+            rag_query_for_retrieval = str(rag_query_expand_meta.get("query") or request_user_text).strip() or request_user_text
             self._log(
                 "INFO",
                 "RAG_RETRIEVE_REQUEST",
@@ -1839,7 +1984,7 @@ class LLMAgentServer:
                     "req_id": req_id,
                     "session_id": session_id,
                     "branch_id": active_branch,
-                    "user_text": user_text,
+                    "user_text": request_user_text,
                     "rag_query_retrieval": rag_query_for_retrieval,
                     "rag_query_expand_used_llm": bool(rag_query_expand_meta.get("used_llm")),
                     "rag_query_expand_reason": str(rag_query_expand_meta.get("reason") or ""),
@@ -1918,8 +2063,23 @@ class LLMAgentServer:
                         "message": str(e),
                     },
                 )
-                await self._send_error(writer, f"RAG error: {e}")
-                return
+                if developer_help_mode:
+                    rag_chunks = []
+                    rag_context_text = None
+                else:
+                    await self._send_error(writer, f"RAG error: {e}")
+                    return
+
+        if developer_help_mode:
+            developer_help_doc_chunks, developer_help_doc_meta = self._collect_developer_help_doc_chunks()
+            if developer_help_doc_chunks:
+                rag_chunks = developer_help_doc_chunks + rag_chunks
+            await self._send_task_signal(writer, "tools", "Получаю проектный контекст через MCP")
+            developer_help_project_chunks, developer_help_project_meta = await self._collect_developer_help_project_chunks()
+            if developer_help_project_chunks:
+                rag_chunks.extend(developer_help_project_chunks)
+            if rag_chunks:
+                rag_context_text = self.rag.build_rag_context(rag_chunks)
 
         memory_system_text = self._build_memory_system_text(memory_layers)
         profile_state = self.profile_store.get_state()
@@ -1935,11 +2095,12 @@ class LLMAgentServer:
             invariants_state.get("invariants") or {},
             invariants_state.get("invariant_policy") or {},
         )
-        if use_mcp_tools:
+        should_expose_mcp_tools_to_llm = bool(use_mcp_tools and not developer_help_mode)
+        if should_expose_mcp_tools_to_llm:
             await self._send_task_signal(writer, "tools", "Получаю список инструментов MCP")
             mcp_tools, mcp_info = await self._get_mcp_tools()
             tools_policy_text = self._build_tool_usage_instruction(mcp_tools)
-            scheduler_task_protocol = self._build_scheduler_task_protocol(user_text, mcp_tools)
+            scheduler_task_protocol = self._build_scheduler_task_protocol(user_text_for_api, mcp_tools)
             scheduler_task_mode = bool(scheduler_task_protocol)
             mcp_info = {**mcp_info, "provided_to_llm": True, "disabled_by_user": False}
         else:
@@ -1949,15 +2110,20 @@ class LLMAgentServer:
                 "connected": bool(self.mcp.enabled),
                 "tools_count": 0,
                 "provided_to_llm": False,
-                "disabled_by_user": True,
+                "disabled_by_user": bool(not use_mcp_tools),
+                "developer_help_restricted": bool(developer_help_mode),
             }
             tools_policy_text = None
             scheduler_task_protocol = None
             scheduler_task_mode = False
-            await self._send_task_signal(writer, "tools", "Подача MCP-инструментов в LLM отключена")
+            if developer_help_mode:
+                await self._send_task_signal(writer, "tools", "Для /help LLM не получает общий список MCP-инструментов")
+            else:
+                await self._send_task_signal(writer, "tools", "Подача MCP-инструментов в LLM отключена")
         system_text = self._merge_system_text(
             memory_system_text,
             profile_system_text,
+            developer_help_system_text,
             system_text,
             rag_context_text,
             invariants_text,
@@ -2107,7 +2273,7 @@ class LLMAgentServer:
         if use_rag:
             await self._send_task_signal(writer, "rag", "Формирую структурированный ответ с источниками и цитатами")
             final_answer, rag_output_meta = await self._synthesize_rag_answer(
-                user_text=user_text,
+                user_text=user_text_for_api,
                 draft_answer=final_answer,
                 rag_chunks=rag_chunks,
                 rag_similarity_threshold=rag_similarity_threshold,
@@ -2118,7 +2284,7 @@ class LLMAgentServer:
         await self._send_task_signal(writer, "task_memory", "Обновляю память задачи через LLM")
         # TODO: выделить отдельную модель для task-memory update через UI (по типу LLM-операции).
         task_state = await self._llm_update_task_state(
-            user_text=user_text,
+            user_text=user_text_for_api,
             assistant_text=final_answer,
             current_task_state=task_state,
             llm=llm_client,
@@ -2180,7 +2346,13 @@ class LLMAgentServer:
             "tool_iterations": loop_guard,
             "tools_available": len(mcp_tools),
             "use_mcp_tools": use_mcp_tools,
+            "mcp_tools_exposed_to_llm": should_expose_mcp_tools_to_llm,
             "use_rag": use_rag,
+            "developer_help_mode": developer_help_mode,
+            "developer_help_git_branch": str(developer_help_project_meta.get("git_branch") or "") if developer_help_mode else "",
+            "developer_help_docs_count": int(developer_help_doc_meta.get("count") or 0) if developer_help_mode else 0,
+            "developer_help_project_files": int(developer_help_project_meta.get("files_returned") or 0) if developer_help_mode else 0,
+            "developer_help_errors": " | ".join(str(item) for item in developer_help_project_meta.get("errors") or []) if developer_help_mode else "",
             "rag_strategy": rag_strategy if use_rag else "off",
             "rag_top_k": rag_top_k if use_rag else 0,
             "rag_sources_count": int(rag_output_meta.get("sources_count") or len(rag_chunks)) if use_rag else 0,
@@ -2231,7 +2403,13 @@ class LLMAgentServer:
                 "profile_applied": bool(profile_system_text),
             },
             "task_state": task_state,
-            "mcp_info": {**mcp_info, "tools": self._serialize_mcp_tools(mcp_tools)},
+            "mcp_info": {
+                **mcp_info,
+                "tools": self._serialize_mcp_tools(mcp_tools),
+                "developer_help_mode": developer_help_mode,
+                "project_context": developer_help_project_meta,
+                "documentation_context": developer_help_doc_meta,
+            },
             "tool_events": tool_events,
             "llm_provider": llm_provider,
         }
